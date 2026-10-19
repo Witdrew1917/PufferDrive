@@ -487,6 +487,7 @@ def unpack_obs(
     agent_idx: int = 0,
     obs_partner_relative_velocity: bool = False,
     obs_lane_speed_limit: bool = False,
+    obs_navigation: bool = False,
 ):
     """
     Unpack the flattened observation into ego, map, partner, and traffic-control views.
@@ -499,7 +500,7 @@ def unpack_obs(
     if obs_flat.ndim == 1:
         obs_flat = obs_flat[None, :]
 
-    ego_dim = binding.EGO_FEATURES
+    ego_dim = binding.EGO_FEATURES + (binding.NAVIGATION_EGO_FEATURES if obs_navigation else 0)
 
     # Partner obs
     partner_feature_size = binding.PARTNER_FEATURES + (
@@ -591,6 +592,7 @@ def plot_observation(
     true_width_m=None,
     obs_partner_relative_velocity=False,
     obs_lane_speed_limit=False,
+    obs_navigation=False,
 ) -> np.ndarray:
     """Plot observation in ego-centric frame.
 
@@ -613,6 +615,7 @@ def plot_observation(
         agent_idx=agent_idx,
         obs_partner_relative_velocity=obs_partner_relative_velocity,
         obs_lane_speed_limit=obs_lane_speed_limit,
+        obs_navigation=obs_navigation,
     )
     scales = _obs_scales(
         obs_norm_goal_offset_m=obs_norm_goal_offset_m,
@@ -952,6 +955,9 @@ def encode_interactive_replay(scenario, replay):
         chunks["rewards_f32"] = replay["rewards_f32"].astype(np.float32, copy=False)
     if replay.get("coefs_f32") is not None:
         chunks["coefs_f32"] = replay["coefs_f32"].astype(np.float32, copy=False)
+    if replay.get("navi_f32") is not None:
+        chunks["navi_f32"] = replay["navi_f32"].astype(np.float32, copy=False)
+        chunks["navi_route_i32"] = replay["navi_route_i32"].astype(np.int32, copy=False)
     if quantized_observations is not None:
         chunks["obs"] = quantized_observations
         chunks["obs_scale"] = observation_scale_per_dim.astype(np.float32)
@@ -1024,7 +1030,8 @@ def encode_interactive_replay(scenario, replay):
         "num_goals": int(env_cfg["num_goals"]),
         "reward_conditioning": bool(env_cfg["reward_conditioning"]),
         "obs_slots_partners_n": int(env_cfg["obs_slots_partners_n"]),
-        "ego_dim": int(binding.EGO_FEATURES),
+        "ego_dim": int(binding.EGO_FEATURES)
+        + (int(binding.NAVIGATION_EGO_FEATURES) if env_cfg.get("obs_navigation") else 0),
         "reward_coef_count": int(binding.NUM_REWARD_COEFS),
         "partner_features": int(binding.PARTNER_FEATURES)
         + (int(binding.PARTNER_RELATIVE_VELOCITY_FEATURES) if env_cfg.get("obs_partner_relative_velocity") else 0),
@@ -1100,6 +1107,7 @@ def _render_interactive_replay_payload(compressed_payload, filename):
         .perturbation-line.blindness { border-color:#6d28d9; border-top-style:dashed; }
         .perturbation-line.phantom-braking { border-color:#b45309; }
         .perturbation-line.human-log { border-color:#ff0000; }
+        .perturbation-line.navi-route { border-color:#f97316; border-top-width:5px; opacity:.7; }
         /* Agent panel: dark instrument-cluster surface in both themes — scoped variable overrides restyle all children. */
         #hud-telemetry { --border:#4a5468; --muted:#aab3c5; --field:rgba(255,255,255,.07); --accent:#7cbcff; position:absolute; top:14px; right:14px; width:372px; max-height:calc(100vh - 90px); padding:12px 14px; overflow-y:auto; display:none; background:rgba(54,62,77,.95); color:#eef1f6; }
         [data-theme="dark"] #hud-telemetry { background:rgba(48,56,70,.95); }
@@ -1151,6 +1159,7 @@ def _render_interactive_replay_payload(compressed_payload, filename):
                 <div class="perturbation-key"><span class="perturbation-line blindness"></span><span>Partner blindness</span></div>
                 <div class="perturbation-key"><span class="perturbation-line phantom-braking"></span><span>Phantom braking</span></div>
                 <div class="perturbation-key" id="ghost-key" style="display:none"><span class="perturbation-line human-log"></span><span>Human driver (log) &middot; G toggles</span></div>
+                <div class="perturbation-key" id="navi-key" style="display:none"><span class="perturbation-line navi-route"></span><span>Navigation route &middot; L cycles lane feasibility</span></div>
             </div>
             <button type="button" class="toggle-header is-collapsed" id="overrides-header" data-target="overrides-body"><span>Eval overrides</span><span>&#9662;</span></button>
             <div id="overrides-body" class="grid toggle-body is-collapsed"></div>
@@ -1171,6 +1180,8 @@ def _render_interactive_replay_payload(compressed_payload, filename):
             <div class="label">Position x / y / heading</div>
             <div class="mono dim" style="font-size:11.5px"><span id="tel-x">0</span>, <span id="tel-y">0</span>, <span id="tel-h">0</span></div>
             <div class="label">Policy</div><div id="policy-grid" class="grid"></div>
+            <button type="button" id="navi-header" class="toggle-header" data-target="navi-grid"><span>Navigation</span><span>&#9662;</span></button>
+            <div id="navi-grid" class="grid toggle-body"></div>
             <button type="button" id="reward-header" class="toggle-header" data-target="reward-grid"><span>Reward</span><span>&#9662;</span></button>
             <div id="reward-grid" class="grid toggle-body"></div>
             <button type="button" id="ego-obs-header" class="toggle-header" data-target="ego-obs-grid"><span>Ego observation</span><span>&#9662;</span></button>
@@ -1203,9 +1214,10 @@ __PAYLOAD_CHUNKS__
         // Order must match the Log fields written in env_binding.h vec_get_obs_html_frame (15 values).
         const PUFFER_LABELS = ["score","no at fault","no offroad","no red light","progress > .2","direction","ttc","progress ratio","speed limit","comfort","multi lane","wrong way dist","speed violation","multiplier","weighted avg"];
         // Order must match the REWARD_COEF_* indices in constants.h.
+        const NAVI_LABELS = ["goal","to goal m","feas left m","feas lane m","feas right m","off route"];
         const COEF_LABELS = ["goal radius","goal speed","collision","offroad","comfort","lane align","vel align","lane center","center bias","velocity","reverse","stop line","timestep","overspeed","throttle","steer","acc","speed"];
         const REWARD_LABELS = ["collision","offroad","red light","stop sign","goal","lane align","lane center","comfort","velocity","timestep","reverse","overspeed","ADE"];
-        const EGO_OBS_LABELS = ["speed","width","length","steer","accel lon","accel lat","lane dist","lane angle (cos | err/pi)","speed limit","stopped","lane curvature"];
+        const EGO_OBS_LABELS = ["speed","width","length","steer","accel lon","accel lat","lane dist","lane angle (cos | err/pi)","speed limit","stopped","lane curvature","navi active","navi feas left","navi feas lane","navi feas right"];
         const EGO_COND_LABELS = ["goal radius","goal speed","collision","offroad","comfort","lane align","vel align","lane center","center bias","velocity","reverse","stop line","timestep","overspeed","C_throttle","C_steer","C_acc","C_vel"];
         const ACCEL = [-4,-2.667,-1.333,0,1.333,2.667,4], STEER = [-0.667,-0.5,-0.333,-0.167,0,0.167,0.333,0.5,0.667];
         const JLONG = [-15,-4,0,4], JLAT = [-4,0,4];
@@ -1225,6 +1237,12 @@ __PAYLOAD_CHUNKS__
         let step = 0, play = false, speed = 4, lastTick = 0;
         let cam = {x:0,y:0,z:5,drag:false,lx:0,ly:0};
         let followedId = null, isEgoCam = false, darkMode = false, showGhost = false, ghostPaths = [];
+        // navi_f32 layout: goal_idx (-1 = none), goal_x, goal_y, distance_to_goal_m, feasibility left/center/right m, off_route
+        const NAVI_GOAL = 0, NAVI_GOAL_X = 1, NAVI_GOAL_Y = 2, NAVI_DISTANCE = 3, NAVI_FEAS_LEFT = 4, NAVI_OFF_ROUTE = 7;
+        const NAVI_UNREACHABLE_M = 1e8, NAVI_FEASIBILITY_CAP_M = 1000, NAVI_ROUTE_COLOR = 'rgba(249,115,22,.55)', NAVI_GOAL_COLOR = '#f97316', NAVI_FEAS_COLOR = '#dc2626';
+        const NAVI_FEAS_BACK_OFFSET_M = 3.5, NAVI_FEAS_SIDE_OFFSET_M = 2.45, NAVI_FEAS_MIN_ARROW_M = 1, NAVI_FEAS_MAX_ARROW_M = 8, NAVI_FEAS_CROSS_M = .8;
+        const NAVI_FEAS_MODES = ["arrows", "text", "off"];
+        let naviFeasMode = 0;
         const OBS_ZOOM_DEFAULT = 2.2, OBS_ZOOM_MIN = .45, OBS_ZOOM_MAX = 8;
         let obsZoom = OBS_ZOOM_DEFAULT, obsExpanded = false, obsMode = 2, obsShowLimits = true;
         let expertAgentIndices = new Set();
@@ -1329,7 +1347,7 @@ self.onmessage = async event => {
             for (const name of Object.keys(H.chunks)) C[name] = chunk(name);
             if (C.obs && !C.obs_scale) C.obs_scale = new Float32Array(H.obs_dim).fill(H.obs_scale === undefined ? 1 : H.obs_scale); // pre-per-dim replays
             if (C.obs && H.obs_layout === "agent_dim_frame_delta") { const T = H.frames, o = C.obs; for (let row = 0; row < o.length; row += T) for (let t = row + 1; t < row + T; t++) o[t] += o[t-1]; }
-            F = {af:H.chunks.agent_f32.shape[2], ai:H.chunks.agent_i32.shape[2], mf:H.chunks.metrics_f32.shape[2], pf:H.chunks.puffer_f32.shape[2], tf:H.chunks.traffic_i16.shape[2], gf:H.chunks.goals_f32 ? H.chunks.goals_f32.shape[2] : 0, rf:H.chunks.rewards_f32 ? H.chunks.rewards_f32.shape[2] : 0, cf:H.chunks.coefs_f32 ? H.chunks.coefs_f32.shape[2] : 0};
+            F = {af:H.chunks.agent_f32.shape[2], ai:H.chunks.agent_i32.shape[2], mf:H.chunks.metrics_f32.shape[2], pf:H.chunks.puffer_f32.shape[2], tf:H.chunks.traffic_i16.shape[2], gf:H.chunks.goals_f32 ? H.chunks.goals_f32.shape[2] : 0, rf:H.chunks.rewards_f32 ? H.chunks.rewards_f32.shape[2] : 0, cf:H.chunks.coefs_f32 ? H.chunks.coefs_f32.shape[2] : 0, nf:H.chunks.navi_f32 ? H.chunks.navi_f32.shape[2] : 0, nr:H.chunks.navi_route_i32 ? H.chunks.navi_route_i32.shape[2] : 0};
             expertAgentIndices = new Set(H.expert_indices);
             document.getElementById('meta-map').textContent = String(H.map_name).split('/').pop();
             document.getElementById('meta-id').textContent = H.scenario_id || "-";
@@ -1338,6 +1356,7 @@ self.onmessage = async event => {
             const hasGhost = ghostPaths.length > 0 && C.ghost_f32.some((v, i) => i % 5 === 4 && v > 0);
             showGhost = (H.active_count === 1) && hasGhost;
             document.getElementById('ghost-key').style.display = hasGhost ? '' : 'none';
+            document.getElementById('navi-key').style.display = C.navi_f32 ? '' : 'none';
             const ov = H.eval_overrides || {}, ovKeys = Object.keys(ov);
             if (ovKeys.length) document.getElementById('overrides-body').innerHTML = ovKeys.map(k=>`<div class="item"><span class="name">${k}</span><span class="num">${ov[k]}</span></div>`).join('');
             else document.getElementById('overrides-header').style.display = 'none';
@@ -1486,7 +1505,7 @@ self.onmessage = async event => {
         function toggleObsLimits(e){ if(e) e.stopPropagation(); obsShowLimits=!obsShowLimits; document.getElementById('obsLimitBtn').classList.toggle('on', obsShowLimits); draw(true); }
         function toggleObsSize(e){ if(e) e.stopPropagation(); const p=document.getElementById('obs-container'), b=e ? e.currentTarget : null; obsExpanded=!obsExpanded; p.style.width=obsExpanded?'680px':'390px'; p.style.height=obsExpanded?'680px':'390px'; if(b) b.textContent=obsExpanded?'Collapse':'Expand'; resizeObsCanvas(); draw(true); }
         function searchAgent(){ const id=parseInt(document.getElementById('agentSearch').value); if(!isNaN(id)){ followedId=id; play=false; updateBtn(); draw(true); } }
-        document.addEventListener('keydown', e => { if(!H || e.target.tagName === 'INPUT') return; if(e.code === 'Space'){ toggle(); e.preventDefault(); } if(e.code === 'ArrowRight'){ play=false; updateBtn(); step=Math.min(step+1,frameMax()); draw(true); } if(e.code === 'ArrowLeft'){ play=false; updateBtn(); step=Math.max(step-1,0); draw(true); } if(e.code === 'Escape'){ followedId=null; isEgoCam=false; updateUI(); draw(true); } if(e.code === 'KeyG'){ showGhost=!showGhost; draw(true); } });
+        document.addEventListener('keydown', e => { if(!H || e.target.tagName === 'INPUT') return; if(e.code === 'Space'){ toggle(); e.preventDefault(); } if(e.code === 'ArrowRight'){ play=false; updateBtn(); step=Math.min(step+1,frameMax()); draw(true); } if(e.code === 'ArrowLeft'){ play=false; updateBtn(); step=Math.max(step-1,0); draw(true); } if(e.code === 'Escape'){ followedId=null; isEgoCam=false; updateUI(); draw(true); } if(e.code === 'KeyG'){ showGhost=!showGhost; draw(true); } if(e.code === 'KeyL'){ naviFeasMode=(naviFeasMode+1)%NAVI_FEAS_MODES.length; draw(true); } });
         c.onwheel = e => { e.preventDefault(); cam.z *= Math.exp(-e.deltaY * .001); draw(true); };
         c.onmousedown = e => { if(!H) return; const r=c.getBoundingClientRect(), wx=(e.clientX-r.left-c.width/2)/cam.z+cam.x, wy=(e.clientY-r.top-c.height/2)/-cam.z+cam.y; let hit=null, agents=getFrameAgents(Math.floor(step)); if(!isEgoCam) for(const a of agents) if(Math.hypot(wx-a.x, wy-a.y) < Math.max(a.l,3)){ hit=a.id; break; } if(hit !== null){ followedId=hit; cam.drag=false; } else { followedId=null; isEgoCam=false; cam.drag=true; cam.lx=e.clientX; cam.ly=e.clientY; } draw(true); };
         window.onmouseup = () => cam.drag = false;
@@ -1585,6 +1604,71 @@ self.onmessage = async event => {
             strokeLanePath(agent.cl, colors.accent, Math.max(.35, 4.0/cam.z));
             ctx.restore();
         }
+        function naviState(frame, agent) {
+            if (!C.navi_f32 || !agent) return null;
+            const b = (frame * H.agent_cap + agent.idx) * F.nf, n = C.navi_f32;
+            if (n[b + NAVI_GOAL] < 0) return null;
+            return {goal:n[b+NAVI_GOAL], gx:n[b+NAVI_GOAL_X], gy:n[b+NAVI_GOAL_Y], dist:n[b+NAVI_DISTANCE], feas:[n[b+NAVI_FEAS_LEFT], n[b+NAVI_FEAS_LEFT+1], n[b+NAVI_FEAS_LEFT+2]], off:n[b+NAVI_OFF_ROUTE] > 0};
+        }
+        function drawNaviRoute(frame, agent) {
+            const navi = naviState(frame, agent);
+            if (!navi) return;
+            const b = (frame * H.agent_cap + agent.idx) * F.nr;
+            ctx.save();
+            ctx.lineCap = 'round';
+            if (navi.off) ctx.setLineDash([4/cam.z, 4/cam.z]);
+            for (let i=0;i<F.nr;i++) { const laneId = C.navi_route_i32[b+i]; if (laneId < 0) break; strokeLanePath(laneId, NAVI_ROUTE_COLOR, Math.max(1.2, 9.0/cam.z)); }
+            ctx.restore();
+        }
+        function drawNaviGoal(frame, agent) {
+            const navi = naviState(frame, agent);
+            if (!navi) return;
+            const r = Math.max(1.5, 9/cam.z);
+            ctx.save();
+            ctx.translate(navi.gx, navi.gy);
+            ctx.fillStyle = NAVI_GOAL_COLOR; ctx.strokeStyle = '#111'; ctx.lineWidth = Math.max(.15, 1.5/cam.z);
+            ctx.beginPath(); ctx.moveTo(0, r); ctx.lineTo(r, 0); ctx.lineTo(0, -r); ctx.lineTo(-r, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
+            if (isEgoCam) ctx.rotate(-Math.PI/2 + agent.h); else ctx.scale(1,-1);
+            ctx.fillStyle = NAVI_GOAL_COLOR; ctx.font = '700 '+(13/cam.z)+'px system-ui'; ctx.textAlign = 'center';
+            ctx.fillText('navi goal ' + navi.goal, 0, -r - 3/cam.z);
+            ctx.restore();
+        }
+        function naviArrowLength(meters) {
+            const t = Math.sqrt(Math.min(meters, NAVI_FEASIBILITY_CAP_M) / NAVI_FEASIBILITY_CAP_M);
+            return NAVI_FEAS_MIN_ARROW_M + t * (NAVI_FEAS_MAX_ARROW_M - NAVI_FEAS_MIN_ARROW_M);
+        }
+        function drawNaviFeasibility(frame, agent) {
+            // Left / current / right lane: metres the goal stays reachable on that lane, X = lane change not allowed.
+            const navi = naviState(frame, agent), mode = NAVI_FEAS_MODES[naviFeasMode];
+            if (!navi || mode === "off") return;
+            const fx = Math.cos(agent.h), fy = Math.sin(agent.h), lx = -fy, ly = fx;
+            const back = agent.l/2 + NAVI_FEAS_BACK_OFFSET_M, bx = agent.x - fx*back, by = agent.y - fy*back;
+            const sides = [NAVI_FEAS_SIDE_OFFSET_M, 0, -NAVI_FEAS_SIDE_OFFSET_M];
+            ctx.save();
+            ctx.strokeStyle = NAVI_FEAS_COLOR; ctx.fillStyle = NAVI_FEAS_COLOR; ctx.lineCap = 'round'; ctx.lineWidth = Math.max(.18, 3/cam.z);
+            for (let i=0;i<3;i++) {
+                const px = bx + lx*sides[i], py = by + ly*sides[i], value = navi.feas[i];
+                if (mode === "text") {
+                    ctx.save(); ctx.translate(px, py); if (isEgoCam) ctx.rotate(-Math.PI/2 + agent.h); else ctx.scale(1,-1);
+                    ctx.font = '800 '+(15/cam.z)+'px system-ui'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                    ctx.fillText(value <= 0 ? 'X' : (value >= NAVI_FEASIBILITY_CAP_M ? NAVI_FEASIBILITY_CAP_M + '+' : value.toFixed(0)) + (value <= 0 ? '' : 'm'), 0, 0);
+                    ctx.restore();
+                    continue;
+                }
+                ctx.beginPath();
+                if (value <= 0) {
+                    const s = NAVI_FEAS_CROSS_M;
+                    ctx.moveTo(px + (fx+lx)*s, py + (fy+ly)*s); ctx.lineTo(px - (fx+lx)*s, py - (fy+ly)*s);
+                    ctx.moveTo(px + (fx-lx)*s, py + (fy-ly)*s); ctx.lineTo(px - (fx-lx)*s, py - (fy-ly)*s);
+                    ctx.stroke();
+                    continue;
+                }
+                const len = naviArrowLength(value), tipX = px + fx*len, tipY = py + fy*len, head = Math.min(.9, len*.35);
+                ctx.moveTo(px, py); ctx.lineTo(tipX, tipY); ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(tipX, tipY); ctx.lineTo(tipX - fx*head + lx*head*.6, tipY - fy*head + ly*head*.6); ctx.lineTo(tipX - fx*head - lx*head*.6, tipY - fy*head - ly*head*.6); ctx.closePath(); ctx.fill();
+            }
+            ctx.restore();
+        }
         function decodeObs(frame, slot) {
             if (!C.obs || slot < 0 || slot >= H.active_count) return null;
             const base = 0, obs = obsRow(frame, slot), LF = H.lane_features, BF = H.boundary_features, TF = H.traffic_features;
@@ -1646,6 +1730,9 @@ self.onmessage = async event => {
             const rewardLabels = ["return (cum)","total (step)"].concat(REWARD_LABELS.slice(0, Math.max(0, F.rf - 1)));
             rg.innerHTML = C.rewards_f32 ? rewardLabels.map(l=>`<div class="item"><span class="name">${l}</span><span class="num">-</span></div>`).join('') : '';
             document.getElementById('reward-header').style.display = C.rewards_f32 ? '' : 'none';
+            const ng = document.getElementById('navi-grid');
+            ng.innerHTML = C.navi_f32 ? NAVI_LABELS.map(l=>`<div class="item"><span class="name">${l}</span><span class="num">-</span></div>`).join('') : '';
+            document.getElementById('navi-header').style.display = C.navi_f32 ? '' : 'none';
             const eg = document.getElementById('ego-obs-grid');
             const egoLabels = EGO_OBS_LABELS.slice(0, H.ego_dim);
             while (egoLabels.length < H.ego_dim) egoLabels.push(`ego[${egoLabels.length}]`);
@@ -1687,6 +1774,7 @@ self.onmessage = async event => {
                 puffer: [...pg.querySelectorAll('.num')],
                 rewardCells: [...rg.querySelectorAll('.num')],
                 coefCells: [...kg.querySelectorAll('.num')],
+                naviCells: [...ng.querySelectorAll('.num')],
                 polV: pol.querySelector('[data-pol=v]'), polE: pol.querySelector('[data-pol=e]'),
                 heat: [...pol.querySelectorAll('.heat-cell')],
                 acts: [...pol.querySelectorAll('.pol-act')], means: [...pol.querySelectorAll('.pol-mean')], stds: [...pol.querySelectorAll('.pol-std')],
@@ -1765,8 +1853,13 @@ self.onmessage = async event => {
                 const cb = (f * H.agent_cap + agent.idx) * F.cf;
                 for (let i=0;i<refs.coefCells.length;i++) refs.coefCells[i].textContent = formatCoef(C.coefs_f32[cb+i]);
             }
+            if (refs.naviCells.length) {
+                const navi = naviState(f, agent), fmt = m => m >= NAVI_UNREACHABLE_M ? 'unreachable' : (m >= NAVI_FEASIBILITY_CAP_M ? NAVI_FEASIBILITY_CAP_M + '+' : m.toFixed(1));
+                const values = navi ? [String(navi.goal), fmt(navi.dist), fmt(navi.feas[0]), fmt(navi.feas[1]), fmt(navi.feas[2]), navi.off ? 'yes' : 'no'] : ['none', '-', '-', '-', '-', '-'];
+                for (let i=0;i<refs.naviCells.length;i++) refs.naviCells[i].textContent = values[i];
+            }
             updatePolicy(f, agent);
-            const warnings = []; if(C.metrics_f32[mb] === 1) warnings.push("COLLISION"); if(C.metrics_f32[mb+1] === 1) warnings.push("OFFROAD"); if(C.metrics_f32[mb+2] === 1) warnings.push("RED LIGHT"); if(C.metrics_f32[mb+3] === 1) warnings.push("STOP SIGN");
+            const warnings = []; if (naviState(f, agent)?.off) warnings.push("OFF ROUTE"); if(C.metrics_f32[mb] === 1) warnings.push("COLLISION"); if(C.metrics_f32[mb+1] === 1) warnings.push("OFFROAD"); if(C.metrics_f32[mb+2] === 1) warnings.push("RED LIGHT"); if(C.metrics_f32[mb+3] === 1) warnings.push("STOP SIGN");
             const warnKey = warnings.join('|'), warnRow = document.getElementById('warn-row');
             if (warnKey !== lastWarnKey) { lastWarnKey = warnKey; warnRow.style.display = warnings.length ? 'flex' : 'none'; warnRow.innerHTML = warnings.map(w=>`<span class="warn-chip">${w}</span>`).join(''); }
             const obs = decodeObs(f, agent.slot); if (obs) { obsBox.style.display='block'; drawObs(obs, {l:agent.l*H.scales.meters_to_position, w:agent.w*H.scales.meters_to_position}); } else obsBox.style.display='none';
@@ -1780,11 +1873,12 @@ self.onmessage = async event => {
             updateUI(target);
             const colors = getColors(); ctx.fillStyle = colors.bg; ctx.fillRect(0,0,c.width,c.height); ctx.save(); ctx.translate(c.width/2,c.height/2); ctx.scale(cam.z,-cam.z); if(isEgoCam && target) ctx.rotate(Math.PI/2 - target.h); ctx.translate(-cam.x,-cam.y);
             ctx.lineCap='round'; ctx.strokeStyle=colors.road; ctx.lineWidth=.5; ctx.stroke(paths[0]); ctx.strokeStyle=colors.line; ctx.setLineDash([1,1]); ctx.stroke(paths[1]); ctx.setLineDash([]); ctx.strokeStyle=colors.edge; ctx.lineWidth=.8; ctx.stroke(paths[2]);
+            drawNaviRoute(f, target);
             drawCurrentLane(target, colors);
             drawGhosts(f);
             for(const a of getFrameAgents(f)){ ctx.save(); ctx.translate(a.x,a.y); ctx.rotate(a.h); drawAgentBody(a, darkMode?'#fff':'#111'); drawPerturbationOutlines(a); ctx.restore(); ctx.save(); ctx.translate(a.x,a.y); if(isEgoCam && target) ctx.rotate(-Math.PI/2 + target.h); else ctx.scale(1,-1); ctx.fillStyle=colors.text; ctx.font='600 '+(14/cam.z)+'px system-ui'; ctx.textAlign='center'; ctx.fillText(a.id,0,(isEgoCam && target)?a.w/2+.5:-a.w/2-.5); ctx.restore(); if(a.id === followedId){ ctx.save(); ctx.translate(a.x,a.y); ctx.strokeStyle=colors.accent; ctx.lineWidth=3/cam.z; ctx.beginPath(); ctx.arc(0,0,Math.max(a.l,a.w)*1.2,0,7); ctx.stroke(); ctx.restore(); } }
             for(let i=0;i<H.traffic_static_count;i++){ const t=trafficAt(f,i); if(!t) continue; const sl=t.stop_line; ctx.lineCap='butt'; if(t.type === 1){ ctx.strokeStyle=trafficColor(t); ctx.lineWidth=Math.min(1.5,3/cam.z); } else { ctx.strokeStyle=t.type === 2 ? '#ff0000' : '#ffd700'; ctx.lineWidth=Math.min(1.2,2.5/cam.z); ctx.setLineDash([6/cam.z,4/cam.z]); } ctx.beginPath(); ctx.moveTo(sl[0],sl[1]); ctx.lineTo(sl[3],sl[4]); ctx.stroke(); ctx.setLineDash([]); }
-            if(target){ for(const g of selectedGoals(f,target)){ ctx.strokeStyle='#38bdf8'; ctx.fillStyle='rgba(56,189,248,.22)'; ctx.lineWidth=Math.max(.25,2.5/cam.z); ctx.beginPath(); ctx.arc(g.x,g.y,g.radius,0,7); ctx.fill(); ctx.stroke(); } }
+            if(target){ for(const g of selectedGoals(f,target)){ ctx.strokeStyle='#38bdf8'; ctx.fillStyle='rgba(56,189,248,.22)'; ctx.lineWidth=Math.max(.25,2.5/cam.z); ctx.beginPath(); ctx.arc(g.x,g.y,g.radius,0,7); ctx.fill(); ctx.stroke(); } drawNaviGoal(f, target); drawNaviFeasibility(f, target); }
             ctx.restore(); lastDrawn = f;
         }
         function toggle(){ play=!play; lastTick=performance.now(); updateBtn(); if(play) requestAnimationFrame(loop); }

@@ -108,6 +108,8 @@ class Drive(pufferlib.PufferEnv):
         config_only=False,
         goal_regen_mode="finite",
         goal_source="route",
+        route_source="random_walk",
+        navigation_dir="",
         obs_goal_lane_distance=False,
         reward_conditioning=False,
         reward_randomization=False,
@@ -122,6 +124,7 @@ class Drive(pufferlib.PufferEnv):
         obs_partner_relative_velocity=False,
         obs_lane_heading_signed=False,
         obs_lane_speed_limit=False,
+        obs_navigation=False,
         obs_slots_traffic_controls_n=4,
         traffic_lights_enabled=True,
         stop_signs_enabled=False,
@@ -235,6 +238,21 @@ class Drive(pufferlib.PufferEnv):
             "external": binding.GOAL_SOURCE_EXTERNAL,
             "gt_map": binding.GOAL_SOURCE_GT_MAP,
         }[goal_source]
+        self.route_source = {
+            "random_walk": binding.ROUTE_SOURCE_RANDOM_WALK,
+            "navigation": binding.ROUTE_SOURCE_NAVIGATION,
+        }[route_source]
+        if route_source == "navigation" and (simulation_mode != "gigaflow" or goal_source != "route"):
+            raise ValueError("route_source 'navigation' requires gigaflow simulation_mode and goal_source 'route'")
+        self.navigation_dir = navigation_dir or ""
+        if route_source == "navigation" and self.navigation_dir:
+            if not os.path.isdir(self.navigation_dir):
+                raise ValueError(f"navigation_dir '{self.navigation_dir}' does not exist (run process_navigation.py)")
+            if not any(name.endswith(".navi") for name in os.listdir(self.navigation_dir)):
+                raise ValueError(f"navigation_dir '{self.navigation_dir}' contains no .navi sidecars")
+        self.obs_navigation = int(bool(obs_navigation))
+        if self.obs_navigation and route_source != "navigation":
+            raise ValueError("obs_navigation requires route_source 'navigation'")
         self.obs_goal_lane_distance = int(bool(obs_goal_lane_distance))
         infraction_behavior_values = {
             "ignore": binding.INFRACTION_BEHAVIOR_IGNORE,
@@ -297,7 +315,7 @@ class Drive(pufferlib.PufferEnv):
         if goal_source == "external" and simulation_mode != "gigaflow":
             raise ValueError("goal_source 'external' is only supported in gigaflow simulation_mode (co-sim)")
 
-        self.ego_features = binding.EGO_FEATURES
+        self.ego_features = binding.EGO_FEATURES + (binding.NAVIGATION_EGO_FEATURES if self.obs_navigation else 0)
 
         # Extract observation shapes from constants
         self.obs_slots_lane_n = obs_slots_lane_n
@@ -527,6 +545,8 @@ class Drive(pufferlib.PufferEnv):
             "obs_range_road_front_m": self.obs_range_road_front_m,
             "obs_range_road_behind_m": self.obs_range_road_behind_m,
             "obs_range_road_side_m": self.obs_range_road_side_m,
+            "route_source": self.route_source,
+            "navigation_dir": self.navigation_dir,
         }
         cached = binding.map_cache_preload(**preload_kwargs)
         self._preloaded_map_cache_kwargs = preload_kwargs
@@ -569,6 +589,8 @@ class Drive(pufferlib.PufferEnv):
             "num_goals": self.num_goals,
             "goal_regen_mode": self.goal_regen_mode,
             "goal_source": self.goal_source,
+            "route_source": self.route_source,
+            "navigation_dir": self.navigation_dir,
             "obs_goal_lane_distance": self.obs_goal_lane_distance,
             "obs_slots_lane_n": self.obs_slots_lane_n,
             "obs_slots_boundary_n": self.obs_slots_boundary_n,
@@ -578,6 +600,7 @@ class Drive(pufferlib.PufferEnv):
             "obs_partner_relative_velocity": self.obs_partner_relative_velocity,
             "obs_lane_heading_signed": self.obs_lane_heading_signed,
             "obs_lane_speed_limit": self.obs_lane_speed_limit,
+            "obs_navigation": self.obs_navigation,
             "obs_slots_traffic_controls_n": self.obs_slots_traffic_controls_n,
             "traffic_lights_enabled": self.traffic_lights_enabled,
             "stop_signs_enabled": self.stop_signs_enabled,
@@ -1024,9 +1047,15 @@ class Drive(pufferlib.PufferEnv):
                     "goals_f32",
                     "rewards_f32",
                     "coefs_f32",
+                    *self._navigation_replay_keys(),
                 )
             },
         }
+
+    def _navigation_replay_keys(self):
+        if self.route_source != binding.ROUTE_SOURCE_NAVIGATION:
+            return ()
+        return ("navi_f32", "navi_route_i32")
 
     def _initialize_replay_captures(self):
         scenarios = self._normalize_scenarios(self.get_state())
@@ -1075,6 +1104,15 @@ class Drive(pufferlib.PufferEnv):
                 dtype=np.float32,
             ),
         }
+        if self._navigation_replay_keys():
+            self._replay_frame_arrays["navi_f32"] = np.empty(
+                (env_count, agent_capacity, binding.NAVI_F32_FIELDS),
+                dtype=np.float32,
+            )
+            self._replay_frame_arrays["navi_route_i32"] = np.empty(
+                (env_count, agent_capacity, binding.NAVI_ROUTE_PREVIEW_LANE_COUNT),
+                dtype=np.int32,
+            )
 
     def _capture_replay_step(self):
         self.get_obs_html_frame(
@@ -1087,6 +1125,12 @@ class Drive(pufferlib.PufferEnv):
             self._replay_frame_arrays["rewards_f32"],
             self._replay_frame_arrays["coefs_f32"],
         )
+        if self._navigation_replay_keys():
+            binding.vec_get_navigation_frame(
+                self.c_envs,
+                self._replay_frame_arrays["navi_f32"],
+                self._replay_frame_arrays["navi_route_i32"],
+            )
         for env_idx, capture in enumerate(self._replay_captures):
             agent_capacity = capture["agent_capacity"]
             traffic_capacity = max(capture["traffic_capacity"], 1)
@@ -1098,6 +1142,7 @@ class Drive(pufferlib.PufferEnv):
                 "goals_f32",
                 "rewards_f32",
                 "coefs_f32",
+                *self._navigation_replay_keys(),
             ):
                 capture["frames"][key].append(self._replay_frame_arrays[key][env_idx, :agent_capacity].copy())
             capture["frames"]["traffic_i16"].append(

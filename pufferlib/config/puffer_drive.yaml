@@ -145,6 +145,11 @@ env:
   # How the goal set is seeded - options: "route" (agent forward route), "map" (uniform free-roam),
   # replay only: "gt" (raw logged trajectory points), "gt_map" (logged points snapped to the nearest lane center)
   goal_source: map
+  # Gigaflow route builder (goal_source route only) - options: "random_walk", "navigation" (follow next-hops of the
+  # <map_stem>.navi sidecar from data_utils/process_navigation.py; falls back to random_walk if the sidecar is missing)
+  route_source: random_walk
+  # Directory holding .navi sidecars; "" looks next to each map .bin
+  navigation_dir: ""
   # Append normalized lane-graph distance to the current goal lane on each lane obs row
   obs_goal_lane_distance: True
   # Meters around goal to be considered "reached"
@@ -200,6 +205,9 @@ env:
   obs_lane_heading_signed: false
   # Append each lane segment's speed limit (/ obs_norm_speed_mps) to its lane row so limit changes ahead are visible
   obs_lane_speed_limit: false
+  # Append navigation to the ego state (requires route_source navigation): active flag + left/center/right lane
+  # feasibility as seconds at the lane speed limit over a 30 s horizon (1 = unbounded). Changes obs size.
+  obs_navigation: false
   obs_slots_traffic_controls_n: 4
   # Fraction of segment observation slots to drop (reduces obs size)
   obs_dropout_lane: 0.5

@@ -1,0 +1,182 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+# PufferDrive base container.
+#
+# Ships the *system* layer only: CUDA toolkit (nvcc), a C/C++ toolchain, the
+# X11/GL/ffmpeg/xvfb stack the raylib renderer needs, and uv with pre-baked
+# CPython interpreters. Python packages are NOT installed here -- create the
+# venv on the host-side repo checkout after the image is built (see %help).
+#
+# CUDA 12.8 runs fine under a 13.0 host driver (drivers are backwards
+# compatible with older toolkits), so `--nv` works on a nvidia-smi 13.0 node.
+
+%labels
+    Author      Emerge-Lab
+    Project     PufferDrive
+    CudaVersion 12.8.1
+    BaseOS      ubuntu24.04
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export DEBIAN_FRONTEND=noninteractive
+
+    # uv + its managed interpreters (baked into the read-only image)
+    export UV_PYTHON_INSTALL_DIR=/opt/uv/python
+    export UV_PYTHON_PREFERENCE=only-managed
+    # The image is read-only at runtime; keep uv's cache/link behaviour sane.
+    export UV_LINK_MODE=copy
+    export PATH=/opt/uv/bin:$PATH
+
+    # torch/nvcc pick these up when building pufferlib._C
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=$CUDA_HOME/bin:$PATH
+    export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        pkg-config \
+        git \
+        curl \
+        ca-certificates \
+        xz-utils \
+        unzip \
+        vim-tiny \
+        less \
+        procps \
+        \
+        ffmpeg \
+        xvfb \
+        xauth \
+        x11-utils \
+        \
+        libx11-dev \
+        libxext-dev \
+        libxrandr-dev \
+        libxinerama-dev \
+        libxcursor-dev \
+        libxi-dev \
+        libxkbcommon-dev \
+        libgl-dev \
+        libglu1-mesa-dev \
+        libgl1-mesa-dri \
+        libegl1 \
+        \
+        libssl-dev \
+        zlib1g-dev \
+        libbz2-dev \
+        libffi-dev \
+        liblzma-dev \
+        libsqlite3-dev \
+        libreadline-dev
+    rm -rf /var/lib/apt/lists/*
+
+    # ---- uv -------------------------------------------------------------
+    export UV_INSTALL_DIR=/opt/uv/bin
+    export UV_NO_MODIFY_PATH=1
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH=/opt/uv/bin:$PATH
+    uv --version
+
+    # ---- managed interpreters -------------------------------------------
+    # Baked in so compute nodes without outbound network can still make venvs.
+    # pyproject.toml declares requires-python >=3.9; 3.12 is the default here,
+    # 3.11 matches .github/workflows/utest.yml. Add more versions as needed.
+    export UV_PYTHON_INSTALL_DIR=/opt/uv/python
+    uv python install 3.12 3.11
+    uv python list --only-installed
+
+    chmod -R a+rX /opt/uv
+
+    # ---- convenience helper ---------------------------------------------
+    mkdir -p /opt/pufferdrive
+    cat > /opt/pufferdrive/setup-venv.sh <<'EOS'
+#!/bin/bash
+# Create the PufferDrive venv + compile the C extensions, inside the container.
+# Run from the repo root (which must be writable, i.e. a bind-mounted checkout).
+set -euo pipefail
+
+PYTHON_VERSION="${PUFFER_PYTHON_VERSION:-3.12}"
+VENV_DIR="${PUFFER_VENV:-.venv}"
+
+if [ ! -f setup.py ] || [ ! -d pufferlib ]; then
+    echo "error: run this from the PufferDrive repo root" >&2
+    exit 1
+fi
+
+echo ">>> creating $VENV_DIR (python $PYTHON_VERSION)"
+uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+
+echo ">>> installing pufferlib (editable)"
+uv pip install -e .
+
+echo ">>> compiling C extensions"
+python setup.py build_ext --inplace --force
+
+echo ">>> done. activate with: source $VENV_DIR/bin/activate"
+EOS
+    chmod 755 /opt/pufferdrive/setup-venv.sh
+
+%runscript
+    # Auto-activate the repo venv when one is present, then run the command.
+    VENV="${PUFFER_VENV:-$PWD/.venv}"
+    if [ -f "$VENV/bin/activate" ]; then
+        # shellcheck disable=SC1091
+        . "$VENV/bin/activate"
+    fi
+    if [ "$#" -eq 0 ]; then
+        exec /bin/bash
+    fi
+    exec "$@"
+
+%test
+    set -eu
+    export PATH=/opt/uv/bin:$PATH
+    uv --version
+    nvcc --version
+    ffmpeg -version | head -1
+    command -v xvfb-run
+    gcc --version | head -1
+
+%help
+    PufferDrive system container (CUDA 12.8.1 devel / Ubuntu 24.04).
+
+    Contains: nvcc + gcc/g++, cmake, ffmpeg, xvfb, the X11/GL libraries raylib
+    links against, and uv with managed CPython 3.12 and 3.11.
+    Contains NO python packages -- those go in a venv on your bind-mounted
+    repo checkout so the read-only image stays reusable.
+
+    First-time setup (from the repo root, one time per checkout):
+
+        singularity exec --nv \
+            --bind $PWD:$PWD --pwd $PWD \
+            pufferdrive.sif /opt/pufferdrive/setup-venv.sh
+
+    That runs `uv venv`, `uv pip install -e .` and
+    `python setup.py build_ext --inplace --force`.
+
+    Afterwards, the runscript activates ./.venv automatically:
+
+        singularity run --nv --bind $PWD:$PWD --pwd $PWD \
+            pufferdrive.sif puffer train puffer_drive
+
+    Headless rendering (render_mode = 1 in pufferlib/config/ocean/drive.ini):
+
+        singularity run --nv --bind $PWD:$PWD --pwd $PWD pufferdrive.sif \
+            xvfb-run -s "-screen 0 1280x720x24" puffer eval puffer_drive
+
+    If GL calls fail under Xvfb because `--nv` injected the host's NVIDIA GLX,
+    force the mesa software rasterizer: export LIBGL_ALWAYS_SOFTWARE=1
+
+    Overrides:
+        PUFFER_VENV            venv path (default ./.venv)
+        PUFFER_PYTHON_VERSION  interpreter for setup-venv.sh (default 3.12)

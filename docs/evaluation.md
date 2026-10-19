@@ -112,6 +112,27 @@ compressed files are removed after rendering by default; use
 
 `eval.capture_observations=true` also stores policy observations.
 
+### Navigation overlays
+
+With navigation sidecars (see [navigation.md](navigation.md)), any `env.*`
+override applies to the benchmark, so eval and rendering use navigation routes:
+
+```bash
+puffer eval puffer_drive carla_fast \
+  load_model_path=path/to/model.pt \
+  eval.render_scenarios=true \
+  env.route_source=navigation env.navigation_dir=navi/
+```
+
+Replays then store per-frame navigation telemetry (`navi_f32`, `navi_route_i32`).
+Navigation needs gigaflow mode, so the replay benchmarks (`nuplan_multi`, `womd_*`) cannot use it. To run navigation on other maps, reuse a gigaflow benchmark and override `env.map_dir`, e.g. `carla_fast env.map_dir=~/Data/nuplan_mini_val env.navigation_dir=~/Data/nuplan_mini_val_navi`.
+
+Generate the sidecars first; eval aborts if `navigation_dir` does not exist or holds no `.navi` files. Overlays are drawn only for the followed agent (click it or type its id): the viewer draws the upcoming navigation route (orange,
+dashed when off route) and the navigation goal (orange diamond). It also shows
+a Navigation panel with goal, distance to goal, the three feasibility values
+and the off-route flag. Lane feasibility is drawn behind the agent. **L** cycles
+through arrows (length grows with feasible meters, an X marks 0), text, and off.
+
 To evaluate and render the environment distribution used during training, run:
 
 ```bash

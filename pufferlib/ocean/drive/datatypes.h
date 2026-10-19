@@ -79,6 +79,17 @@ struct Agent {
     int route_gt_len;      // Number of leading route lanes supported by GT before extension
     int current_route_idx; // Tracks progress through route array
 
+    // Navigation (route_source navigation): goal of each route lane, -1 for random-walk lanes
+    int navi_route_goal_idx[MAX_ROUTE_LENGTH];
+    int navi_route_length; // leading route entries tagged in navi_route_goal_idx; 0 = no navigation route
+    int navi_route_cursor; // last route index matched to current_lane_idx
+    int navi_goal_idx;     // active navigation goal, -1 if none
+    float navi_distance_to_goal_m;
+    float navi_feasibility_left_m;
+    float navi_feasibility_center_m;
+    float navi_feasibility_right_m;
+    int navi_off_route; // 1: current lane cannot reach the active goal
+
     // Metrics and status tracking (size must match NUM_METRICS in drive.h)
     float metrics_array[NUM_METRICS]; // [collision, offroad, red_light, stop_sign, reached_goal, lane_dist, lane_angle,
                                       // comfort_violation, velocity_progress, speed_limit, avg_displacement_error,
@@ -191,6 +202,24 @@ struct LaneGraph {
     int *lane_to_graph_idx; // road-element idx -> graph idx (-1 if lane absent from graph), sized num_road_elements
 };
 
+// Lane-level navigation from a <map_stem>.navi sidecar. Per-goal tables are row-major [goal * num_lanes + lane].
+struct NavigationData {
+    int num_lanes;
+    int num_goals;
+    int *lane_road_idx;     // navi lane -> road-element idx
+    int *road_to_navi_lane; // road-element idx -> navi lane, -1 for non-lanes; sized num_road_elements
+    int *left_lane;         // legal left lane-change neighbour, -1 if none
+    int *right_lane;        // legal right lane-change neighbour, -1 if none
+    int *goal_lane;         // navi lane whose end point is the goal
+    float *goal_x;
+    float *goal_y;
+    int *next_lane;            // longitudinal next hop toward the goal, -1 at the goal lane or when unreachable
+    float *distance_to_goal_m; // from lane start, lane changes allowed; NAVI_UNREACHABLE_M if unreachable
+    float *feasibility_left_m;
+    float *feasibility_center_m;
+    float *feasibility_right_m;
+};
+
 void free_agent(struct Agent *agent) {
     free(agent->log_trajectory_x);
     free(agent->log_trajectory_y);
@@ -226,4 +255,23 @@ void free_lane_graph(struct LaneGraph *graph) {
     free(graph->lane_ids);
     free(graph->distances);
     free(graph->lane_to_graph_idx);
+}
+
+void free_navigation_data(struct NavigationData *navigation) {
+    if (navigation == NULL) {
+        return;
+    }
+    free(navigation->lane_road_idx);
+    free(navigation->road_to_navi_lane);
+    free(navigation->left_lane);
+    free(navigation->right_lane);
+    free(navigation->goal_lane);
+    free(navigation->goal_x);
+    free(navigation->goal_y);
+    free(navigation->next_lane);
+    free(navigation->distance_to_goal_m);
+    free(navigation->feasibility_left_m);
+    free(navigation->feasibility_center_m);
+    free(navigation->feasibility_right_m);
+    free(navigation);
 }

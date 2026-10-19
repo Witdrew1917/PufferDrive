@@ -95,6 +95,8 @@ struct Log {
     float spawn_failed_goal;
     float stopped_at_reset;
     float early_reset_short;
+    float navi_goal_active_rate;
+    float navi_off_route_rate;
 };
 
 struct GridMapEntity {
@@ -137,6 +139,9 @@ struct SharedMapData {
     GridMap *grid_map;
     int *neighbor_offsets;
     struct LaneGraph lane_graph;
+    struct NavigationData *navigation; // NULL when route_source is random walk or the sidecar is missing
+    int route_source;
+    char *navigation_dir;
     int obs_lane_stride;
     int obs_boundary_stride;
     int ref_count;
@@ -274,6 +279,9 @@ struct Drive {
     int num_goals;
     int goal_regen_mode;
     int goal_source;
+    int route_source;
+    char *navigation_dir;              // "" or NULL: sidecar sits next to the map
+    struct NavigationData *navigation; // borrowed from shared_map when cached
     int obs_goal_lane_distance;
     // Observations
     int obs_slots_boundary_n;
@@ -282,6 +290,7 @@ struct Drive {
     int obs_partner_relative_velocity;
     int obs_lane_heading_signed;
     int obs_lane_speed_limit;
+    int obs_navigation;
     int obs_slots_traffic_controls_n;
     int traffic_lights_enabled;
     int stop_signs_enabled;
@@ -518,6 +527,14 @@ static void reset_agent_state(Agent *agent) {
     agent->current_lane_idx = -1;
     agent->previous_lane_idx = -1;
     agent->current_route_idx = 0;
+    // route tags survive: spawn builds the route before this reset runs
+    agent->navi_route_cursor = 0;
+    agent->navi_goal_idx = -1;
+    agent->navi_distance_to_goal_m = 0.0f;
+    agent->navi_feasibility_left_m = 0.0f;
+    agent->navi_feasibility_center_m = 0.0f;
+    agent->navi_feasibility_right_m = 0.0f;
+    agent->navi_off_route = 0;
     agent->accel_long = 0.0f;
     agent->accel_lat = 0.0f;
     agent->jerk_long = 0.0f;
@@ -1064,12 +1081,73 @@ static void commit_goals(
     agent->current_goal_z = agent->list_goal_z[start_slot_idx];
 }
 
+// Uniform over goals whose longitudinal next-hop chain from navi_lane_idx is non-empty; -1 if none.
+static int sample_reachable_navigation_goal(Drive *env, int navi_lane_idx) {
+    const struct NavigationData *navigation = env->navigation;
+    int reachable_goal_count = 0;
+    for (int goal_idx = 0; goal_idx < navigation->num_goals; goal_idx++) {
+        reachable_goal_count += navigation->next_lane[goal_idx * navigation->num_lanes + navi_lane_idx] != -1;
+    }
+    if (reachable_goal_count == 0) {
+        return -1;
+    }
+    int remaining_picks = rng_below(&env->rng_state, reachable_goal_count);
+    for (int goal_idx = 0; goal_idx < navigation->num_goals; goal_idx++) {
+        if (navigation->next_lane[goal_idx * navigation->num_lanes + navi_lane_idx] == -1) {
+            continue;
+        }
+        if (remaining_picks == 0) {
+            return goal_idx;
+        }
+        remaining_picks--;
+    }
+    return -1;
+}
+
+// Chains next-hop legs toward sampled goals (each leg starts at the previous goal lane) and tags
+// navi_route_goal_idx; returns the new route length. Legs are only cut short by MAX_ROUTE_LENGTH.
+static int append_navigation_legs(
+    Drive *env,
+    Agent *agent,
+    int *candidate_route,
+    int route_length,
+    float *route_distance_meters) {
+    const struct NavigationData *navigation = env->navigation;
+    int leg_start_navi_lane = navigation->road_to_navi_lane[candidate_route[route_length - 1]];
+    while (leg_start_navi_lane != -1 && *route_distance_meters < ROUTE_TARGET_DISTANCE
+           && route_length < MAX_ROUTE_LENGTH) {
+        int goal_idx = sample_reachable_navigation_goal(env, leg_start_navi_lane);
+        if (goal_idx == -1) {
+            break;
+        }
+        if (agent->navi_route_goal_idx[route_length - 1] == -1) {
+            agent->navi_route_goal_idx[route_length - 1] = goal_idx;
+        }
+        const int *next_lane_row = &navigation->next_lane[goal_idx * navigation->num_lanes];
+        int navi_lane_idx = leg_start_navi_lane;
+        while (next_lane_row[navi_lane_idx] != -1 && route_length < MAX_ROUTE_LENGTH) {
+            navi_lane_idx = next_lane_row[navi_lane_idx];
+            int road_idx = navigation->lane_road_idx[navi_lane_idx];
+            candidate_route[route_length] = road_idx;
+            agent->navi_route_goal_idx[route_length] = goal_idx;
+            route_length++;
+            *route_distance_meters += env->road_elements[road_idx].length;
+        }
+        leg_start_navi_lane = (navi_lane_idx == navigation->goal_lane[goal_idx]) ? navi_lane_idx : -1;
+    }
+    agent->navi_route_length = (agent->navi_route_goal_idx[0] == -1) ? 0 : route_length;
+    return route_length;
+}
+
 static bool compute_new_route(Drive *env, Agent *agent, int current_lane_idx) {
     RoadMapElement *road_elements = env->road_elements;
     int candidate_route[MAX_ROUTE_LENGTH];
     float route_distance_meters = 0.0f;
     int route_length = 0;
     candidate_route[route_length++] = current_lane_idx;
+    agent->navi_route_length = 0;
+    agent->navi_route_cursor = 0;
+    agent->navi_route_goal_idx[0] = -1;
 
     // First lane only contributes the arc-length still ahead of the agent, not its full length.
     RoadMapElement *current_lane = &road_elements[current_lane_idx];
@@ -1081,6 +1159,11 @@ static bool compute_new_route(Drive *env, Agent *agent, int current_lane_idx) {
                                 agent->sin_heading,
                                 true,
                                 NULL);
+
+    if (env->navigation != NULL) {
+        route_length = append_navigation_legs(env, agent, candidate_route, route_length, &route_distance_meters);
+        current_lane_idx = candidate_route[route_length - 1];
+    }
 
     // Random walk through the lane graph, appending exit lanes until we cover the target distance.
     while (route_distance_meters < ROUTE_TARGET_DISTANCE && route_length < MAX_ROUTE_LENGTH) {
@@ -2487,6 +2570,8 @@ static void add_log(Drive *env) {
         // Lane metrics (normalized per timestep for average per episode)
         episode_log.lane_center_rate += env->logs[i].lane_center_rate / safe_timestep;
         episode_log.lane_heading_aligned_rate += env->logs[i].lane_heading_aligned_rate / safe_timestep;
+        episode_log.navi_goal_active_rate += env->logs[i].navi_goal_active_rate / safe_timestep;
+        episode_log.navi_off_route_rate += env->logs[i].navi_off_route_rate / safe_timestep;
         if (env->compute_eval_metrics) {
             env->logs[i].progress_ratio = agent->distance_since_spawn / reference_progress_distance;
             env->logs[i].comfort_score = calculate_duration_scaled_violation_score(
@@ -3609,6 +3694,7 @@ void init(Drive *env) {
         env->grid_map = shared->grid_map;
         env->neighbor_offsets = shared->neighbor_offsets;
         env->lane_graph = shared->lane_graph;
+        env->navigation = shared->navigation;
         env->shared_map = shared;
         shared->ref_count++;
     } else {
@@ -3617,6 +3703,7 @@ void init(Drive *env) {
             fprintf(stderr, "[ERROR] -> Failed to load map binary: %s\n", env->map_name);
             return;
         }
+        load_env_navigation(env);
         if (init_grid_map(env) != 0) {
             fprintf(stderr, "[ERROR] -> Failed to build grid map for map: %s\n", env->map_name);
             return;
@@ -3714,6 +3801,7 @@ void c_close(Drive *env) {
     free(env->static_agent_indices);
     free(env->expert_static_agent_indices);
     free_loaded_map_data(env);
+    free(env->navigation_dir);
 }
 
 static inline int partner_feature_count(const Drive *env) {
@@ -3724,8 +3812,12 @@ static inline int lane_feature_count(const Drive *env) {
     return LANE_FEATURES + (env->obs_lane_speed_limit ? LANE_SPEED_LIMIT_FEATURES : 0);
 }
 
+static inline int ego_feature_count(const Drive *env) {
+    return EGO_FEATURES + (env->obs_navigation ? NAVIGATION_EGO_FEATURES : 0);
+}
+
 static int compute_observation_size(Drive *env) {
-    return EGO_FEATURES + partner_feature_count(env) * env->obs_slots_partners_n
+    return ego_feature_count(env) + partner_feature_count(env) * env->obs_slots_partners_n
         + lane_feature_count(env) * env->obs_slots_lane_kept + BOUNDARY_FEATURES * env->obs_slots_boundary_kept
         + TRAFFIC_CONTROL_FEATURES * env->obs_slots_traffic_controls_n + OBS_VALID_COUNT_FEATURES
         + env->reward_conditioning * NUM_REWARD_COEFS + env->num_goals * GOAL_FEATURES;
@@ -4682,6 +4774,24 @@ static int write_ego_obs(Drive *env, Agent *ego, float *obs, int obs_idx) {
     obs[obs_idx++] = current_lane_speed_limit / env->obs_norm_speed_mps;
     obs[obs_idx++] = fminf(1.0f, ego->seconds_stopped / MAX_STOPPED_SECONDS);
     obs[obs_idx++] = fmaxf(-1.0f, fminf(1.0f, ego->lane_curvature / LANE_CURVATURE_NORM));
+    if (!env->obs_navigation) {
+        return obs_idx;
+    }
+    // Feasibility as seconds at the lane speed limit over a fixed horizon; the cap means unbounded.
+    bool navigation_active = ego->navi_goal_idx != -1;
+    float feasibility_horizon_m = current_lane_speed_limit * NAVI_OBS_FEASIBILITY_HORIZON_S;
+    const float feasibility_m[NAVI_FEASIBILITY_SIDE_COUNT]
+        = {ego->navi_feasibility_left_m, ego->navi_feasibility_center_m, ego->navi_feasibility_right_m};
+    obs[obs_idx++] = navigation_active ? 1.0f : 0.0f;
+    for (int side_idx = 0; side_idx < NAVI_FEASIBILITY_SIDE_COUNT; side_idx++) {
+        if (!navigation_active || feasibility_horizon_m <= 0.0f) {
+            obs[obs_idx++] = 0.0f;
+            continue;
+        }
+        obs[obs_idx++] = (feasibility_m[side_idx] >= NAVI_FEASIBILITY_CAP_M)
+            ? 1.0f
+            : fminf(feasibility_m[side_idx] / feasibility_horizon_m, 1.0f);
+    }
     return obs_idx;
 }
 
@@ -5387,6 +5497,86 @@ static void update_rollout_masks(Drive *env) {
     }
 }
 
+// Lane-start feasibility minus the agent's progress along road_idx; 0 (forbidden) and capped values pass through.
+static float navigation_feasibility_ahead_m(Drive *env, Agent *agent, int road_idx, float lane_start_feasibility_m) {
+    if (lane_start_feasibility_m <= 0.0f || lane_start_feasibility_m >= NAVI_FEASIBILITY_CAP_M) {
+        return lane_start_feasibility_m;
+    }
+    float lane_progress_m = compute_lane_progress(
+        &env->road_elements[road_idx],
+        agent->sim_x,
+        agent->sim_y,
+        agent->cos_heading,
+        agent->sin_heading,
+        true,
+        NULL);
+    return fmaxf(lane_start_feasibility_m - lane_progress_m, 0.0f);
+}
+
+// Tracks the agent along its navigation route and refreshes goal distance / lane-change feasibility.
+static void update_navigation_state(Drive *env, int agent_idx) {
+    Agent *agent = &env->agents[agent_idx];
+    if (env->navigation == NULL || agent->navi_route_length == 0) {
+        agent->navi_goal_idx = -1;
+        agent->navi_off_route = 0;
+        return;
+    }
+    if (agent->current_lane_idx == -1) {
+        return; // off-lane: keep the last known navigation state
+    }
+    const struct NavigationData *navigation = env->navigation;
+    for (int route_idx = agent->navi_route_cursor; route_idx < agent->route_length; route_idx++) {
+        if (agent->route[route_idx] == agent->current_lane_idx) {
+            agent->navi_route_cursor = route_idx;
+            break;
+        }
+    }
+    agent->navi_goal_idx = (agent->navi_route_cursor < agent->navi_route_length)
+        ? agent->navi_route_goal_idx[agent->navi_route_cursor]
+        : -1;
+    if (agent->navi_goal_idx == -1) {
+        agent->navi_off_route = 0;
+        agent->navi_distance_to_goal_m = 0.0f;
+        agent->navi_feasibility_left_m = 0.0f;
+        agent->navi_feasibility_center_m = 0.0f;
+        agent->navi_feasibility_right_m = 0.0f;
+        return;
+    }
+    int navi_lane_idx = navigation->road_to_navi_lane[agent->current_lane_idx];
+    assert(navi_lane_idx != -1);
+    int table_idx = agent->navi_goal_idx * navigation->num_lanes + navi_lane_idx;
+    float lane_start_distance_m = navigation->distance_to_goal_m[table_idx];
+    agent->navi_off_route = lane_start_distance_m >= NAVI_UNREACHABLE_M;
+    float lane_progress_m = compute_lane_progress(
+        &env->road_elements[agent->current_lane_idx],
+        agent->sim_x,
+        agent->sim_y,
+        agent->cos_heading,
+        agent->sin_heading,
+        true,
+        NULL);
+    agent->navi_distance_to_goal_m
+        = agent->navi_off_route ? NAVI_UNREACHABLE_M : fmaxf(lane_start_distance_m - lane_progress_m, 0.0f);
+    float lane_start_center_m = navigation->feasibility_center_m[table_idx];
+    agent->navi_feasibility_center_m = (lane_start_center_m >= NAVI_FEASIBILITY_CAP_M)
+        ? lane_start_center_m
+        : fmaxf(lane_start_center_m - lane_progress_m, 0.0f);
+    int left_navi_lane_idx = navigation->left_lane[navi_lane_idx];
+    int right_navi_lane_idx = navigation->right_lane[navi_lane_idx];
+    agent->navi_feasibility_left_m = (left_navi_lane_idx == -1) ? 0.0f
+                                                                : navigation_feasibility_ahead_m(
+                                                                      env,
+                                                                      agent,
+                                                                      navigation->lane_road_idx[left_navi_lane_idx],
+                                                                      navigation->feasibility_left_m[table_idx]);
+    agent->navi_feasibility_right_m = (right_navi_lane_idx == -1) ? 0.0f
+                                                                  : navigation_feasibility_ahead_m(
+                                                                        env,
+                                                                        agent,
+                                                                        navigation->lane_road_idx[right_navi_lane_idx],
+                                                                        navigation->feasibility_right_m[table_idx]);
+}
+
 void c_reset(Drive *env) {
     env->autoreset_pending = 0;
     env->episode_end_timestep = env->scenario_length;
@@ -5407,6 +5597,7 @@ void c_reset(Drive *env) {
             int agent_idx = env->active_agent_indices[x];
             sample_erratic_flags(env, &env->agents[agent_idx]);
             compute_metrics(env, agent_idx, x);
+            update_navigation_state(env, agent_idx);
         }
         update_rollout_masks(env);
         compute_observations(env);
@@ -5458,6 +5649,7 @@ void c_reset(Drive *env) {
             sample_erratic_flags(env, agent);
             generate_reward_coefs(env, agent);
             compute_metrics(env, agent_idx, x);
+            update_navigation_state(env, agent_idx);
             env->logs[x].stopped_at_reset = agent->stopped ? 1.0f : 0.0f;
         }
         update_rollout_masks(env);
@@ -5608,6 +5800,10 @@ void c_step(Drive *env) {
             continue;
         }
         compute_metrics(env, agent_idx, i);
+        update_navigation_state(env, agent_idx);
+        Agent *navigated_agent = &env->agents[agent_idx];
+        env->logs[i].navi_goal_active_rate += (float) (navigated_agent->navi_goal_idx != -1);
+        env->logs[i].navi_off_route_rate += (float) navigated_agent->navi_off_route;
         compute_rewards(env, i);
     }
 

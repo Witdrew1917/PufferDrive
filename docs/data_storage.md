@@ -19,6 +19,9 @@ A bare run fetches the entries marked `default: true` in the manifest — the
 mini splits. The full splits run to hundreds of GB; fetch those by name.
 Syncs are incremental.
 
+Bins carry no navigation data. For goal-directed gigaflow routes, generate
+`.navi` sidecars locally (see [navigation.md](navigation.md)).
+
 ## AWS access
 
 Ask Eugene Vinitsky or Riccardo Savorgnan for an AWS user account. All access

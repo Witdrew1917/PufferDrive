@@ -861,6 +861,99 @@ static PyObject *vec_get_obs_html_frame(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static int check_navigation_frame_array(PyObject *array_obj, int type_num, int field_count, const char *name) {
+    if (!PyArray_Check(array_obj)) {
+        PyErr_Format(PyExc_TypeError, "%s must be a NumPy array", name);
+        return -1;
+    }
+    PyArrayObject *array = (PyArrayObject *) array_obj;
+    if (PyArray_NDIM(array) != 3 || PyArray_TYPE(array) != type_num || !PyArray_IS_C_CONTIGUOUS(array)
+        || PyArray_DIM(array, 2) != field_count) {
+        PyErr_Format(PyExc_ValueError, "%s must be a C-contiguous (envs, agents, %d) array", name, field_count);
+        return -1;
+    }
+    return 0;
+}
+
+// Writes one agent's navigation telemetry; rows of agents without an active navigation goal stay at their defaults.
+static void fill_navigation_frame_row(const Drive *drive, const Agent *agent, float *navi_row, int *route_row) {
+    const struct NavigationData *navigation = drive->navigation;
+    if (navigation == NULL || agent->navi_goal_idx == -1) {
+        return;
+    }
+    navi_row[NAVI_F32_GOAL_IDX] = (float) agent->navi_goal_idx;
+    navi_row[NAVI_F32_GOAL_X_IDX] = navigation->goal_x[agent->navi_goal_idx];
+    navi_row[NAVI_F32_GOAL_Y_IDX] = navigation->goal_y[agent->navi_goal_idx];
+    navi_row[NAVI_F32_DISTANCE_TO_GOAL_IDX] = agent->navi_distance_to_goal_m;
+    navi_row[NAVI_F32_FEASIBILITY_LEFT_IDX] = agent->navi_feasibility_left_m;
+    navi_row[NAVI_F32_FEASIBILITY_CENTER_IDX] = agent->navi_feasibility_center_m;
+    navi_row[NAVI_F32_FEASIBILITY_RIGHT_IDX] = agent->navi_feasibility_right_m;
+    navi_row[NAVI_F32_OFF_ROUTE_IDX] = (float) agent->navi_off_route;
+
+    int preview_count = 0;
+    for (int route_idx = agent->navi_route_cursor;
+         route_idx < agent->navi_route_length && preview_count < NAVI_ROUTE_PREVIEW_LANE_COUNT;
+         route_idx++) {
+        if (agent->navi_route_goal_idx[route_idx] != agent->navi_goal_idx) {
+            break;
+        }
+        route_row[preview_count++] = agent->route[route_idx];
+    }
+}
+
+static PyObject *vec_get_navigation_frame(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_navigation_frame requires 3 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+    PyObject *navi_f32_obj = PyTuple_GetItem(args, 1);
+    PyObject *navi_route_i32_obj = PyTuple_GetItem(args, 2);
+    if (check_navigation_frame_array(navi_f32_obj, NPY_FLOAT32, NAVI_F32_FIELDS, "navi_f32") != 0
+        || check_navigation_frame_array(navi_route_i32_obj, NPY_INT32, NAVI_ROUTE_PREVIEW_LANE_COUNT, "navi_route_i32")
+            != 0) {
+        return NULL;
+    }
+    PyArrayObject *navi_f32_array = (PyArrayObject *) navi_f32_obj;
+    PyArrayObject *navi_route_i32_array = (PyArrayObject *) navi_route_i32_obj;
+    if (PyArray_DIM(navi_f32_array, 0) != PyArray_DIM(navi_route_i32_array, 0)
+        || PyArray_DIM(navi_f32_array, 1) != PyArray_DIM(navi_route_i32_array, 1)) {
+        PyErr_SetString(PyExc_ValueError, "navi_f32 and navi_route_i32 must share (envs, agents) dimensions");
+        return NULL;
+    }
+
+    float *navi_f32 = (float *) PyArray_DATA(navi_f32_array);
+    int *navi_route_i32 = (int *) PyArray_DATA(navi_route_i32_array);
+    memset(navi_f32, 0, PyArray_NBYTES(navi_f32_array));
+    int env_capacity = (int) PyArray_DIM(navi_f32_array, 0);
+    int agent_capacity = (int) PyArray_DIM(navi_f32_array, 1);
+    for (int slot_idx = 0; slot_idx < env_capacity * agent_capacity; slot_idx++) {
+        navi_f32[slot_idx * NAVI_F32_FIELDS + NAVI_F32_GOAL_IDX] = -1.0f;
+        for (int preview_idx = 0; preview_idx < NAVI_ROUTE_PREVIEW_LANE_COUNT; preview_idx++) {
+            navi_route_i32[slot_idx * NAVI_ROUTE_PREVIEW_LANE_COUNT + preview_idx] = -1;
+        }
+    }
+
+    int env_count = vec->num_envs < env_capacity ? vec->num_envs : env_capacity;
+    for (int env_idx = 0; env_idx < env_count; env_idx++) {
+        Drive *drive = (Drive *) vec->envs[env_idx];
+        int agent_count = drive->num_total_agents < agent_capacity ? drive->num_total_agents : agent_capacity;
+        for (int agent_idx = 0; agent_idx < agent_count; agent_idx++) {
+            int slot_idx = env_idx * agent_capacity + agent_idx;
+            fill_navigation_frame_row(
+                drive,
+                &drive->agents[agent_idx],
+                &navi_f32[slot_idx * NAVI_F32_FIELDS],
+                &navi_route_i32[slot_idx * NAVI_ROUTE_PREVIEW_LANE_COUNT]);
+        }
+    }
+
+    Py_RETURN_NONE;
+}
+
 static PyObject *vec_close(PyObject *self, PyObject *args) {
     VecEnv *vec = unpack_vecenv(args);
     if (!vec) {
@@ -1490,6 +1583,10 @@ static PyMethodDef methods[]
         vec_get_obs_html_frame,
         METH_VARARGS,
         "Fill compact obs_html frame arrays from a VecEnv"},
+       {"vec_get_navigation_frame",
+        vec_get_navigation_frame,
+        METH_VARARGS,
+        "Fill per-agent navigation goal, feasibility and route-preview arrays from a VecEnv"},
        {"shared", (PyCFunction) my_shared, METH_VARARGS | METH_KEYWORDS, "Shared state"},
        {"get_global_agent_state", get_global_agent_state, METH_VARARGS, "Get global agent state"},
        {"vec_get_global_agent_state", vec_get_global_agent_state, METH_VARARGS, "Get agent state from vectorized env"},
@@ -1571,6 +1668,7 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "MAX_ENTITIES_PER_CELL", MAX_ENTITIES_PER_CELL);
     PyModule_AddIntConstant(m, "LANE_FEATURES", LANE_FEATURES);
     PyModule_AddIntConstant(m, "LANE_SPEED_LIMIT_FEATURES", LANE_SPEED_LIMIT_FEATURES);
+    PyModule_AddIntConstant(m, "NAVIGATION_EGO_FEATURES", NAVIGATION_EGO_FEATURES);
     PyModule_AddObject(m, "LANE_CURVATURE_NORM", PyFloat_FromDouble(LANE_CURVATURE_NORM));
     PyModule_AddIntConstant(m, "BOUNDARY_FEATURES", BOUNDARY_FEATURES);
     PyModule_AddIntConstant(m, "PARTNER_FEATURES", PARTNER_FEATURES);
@@ -1599,6 +1697,8 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "SCORE_F32_FIELDS", SCORE_F32_FIELDS);
     PyModule_AddIntConstant(m, "REWARD_F32_FIELDS", REWARD_F32_FIELDS);
     PyModule_AddIntConstant(m, "TRAFFIC_I16_FIELDS", TRAFFIC_I16_FIELDS);
+    PyModule_AddIntConstant(m, "NAVI_F32_FIELDS", NAVI_F32_FIELDS);
+    PyModule_AddIntConstant(m, "NAVI_ROUTE_PREVIEW_LANE_COUNT", NAVI_ROUTE_PREVIEW_LANE_COUNT);
     PyModule_AddIntConstant(m, "NUM_REWARD_COEFS", NUM_REWARD_COEFS);
     PyModule_AddIntConstant(m, "GOAL_REGEN_FINITE", GOAL_REGEN_FINITE);
     PyModule_AddIntConstant(m, "GOAL_REGEN_ROLLING", GOAL_REGEN_ROLLING);
@@ -1607,6 +1707,8 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "GOAL_SOURCE_GT", GOAL_SOURCE_GT);
     PyModule_AddIntConstant(m, "GOAL_SOURCE_EXTERNAL", GOAL_SOURCE_EXTERNAL);
     PyModule_AddIntConstant(m, "GOAL_SOURCE_GT_MAP", GOAL_SOURCE_GT_MAP);
+    PyModule_AddIntConstant(m, "ROUTE_SOURCE_RANDOM_WALK", ROUTE_SOURCE_RANDOM_WALK);
+    PyModule_AddIntConstant(m, "ROUTE_SOURCE_NAVIGATION", ROUTE_SOURCE_NAVIGATION);
     PyModule_AddIntConstant(m, "CONTROLLER_STATIC", CONTROLLER_STATIC);
     PyModule_AddIntConstant(m, "CONTROLLER_POLICY", CONTROLLER_POLICY);
     PyModule_AddIntConstant(m, "CONTROLLER_REPLAY", CONTROLLER_REPLAY);

@@ -1929,7 +1929,16 @@ static int unpack_map_cache_args(PyObject *kwargs, Drive *config, const char ***
     config->obs_range_road_front_m = (float) unpack(kwargs, "obs_range_road_front_m");
     config->obs_range_road_behind_m = (float) unpack(kwargs, "obs_range_road_behind_m");
     config->obs_range_road_side_m = (float) unpack(kwargs, "obs_range_road_side_m");
+    config->route_source = (int) unpack(kwargs, "route_source");
     if (PyErr_Occurred()) {
+        return -1;
+    }
+    if (config->route_source != ROUTE_SOURCE_RANDOM_WALK && config->route_source != ROUTE_SOURCE_NAVIGATION) {
+        PyErr_SetString(PyExc_ValueError, "route_source must be 0 (random_walk) or 1 (navigation)");
+        return -1;
+    }
+    config->navigation_dir = unpack_str(kwargs, "navigation_dir");
+    if (config->navigation_dir == NULL) {
         return -1;
     }
     if (config->use_neighbor_cache < 0 || config->use_neighbor_cache > 1 || config->obs_lane_stride < 1
@@ -1963,10 +1972,12 @@ static PyObject *map_cache_preload_py(
     const char **paths;
     int num_map_files;
     if (unpack_map_cache_args(kwargs, &config, &paths, &num_map_files) != 0) {
+        free(config.navigation_dir);
         return NULL;
     }
     int cached = preload_map_cache(&config, paths, num_map_files);
     free(paths);
+    free(config.navigation_dir);
     if (cached < 0) {
         PyErr_SetString(PyExc_RuntimeError, "map_cache_preload failed to load or build a map binary");
         return NULL;
@@ -1982,10 +1993,12 @@ static PyObject *map_cache_release_py(
     const char **paths;
     int num_map_files;
     if (unpack_map_cache_args(kwargs, &config, &paths, &num_map_files) != 0) {
+        free(config.navigation_dir);
         return NULL;
     }
     int released = release_preloaded_map_cache(&config, paths, num_map_files);
     free(paths);
+    free(config.navigation_dir);
     if (released != 0) {
         PyErr_SetString(PyExc_RuntimeError, "map_cache_release failed: preload configuration drifted");
         return NULL;
@@ -2050,6 +2063,18 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     }
     env->goal_regen_mode = (int) unpack(kwargs, "goal_regen_mode");
     env->goal_source = (int) unpack(kwargs, "goal_source");
+    env->route_source = (int) unpack(kwargs, "route_source");
+    if (env->route_source != ROUTE_SOURCE_RANDOM_WALK && env->route_source != ROUTE_SOURCE_NAVIGATION) {
+        PyErr_Format(
+            PyExc_ValueError,
+            "route_source must be 0 (random_walk) or 1 (navigation). Got: %d",
+            env->route_source);
+        return -1;
+    }
+    env->navigation_dir = unpack_str(kwargs, "navigation_dir");
+    if (env->navigation_dir == NULL) {
+        return -1;
+    }
     env->obs_goal_lane_distance = (int) unpack(kwargs, "obs_goal_lane_distance");
     env->obs_slots_boundary_n = (int) unpack(kwargs, "obs_slots_boundary_n");
     env->obs_slots_lane_n = (int) unpack(kwargs, "obs_slots_lane_n");
@@ -2057,6 +2082,11 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->obs_partner_relative_velocity = (int) unpack(kwargs, "obs_partner_relative_velocity");
     env->obs_lane_heading_signed = (int) unpack(kwargs, "obs_lane_heading_signed");
     env->obs_lane_speed_limit = (int) unpack(kwargs, "obs_lane_speed_limit");
+    env->obs_navigation = (int) unpack(kwargs, "obs_navigation");
+    if (env->obs_navigation && env->route_source != ROUTE_SOURCE_NAVIGATION) {
+        PyErr_SetString(PyExc_ValueError, "obs_navigation requires route_source 1 (navigation)");
+        return -1;
+    }
     env->obs_slots_traffic_controls_n = (int) unpack(kwargs, "obs_slots_traffic_controls_n");
     env->traffic_lights_enabled = (bool) unpack(kwargs, "traffic_lights_enabled");
     env->stop_signs_enabled = (bool) unpack(kwargs, "stop_signs_enabled");
@@ -2234,6 +2264,8 @@ static int my_log(PyObject *dict, Env *env, Log *log, float n) {
     assign_to_dict(dict, "spawn_failed_goal", log->spawn_failed_goal);
     assign_to_dict(dict, "stopped_at_reset", log->stopped_at_reset);
     assign_to_dict(dict, "early_reset_short", log->early_reset_short);
+    assign_to_dict(dict, "navi_goal_active_rate", log->navi_goal_active_rate);
+    assign_to_dict(dict, "navi_off_route_rate", log->navi_off_route_rate);
     assign_to_dict(dict, "offroad_rate", log->offroad_rate);
     assign_to_dict(dict, "episode_length", log->episode_length);
     assign_to_dict(dict, "collision_rate", log->collision_rate);

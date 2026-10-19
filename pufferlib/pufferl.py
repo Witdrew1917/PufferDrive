@@ -1498,6 +1498,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None, early_stop
             "min_goal_spacing",
             "max_goal_spacing",
             "obs_goal_lane_distance",
+            "obs_navigation",
             "reward_conditioning",
             "reward_randomization",
             "trajectory_prediction_length",
