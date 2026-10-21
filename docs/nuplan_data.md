@@ -105,3 +105,41 @@ puffer train puffer_drive \
     env.control_mode=control_sdc_only \
     env.scenario_length=200
 ```
+
+## WOMD-style JSON scenarios
+
+`data_utils/json_to_bin.py` converts WOMD-style JSON scenarios (the 2.0 /
+zpufferdrive `objects` + `roads` + `metadata` layout) into 3.0 bins for
+**replay mode**. Each scenario becomes one `<dataset>__<scenario_id>.bin`:
+
+```bash
+python data_utils/json_to_bin.py --input ~/Data/dl2_micro --output ~/Data/dl2_micro_bins \
+    --dataset-name dl2 --workers 8
+```
+
+The JSON has no topology, so the converter derives it:
+
+- **Lane links.** A lane exits into another lane when its end point meets the
+  other's start point (≤ 0.5 m apart, with aligned tangents).
+- **Lane graph.** Distances come from Dijkstra over the drivable lanes.
+- **Vehicle routes.** Each logged trajectory is map-matched to a chain of
+  linked lanes, then extended to a dead end. `route_gt_len` marks how much of
+  the route the log actually covers. This is a simplified version of
+  123Drive's algorithm.
+
+The input is validated strictly: a malformed scenario fails with an explicit
+error, and the command exits non-zero.
+
+The SDC (`metadata.sdc_track_index`) becomes agent 0 and is always
+controllable. Every other object with `mark_as_expert: true` is replayed when
+`env.replay_expert_agents=1`. Vehicles further than 5 m from every lane get
+no route, which means they are never policy-controlled.
+
+Not converted:
+
+- traffic lights and stop signs (the format has none);
+- lane widths (the sim default is used);
+- lane priority.
+
+`motorcyclist` maps to `CYCLIST`. Gigaflow mode is not a target, and the
+output loads fine with `data_utils/process_navigation.py`.
