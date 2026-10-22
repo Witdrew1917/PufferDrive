@@ -226,6 +226,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_FLOAT(goal_radius);
     OVERRIDE_FLOAT(goal_speed);
     OVERRIDE_INT(max_controlled_agents);
+    OVERRIDE_INT(navigation);
 
 #undef OVERRIDE_INT
 #undef OVERRIDE_FLOAT
@@ -249,6 +250,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->goal_radius = (float)unpack(kwargs, "goal_radius");
     env->goal_speed = (float)unpack(kwargs, "goal_speed");
     env->render_mode = (int)unpack(kwargs, "render_mode");
+    env->navigation_enabled = conf.navigation;
     char *map_dir = unpack_str(kwargs, "map_dir");
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");
@@ -280,6 +282,8 @@ static int my_log(PyObject *dict, Log *log) {
     assign_to_dict(dict, "goals_sampled_this_episode", log->goals_sampled_this_episode);
     assign_to_dict(dict, "goals_reached_this_episode", log->goals_reached_this_episode);
     assign_to_dict(dict, "speed_at_goal", log->speed_at_goal);
+    assign_to_dict(dict, "navi_goal_active_rate", log->navi_goal_active_rate);
+    assign_to_dict(dict, "navi_off_route_rate", log->navi_off_route_rate);
     // assign_to_dict(dict, "avg_displacement_error", log->avg_displacement_error);
     return 0;
 }

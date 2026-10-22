@@ -30,6 +30,7 @@ typedef struct {
     int init_mode;
     int control_mode;
     int max_controlled_agents;
+    int navigation;
     char map_dir[256];
 } env_init_config;
 
@@ -60,6 +61,8 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->goal_behavior = atoi(value);
     } else if (MATCH("env", "goal_target_distance")) {
         env_config->goal_target_distance = atof(value);
+    } else if (MATCH("env", "navigation")) {
+        env_config->navigation = atoi(value);
     } else if (MATCH("env", "reward_vehicle_collision")) {
         env_config->reward_vehicle_collision = atof(value);
     } else if (MATCH("env", "reward_offroad_collision")) {

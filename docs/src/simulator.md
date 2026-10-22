@@ -141,6 +141,8 @@ Where partners = `MAX_AGENTS - 1` agents × 7 features, roads = 232 segments × 
 
 **Jerk adds (3):** steering_angle, long_accel, lat_accel
 
+**Navigation adds (4, opt-in with `navigation = 1`):** has_navigation_goal, left/center/right lane feasibility (metres the agent can stay on that lane and still reach its goal, divided by 200 and capped at 1). Requires [navigation sidecars](data.md#navigation-sidecars-optional). With goal behavior 1, new goals are snapped to sidecar goal lanes.
+
 
 ### Partner features (up to `MAX_AGENTS - 1` agents, 7 each)
 rel_x, rel_y, width, length, heading_cos, heading_sin, speed
@@ -208,6 +210,8 @@ mid_x, mid_y, length, width, dir_cos, dir_sin, type
 - **`goals_reached_this_episode`** - Total goals completed across all agents
 
 - **`goals_sampled_this_episode`** - Total goals assigned (>1 in multi-goal mode)
+
+- **`navi_goal_active_rate`**, **`navi_off_route_rate`** (only with `navigation = 1`) - Fraction of steps with a navigation goal, and fraction of steps on a lane from which that goal is unreachable
 
 #### Metrics interpretation by goal behavior
 

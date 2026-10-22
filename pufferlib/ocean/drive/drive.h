@@ -103,6 +103,29 @@
 #define EGO_FEATURES_CLASSIC 8
 #define EGO_FEATURES_JERK 11
 
+// Navigation sidecar (map_XXX.navi), written by pufferlib/ocean/drive/navigation.py
+#define NAVI_MAGIC "PDNAVI01"
+#define NAVI_MAGIC_LENGTH 8
+#define NAVI_VERSION 2
+#define NAVI_FILE_SUFFIX ".navi"
+#define NAVI_HEADER_BYTES 40
+#define NAVI_LANE_ARRAY_COUNT 3
+#define NAVI_GOAL_ARRAY_COUNT 3
+#define NAVI_GOAL_LANE_ARRAY_COUNT 5
+#define NAVI_MAX_GOALS 1024
+#define NAVI_MAX_LANES 1000000
+#define NAVI_UNREACHABLE_M 1.0e9f
+#define NAVI_FEASIBILITY_CAP_M 1000.0f
+#define NAVI_CRC32_POLYNOMIAL 0xEDB88320u
+#define NAVI_CRC32_CHUNK_BYTES 65536
+#define NAVIGATION_EGO_FEATURES 4 // active flag + left/center/right lane feasibility
+#define NAVI_OBS_FEASIBILITY_HORIZON_M 200.0f
+#define NAVI_RENDER_LANE_WIDTH_PX 3.0f
+#define NAVI_RENDER_ROUTE_WIDTH_PX 6.0f
+#define NAVI_RENDER_Z_OFFSET 0.05f
+#define NAVI_RENDER_UNREACHABLE_ALPHA 0.35f
+#define NAVI_RENDER_GOAL_RADIUS_M 1.5f
+
 // Observation normalization constants
 #define MAX_SPEED 100.0f
 #define MAX_VEH_LEN 30.0f
@@ -190,6 +213,8 @@ struct Log {
     float static_agent_count;
     float perc_controlled;
     float perc_other;
+    float navi_goal_active_rate;
+    float navi_off_route_rate;
 };
 
 typedef struct Entity Entity;
@@ -237,6 +262,14 @@ struct Entity {
     int active_agent;
     int stopped;
     int removed;
+
+    // Navigation (env->navigation loaded)
+    int navi_goal_idx;  // -1 when the agent has no navigation goal
+    int navi_off_route; // 1: current lane cannot reach the navigation goal
+    float navi_distance_to_goal_m;
+    float navi_feasibility_left_m;
+    float navi_feasibility_center_m;
+    float navi_feasibility_right_m;
 
     // Jerk dynamics
     float a_long;
@@ -304,6 +337,46 @@ struct GridMap {
     GridMapEntity **neighbor_cache_entities; // preallocated array to hold neighbor entities
 };
 
+// Lane-level navigation from a map_XXX.navi sidecar. Per-goal tables are row-major [goal * num_lanes + lane].
+typedef struct Navigation Navigation;
+struct Navigation {
+    int num_lanes;
+    int num_goals;
+    int *lane_entity_idx;     // navi lane -> entity idx
+    int *entity_to_navi_lane; // entity idx -> navi lane, -1 for non-lanes; sized num_entities
+    int *left_lane;
+    int *right_lane;
+    int *goal_lane;
+    float *goal_x; // world frame shifted by world_mean, like entity coordinates
+    float *goal_y;
+    int *object_goal_idx; // per object entity, goal of its logged goal or -1; sized num_objects
+    int *next_lane;
+    float *distance_to_goal_m; // from lane start, lane changes allowed; NAVI_UNREACHABLE_M if unreachable
+    float *feasibility_left_m;
+    float *feasibility_center_m;
+    float *feasibility_right_m;
+};
+
+void free_navigation(Navigation *navigation) {
+    if (navigation == NULL) {
+        return;
+    }
+    free(navigation->lane_entity_idx);
+    free(navigation->entity_to_navi_lane);
+    free(navigation->left_lane);
+    free(navigation->right_lane);
+    free(navigation->goal_lane);
+    free(navigation->goal_x);
+    free(navigation->goal_y);
+    free(navigation->object_goal_idx);
+    free(navigation->next_lane);
+    free(navigation->distance_to_goal_m);
+    free(navigation->feasibility_left_m);
+    free(navigation->feasibility_center_m);
+    free(navigation->feasibility_right_m);
+    free(navigation);
+}
+
 struct Drive {
     Client *client;
     float *observations;
@@ -358,6 +431,8 @@ struct Drive {
     int control_mode;
     int max_controlled_agents;
     int render_mode;
+    int navigation_enabled; // ini/kwarg `navigation`; requires map_XXX.navi sidecars
+    Navigation *navigation; // NULL unless navigation_enabled
 };
 
 void add_log(Drive *env) {
@@ -405,6 +480,8 @@ void add_log(Drive *env) {
         int total = env->active_agent_count + env->static_agent_count;
         env->log.perc_controlled += (float)env->active_agent_count / (float)total;
         env->log.perc_other += (float)env->static_agent_count / (float)total;
+        env->log.navi_goal_active_rate += env->logs[i].navi_goal_active_rate / env->logs[i].episode_length;
+        env->log.navi_off_route_rate += env->logs[i].navi_off_route_rate / env->logs[i].episode_length;
         env->log.n += 1;
     }
 }
@@ -487,6 +564,263 @@ Entity *load_map_binary(const char *filename, Drive *env) {
 
     fclose(file);
     return entities;
+}
+
+// zlib-compatible CRC-32 and byte size of a file; a sidecar is bound to its map through these.
+static int navi_file_fingerprint(const char *path, uint32_t *crc_out, uint64_t *size_out) {
+    uint32_t crc_table[256];
+    for (uint32_t byte_value = 0; byte_value < 256; byte_value++) {
+        uint32_t crc = byte_value;
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 1u) ? (crc >> 1) ^ NAVI_CRC32_POLYNOMIAL : crc >> 1;
+        }
+        crc_table[byte_value] = crc;
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return -1;
+    }
+    unsigned char *chunk = (unsigned char *)malloc(NAVI_CRC32_CHUNK_BYTES);
+    if (chunk == NULL) {
+        fclose(file);
+        return -1;
+    }
+    uint32_t crc = 0xFFFFFFFFu;
+    uint64_t total_bytes = 0;
+    size_t read_count = fread(chunk, 1, NAVI_CRC32_CHUNK_BYTES, file);
+    while (read_count > 0) {
+        for (size_t i = 0; i < read_count; i++) {
+            crc = crc_table[(crc ^ chunk[i]) & 0xFFu] ^ (crc >> 8);
+        }
+        total_bytes += read_count;
+        read_count = fread(chunk, 1, NAVI_CRC32_CHUNK_BYTES, file);
+    }
+    int read_failed = ferror(file);
+    free(chunk);
+    fclose(file);
+    if (read_failed) {
+        return -1;
+    }
+    *crc_out = crc ^ 0xFFFFFFFFu;
+    *size_out = total_bytes;
+    return 0;
+}
+
+static int navi_read_array(FILE *file, void *dst, size_t element_count) {
+    return fread(dst, 4, element_count, file) == element_count ? 0 : -1;
+}
+
+static int navi_check_floats(const float *values, size_t count, float max_value) {
+    for (size_t i = 0; i < count; i++) {
+        if (!isfinite(values[i]) || values[i] < 0.0f || values[i] > max_value) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int navi_index_valid(int idx, int count, int allow_none) {
+    return (allow_none && idx == -1) || (idx >= 0 && idx < count);
+}
+
+static const char *navi_read_header(FILE *file, const Drive *env, int *num_lanes_out, int *num_goals_out) {
+    char magic[NAVI_MAGIC_LENGTH];
+    int32_t version, num_objects, num_roads, num_lanes, num_goals;
+    uint32_t map_crc32;
+    uint64_t map_size_bytes;
+    if (fread(magic, 1, NAVI_MAGIC_LENGTH, file) != NAVI_MAGIC_LENGTH || fread(&version, 4, 1, file) != 1 ||
+        fread(&map_crc32, 4, 1, file) != 1 || fread(&map_size_bytes, 8, 1, file) != 1 ||
+        fread(&num_objects, 4, 1, file) != 1 || fread(&num_roads, 4, 1, file) != 1 ||
+        fread(&num_lanes, 4, 1, file) != 1 || fread(&num_goals, 4, 1, file) != 1) {
+        return "truncated header";
+    }
+    if (memcmp(magic, NAVI_MAGIC, NAVI_MAGIC_LENGTH) != 0) {
+        return "bad magic";
+    }
+    if (version != NAVI_VERSION) {
+        return "unsupported version (expected the PufferDrive 2.0 layout)";
+    }
+    int map_lane_count = 0;
+    for (int entity_idx = 0; entity_idx < env->num_entities; entity_idx++) {
+        map_lane_count += env->entities[entity_idx].type == ROAD_LANE;
+    }
+    if (num_objects != env->num_objects || num_roads != env->num_roads || num_lanes != map_lane_count) {
+        return "object/road/lane counts do not match the map";
+    }
+    if (num_lanes < 1 || num_lanes > NAVI_MAX_LANES || num_goals < 1 || num_goals > NAVI_MAX_GOALS) {
+        return "lane or goal count out of range";
+    }
+    uint32_t actual_crc32;
+    uint64_t actual_size_bytes;
+    if (navi_file_fingerprint(env->map_name, &actual_crc32, &actual_size_bytes) != 0) {
+        return "cannot fingerprint the map binary";
+    }
+    if (actual_crc32 != map_crc32 || actual_size_bytes != map_size_bytes) {
+        return "stale sidecar: map fingerprint mismatch (regenerate with drive.py navigation --overwrite)";
+    }
+    *num_lanes_out = num_lanes;
+    *num_goals_out = num_goals;
+    return NULL;
+}
+
+static const char *navi_allocate(const Drive *env, Navigation *navigation) {
+    size_t num_lanes = (size_t)navigation->num_lanes;
+    size_t num_goals = (size_t)navigation->num_goals;
+    size_t table_count = num_goals * num_lanes;
+    navigation->lane_entity_idx = (int *)malloc(num_lanes * sizeof(int));
+    navigation->entity_to_navi_lane = (int *)malloc((size_t)env->num_entities * sizeof(int));
+    navigation->left_lane = (int *)malloc(num_lanes * sizeof(int));
+    navigation->right_lane = (int *)malloc(num_lanes * sizeof(int));
+    navigation->goal_lane = (int *)malloc(num_goals * sizeof(int));
+    navigation->goal_x = (float *)malloc(num_goals * sizeof(float));
+    navigation->goal_y = (float *)malloc(num_goals * sizeof(float));
+    navigation->object_goal_idx = (int *)malloc(((size_t)env->num_objects + 1) * sizeof(int));
+    navigation->next_lane = (int *)malloc(table_count * sizeof(int));
+    navigation->distance_to_goal_m = (float *)malloc(table_count * sizeof(float));
+    navigation->feasibility_left_m = (float *)malloc(table_count * sizeof(float));
+    navigation->feasibility_center_m = (float *)malloc(table_count * sizeof(float));
+    navigation->feasibility_right_m = (float *)malloc(table_count * sizeof(float));
+    if (!navigation->lane_entity_idx || !navigation->entity_to_navi_lane || !navigation->left_lane ||
+        !navigation->right_lane || !navigation->goal_lane || !navigation->goal_x || !navigation->goal_y ||
+        !navigation->object_goal_idx || !navigation->next_lane || !navigation->distance_to_goal_m ||
+        !navigation->feasibility_left_m || !navigation->feasibility_center_m || !navigation->feasibility_right_m) {
+        return "out of memory";
+    }
+    return NULL;
+}
+
+// Lanes must be exactly the map's ROAD_LANE entities, in ascending order.
+static const char *navi_validate_lanes(const Drive *env, Navigation *navigation) {
+    for (int entity_idx = 0; entity_idx < env->num_entities; entity_idx++) {
+        navigation->entity_to_navi_lane[entity_idx] = -1;
+    }
+    for (int lane = 0; lane < navigation->num_lanes; lane++) {
+        int entity_idx = navigation->lane_entity_idx[lane];
+        if (!navi_index_valid(entity_idx, env->num_entities, 0) || env->entities[entity_idx].type != ROAD_LANE) {
+            return "lane_entity_idx references a non-lane entity";
+        }
+        if (lane > 0 && entity_idx <= navigation->lane_entity_idx[lane - 1]) {
+            return "lane_entity_idx is not strictly ascending";
+        }
+        navigation->entity_to_navi_lane[entity_idx] = lane;
+    }
+    for (int lane = 0; lane < navigation->num_lanes; lane++) {
+        int left = navigation->left_lane[lane];
+        int right = navigation->right_lane[lane];
+        if (!navi_index_valid(left, navigation->num_lanes, 1) || left == lane ||
+            !navi_index_valid(right, navigation->num_lanes, 1) || right == lane) {
+            return "left_lane/right_lane index out of range";
+        }
+    }
+    return NULL;
+}
+
+static const char *navi_validate_goals(const Drive *env, const Navigation *navigation) {
+    int num_lanes = navigation->num_lanes;
+    for (int goal = 0; goal < navigation->num_goals; goal++) {
+        if (!navi_index_valid(navigation->goal_lane[goal], num_lanes, 0)) {
+            return "goal_lane index out of range";
+        }
+        if (!isfinite(navigation->goal_x[goal]) || !isfinite(navigation->goal_y[goal])) {
+            return "goal position is not finite";
+        }
+        const int *next_row = &navigation->next_lane[(size_t)goal * num_lanes];
+        if (next_row[navigation->goal_lane[goal]] != -1) {
+            return "next_lane at the goal lane must be -1";
+        }
+        for (int lane = 0; lane < num_lanes; lane++) {
+            if (!navi_index_valid(next_row[lane], num_lanes, 1)) {
+                return "next_lane index out of range";
+            }
+        }
+    }
+    for (int object_idx = 0; object_idx < env->num_objects; object_idx++) {
+        if (!navi_index_valid(navigation->object_goal_idx[object_idx], navigation->num_goals, 1)) {
+            return "object_goal_idx out of range";
+        }
+    }
+    size_t table_count = (size_t)navigation->num_goals * (size_t)num_lanes;
+    if (navi_check_floats(navigation->distance_to_goal_m, table_count, NAVI_UNREACHABLE_M) != 0) {
+        return "distance_to_goal_m must be finite and in [0, NAVI_UNREACHABLE_M]";
+    }
+    if (navi_check_floats(navigation->feasibility_left_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0 ||
+        navi_check_floats(navigation->feasibility_center_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0 ||
+        navi_check_floats(navigation->feasibility_right_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0) {
+        return "feasibility must be finite and in [0, NAVI_FEASIBILITY_CAP_M]";
+    }
+    return NULL;
+}
+
+static const char *navi_read_body(FILE *file, const Drive *env, Navigation *navigation) {
+    size_t num_lanes = (size_t)navigation->num_lanes;
+    size_t num_goals = (size_t)navigation->num_goals;
+    size_t table_count = num_goals * num_lanes;
+    uint64_t expected_bytes =
+        NAVI_HEADER_BYTES +
+        4u * ((uint64_t)NAVI_LANE_ARRAY_COUNT * num_lanes + (uint64_t)NAVI_GOAL_ARRAY_COUNT * num_goals +
+              (uint64_t)env->num_objects + (uint64_t)NAVI_GOAL_LANE_ARRAY_COUNT * table_count);
+    if (fseek(file, 0, SEEK_END) != 0 || (uint64_t)ftell(file) != expected_bytes ||
+        fseek(file, NAVI_HEADER_BYTES, SEEK_SET) != 0) {
+        return "file size does not match header counts (truncated or trailing bytes)";
+    }
+    const char *error = navi_allocate(env, navigation);
+    if (error != NULL) {
+        return error;
+    }
+    if (navi_read_array(file, navigation->lane_entity_idx, num_lanes) ||
+        navi_read_array(file, navigation->left_lane, num_lanes) ||
+        navi_read_array(file, navigation->right_lane, num_lanes) ||
+        navi_read_array(file, navigation->goal_lane, num_goals) ||
+        navi_read_array(file, navigation->goal_x, num_goals) || navi_read_array(file, navigation->goal_y, num_goals) ||
+        navi_read_array(file, navigation->object_goal_idx, (size_t)env->num_objects) ||
+        navi_read_array(file, navigation->next_lane, table_count) ||
+        navi_read_array(file, navigation->distance_to_goal_m, table_count) ||
+        navi_read_array(file, navigation->feasibility_left_m, table_count) ||
+        navi_read_array(file, navigation->feasibility_center_m, table_count) ||
+        navi_read_array(file, navigation->feasibility_right_m, table_count)) {
+        return "truncated body";
+    }
+    error = navi_validate_lanes(env, navigation);
+    return error != NULL ? error : navi_validate_goals(env, navigation);
+}
+
+// Loads and validates map_XXX.navi against the loaded map; aborts on any error. Goals stay unshifted.
+Navigation *load_navigation_binary(Drive *env) {
+    size_t map_name_length = strlen(env->map_name);
+    size_t bin_suffix_length = strlen(".bin");
+    if (map_name_length < bin_suffix_length ||
+        strcmp(env->map_name + map_name_length - bin_suffix_length, ".bin") != 0) {
+        raise_error_with_message(ERROR_INVALID_ARGUMENT, "navigation needs a .bin map path, got %s", env->map_name);
+    }
+    size_t stem_length = map_name_length - bin_suffix_length;
+    size_t path_length = stem_length + strlen(NAVI_FILE_SUFFIX) + 1;
+    char *path = (char *)malloc(path_length);
+    if (path == NULL) {
+        RAISE_MEMORY_ERROR_WITH_SIZE(path_length);
+    }
+    snprintf(path, path_length, "%.*s%s", (int)stem_length, env->map_name, NAVI_FILE_SUFFIX);
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        raise_error_with_message(ERROR_FILE_NOT_FOUND,
+                                 "navigation=1 but sidecar %s is missing (python -m pufferlib.ocean.drive.drive "
+                                 "navigation --map-dir <map_dir>)",
+                                 path);
+    }
+    Navigation *navigation = (Navigation *)calloc(1, sizeof(Navigation));
+    const char *error = navigation == NULL ? "out of memory" : NULL;
+    if (error == NULL) {
+        error = navi_read_header(file, env, &navigation->num_lanes, &navigation->num_goals);
+    }
+    if (error == NULL) {
+        error = navi_read_body(file, env, navigation);
+    }
+    fclose(file);
+    if (error != NULL) {
+        free_navigation(navigation);
+        raise_error_with_message(ERROR_INITIALIZATION_FAILED, "invalid navigation sidecar %s: %s", path, error);
+    }
+    free(path);
+    return navigation;
 }
 
 void set_start_position(Drive *env) {
@@ -1240,6 +1574,108 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     return;
 }
 
+// Arc length (m) along a lane polyline of the point closest to (x, y).
+float lane_progress_m(const Entity *lane, float x, float y) {
+    float best_distance = INFINITY;
+    float best_progress_m = 0.0f;
+    float segment_start_m = 0.0f;
+    for (int point_idx = 0; point_idx + 1 < lane->array_size; point_idx++) {
+        float start_x = lane->traj_x[point_idx];
+        float start_y = lane->traj_y[point_idx];
+        float segment_dx = lane->traj_x[point_idx + 1] - start_x;
+        float segment_dy = lane->traj_y[point_idx + 1] - start_y;
+        float segment_length_sq = segment_dx * segment_dx + segment_dy * segment_dy;
+        float segment_length_m = sqrtf(segment_length_sq);
+        float t = 0.0f;
+        if (segment_length_sq > 0.0f) {
+            t = clip(((x - start_x) * segment_dx + (y - start_y) * segment_dy) / segment_length_sq, 0.0f, 1.0f);
+        }
+        float distance = relative_distance_2d(x, y, start_x + t * segment_dx, start_y + t * segment_dy);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_progress_m = segment_start_m + t * segment_length_m;
+        }
+        segment_start_m += segment_length_m;
+    }
+    return best_progress_m;
+}
+
+// Lane-start feasibility minus progress along the lane; forbidden (0) and capped values pass through.
+float navigation_feasibility_ahead_m(float lane_start_feasibility_m, float lane_progress) {
+    if (lane_start_feasibility_m <= 0.0f || lane_start_feasibility_m >= NAVI_FEASIBILITY_CAP_M) {
+        return lane_start_feasibility_m;
+    }
+    return fmaxf(lane_start_feasibility_m - lane_progress, 0.0f);
+}
+
+void reset_navigation_state(Drive *env, int agent_idx) {
+    Entity *agent = &env->entities[agent_idx];
+    agent->navi_goal_idx = env->navigation->object_goal_idx[agent_idx];
+    agent->navi_off_route = 0;
+    agent->navi_distance_to_goal_m = 0.0f;
+    agent->navi_feasibility_left_m = 0.0f;
+    agent->navi_feasibility_center_m = 0.0f;
+    agent->navi_feasibility_right_m = 0.0f;
+}
+
+// Refreshes goal distance and lane feasibility from current_lane_idx; off-lane keeps the last known state.
+void update_navigation_state(Drive *env, int agent_idx) {
+    Entity *agent = &env->entities[agent_idx];
+    if (agent->navi_goal_idx == -1 || agent->current_lane_idx == -1) {
+        return;
+    }
+    const Navigation *navigation = env->navigation;
+    int navi_lane_idx = navigation->entity_to_navi_lane[agent->current_lane_idx];
+    int table_idx = agent->navi_goal_idx * navigation->num_lanes + navi_lane_idx;
+    float progress_m = lane_progress_m(&env->entities[agent->current_lane_idx], agent->x, agent->y);
+    float lane_start_distance_m = navigation->distance_to_goal_m[table_idx];
+    agent->navi_off_route = lane_start_distance_m >= NAVI_UNREACHABLE_M;
+    agent->navi_distance_to_goal_m =
+        agent->navi_off_route ? NAVI_UNREACHABLE_M : fmaxf(lane_start_distance_m - progress_m, 0.0f);
+    agent->navi_feasibility_center_m =
+        navigation_feasibility_ahead_m(navigation->feasibility_center_m[table_idx], progress_m);
+    int left_navi_lane_idx = navigation->left_lane[navi_lane_idx];
+    int right_navi_lane_idx = navigation->right_lane[navi_lane_idx];
+    agent->navi_feasibility_left_m = 0.0f;
+    agent->navi_feasibility_right_m = 0.0f;
+    if (left_navi_lane_idx != -1) {
+        const Entity *left_lane = &env->entities[navigation->lane_entity_idx[left_navi_lane_idx]];
+        agent->navi_feasibility_left_m = navigation_feasibility_ahead_m(navigation->feasibility_left_m[table_idx],
+                                                                        lane_progress_m(left_lane, agent->x, agent->y));
+    }
+    if (right_navi_lane_idx != -1) {
+        const Entity *right_lane = &env->entities[navigation->lane_entity_idx[right_navi_lane_idx]];
+        agent->navi_feasibility_right_m = navigation_feasibility_ahead_m(
+            navigation->feasibility_right_m[table_idx], lane_progress_m(right_lane, agent->x, agent->y));
+    }
+}
+
+// Reachable navigation goal whose remaining route distance is closest to goal_target_distance; -1 if none.
+int closest_navigation_goal(Drive *env, int agent_idx) {
+    Entity *agent = &env->entities[agent_idx];
+    if (agent->current_lane_idx == -1) {
+        return -1;
+    }
+    const Navigation *navigation = env->navigation;
+    int navi_lane_idx = navigation->entity_to_navi_lane[agent->current_lane_idx];
+    float progress_m = lane_progress_m(&env->entities[agent->current_lane_idx], agent->x, agent->y);
+    int best_goal_idx = -1;
+    float best_distance_error_m = INFINITY;
+    for (int goal_idx = 0; goal_idx < navigation->num_goals; goal_idx++) {
+        float lane_start_distance_m = navigation->distance_to_goal_m[goal_idx * navigation->num_lanes + navi_lane_idx];
+        float remaining_distance_m = lane_start_distance_m - progress_m;
+        if (lane_start_distance_m >= NAVI_UNREACHABLE_M || remaining_distance_m < env->goal_radius) {
+            continue;
+        }
+        float distance_error_m = fabsf(remaining_distance_m - env->goal_target_distance);
+        if (distance_error_m < best_distance_error_m) {
+            best_distance_error_m = distance_error_m;
+            best_goal_idx = goal_idx;
+        }
+    }
+    return best_goal_idx;
+}
+
 bool should_control_agent(Drive *env, int agent_idx, int control_limit) {
     // Check if we have room for more agents or are already at capacity
     if (env->active_agent_count >= control_limit) {
@@ -1469,6 +1905,17 @@ void init(Drive *env) {
     set_start_position(env);
     init_goal_positions(env);
     env->logs = (Log *)calloc(env->active_agent_count, sizeof(Log));
+    env->navigation = NULL;
+    if (env->navigation_enabled) {
+        env->navigation = load_navigation_binary(env);
+        for (int goal_idx = 0; goal_idx < env->navigation->num_goals; goal_idx++) {
+            env->navigation->goal_x[goal_idx] -= env->world_mean_x;
+            env->navigation->goal_y[goal_idx] -= env->world_mean_y;
+        }
+        for (int i = 0; i < env->active_agent_count; i++) {
+            reset_navigation_state(env, env->active_agent_indices[i]);
+        }
+    }
 }
 
 void close_client(Client *client);
@@ -1504,11 +1951,18 @@ void c_close(Drive *env) {
     free(env->ini_file);
     free(env->tracks_to_predict_indices);
     env->tracks_to_predict_indices = NULL;
+    free_navigation(env->navigation);
+    env->navigation = NULL;
+}
+
+int ego_feature_count(const Drive *env) {
+    int dynamics_ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+    return env->navigation_enabled ? dynamics_ego_dim + NAVIGATION_EGO_FEATURES : dynamics_ego_dim;
 }
 
 void allocate(Drive *env) {
     init(env);
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+    int ego_dim = ego_feature_count(env);
     int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
     env->observations = (float *)calloc(env->active_agent_count * max_obs, sizeof(float));
     env->actions = (float *)calloc(env->active_agent_count * 2, sizeof(float));
@@ -1807,7 +2261,7 @@ void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *leng
 }
 
 void compute_observations(Drive *env) {
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+    int ego_dim = ego_feature_count(env);
     int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
     memset(env->observations, 0, max_obs * env->active_agent_count * sizeof(float));
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
@@ -1850,6 +2304,14 @@ void compute_observations(Drive *env) {
         } else {
             obs[6] = (ego_entity->respawn_timestep != -1) ? 1 : 0;
             obs[7] = ego_entity->type / 3.0f;
+        }
+
+        if (env->navigation != NULL && ego_entity->navi_goal_idx != -1) {
+            float *navi_obs = &obs[ego_dim - NAVIGATION_EGO_FEATURES];
+            navi_obs[0] = 1.0f;
+            navi_obs[1] = fminf(ego_entity->navi_feasibility_left_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
+            navi_obs[2] = fminf(ego_entity->navi_feasibility_center_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
+            navi_obs[3] = fminf(ego_entity->navi_feasibility_right_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
         }
 
         // Relative Pos of other cars
@@ -1978,6 +2440,15 @@ void compute_observations(Drive *env) {
 void sample_new_goal(Drive *env, int agent_idx) {
     // Samples a new goal position based on the existing road lane points
     Entity *agent = &env->entities[agent_idx];
+    if (env->navigation != NULL) {
+        agent->navi_goal_idx = closest_navigation_goal(env, agent_idx);
+        if (agent->navi_goal_idx != -1) {
+            agent->goal_position_x = env->navigation->goal_x[agent->navi_goal_idx];
+            agent->goal_position_y = env->navigation->goal_y[agent->navi_goal_idx];
+            agent->goals_sampled_this_episode += 1;
+            return;
+        }
+    }
     float best_x = agent->x;
     float best_y = agent->y;
     float best_distance_error = 1e30f;
@@ -2054,6 +2525,10 @@ void c_reset(Drive *env) {
         }
 
         compute_agent_metrics(env, agent_idx);
+        if (env->navigation != NULL) {
+            reset_navigation_state(env, agent_idx);
+            update_navigation_state(env, agent_idx);
+        }
     }
     compute_observations(env);
 }
@@ -2195,6 +2670,15 @@ void c_step(Drive *env) {
                 env->entities[agent_idx].stopped = 1;
                 env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
             }
+        }
+    }
+
+    if (env->navigation != NULL) {
+        for (int i = 0; i < env->active_agent_count; i++) {
+            int agent_idx = env->active_agent_indices[i];
+            update_navigation_state(env, agent_idx);
+            env->logs[i].navi_goal_active_rate += env->entities[agent_idx].navi_goal_idx != -1;
+            env->logs[i].navi_off_route_rate += env->entities[agent_idx].navi_off_route;
         }
     }
 
@@ -2463,7 +2947,7 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         return;
     }
 
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+    int ego_dim = ego_feature_count(env);
     int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
     float *agent_obs = &observations[agent_index][0];
@@ -2711,6 +3195,49 @@ void draw_road_edge(Drive *env, float start_x, float start_y, float end_x, float
     DrawTriangle3D(t3, t4, b4, CURB_SIDE);
     DrawTriangle3D(b4, t4, b1, CURB_SIDE);
     DrawTriangle3D(t4, t1, b1, CURB_SIDE);
+}
+
+void draw_lane_polyline(const Entity *lane, float z, Color color) {
+    for (int point_idx = 0; point_idx + 1 < lane->array_size; point_idx++) {
+        DrawLine3D((Vector3){lane->traj_x[point_idx], lane->traj_y[point_idx], z},
+                   (Vector3){lane->traj_x[point_idx + 1], lane->traj_y[point_idx + 1], z}, color);
+    }
+}
+
+// Lanes coloured by centre feasibility toward the selected agent's goal (red→green), grey if unreachable.
+void draw_navigation_overlay(Drive *env) {
+    const Navigation *navigation = env->navigation;
+    const Entity *agent = &env->entities[env->active_agent_indices[env->human_agent_idx]];
+    if (agent->navi_goal_idx == -1) {
+        return;
+    }
+    int goal_table_offset = agent->navi_goal_idx * navigation->num_lanes;
+    rlSetLineWidth(NAVI_RENDER_LANE_WIDTH_PX);
+    for (int navi_lane_idx = 0; navi_lane_idx < navigation->num_lanes; navi_lane_idx++) {
+        const Entity *lane = &env->entities[navigation->lane_entity_idx[navi_lane_idx]];
+        Color lane_color = Fade(GRAY, NAVI_RENDER_UNREACHABLE_ALPHA);
+        if (navigation->distance_to_goal_m[goal_table_offset + navi_lane_idx] < NAVI_UNREACHABLE_M) {
+            float feasibility_ratio = fminf(navigation->feasibility_center_m[goal_table_offset + navi_lane_idx] /
+                                                NAVI_OBS_FEASIBILITY_HORIZON_M,
+                                            1.0f);
+            lane_color = (Color){(unsigned char)(255.0f * (1.0f - feasibility_ratio)),
+                                 (unsigned char)(255.0f * feasibility_ratio), 0, 255};
+        }
+        draw_lane_polyline(lane, Z_ROAD_MARKINGS + NAVI_RENDER_Z_OFFSET, lane_color);
+    }
+    if (agent->current_lane_idx != -1) {
+        rlSetLineWidth(NAVI_RENDER_ROUTE_WIDTH_PX);
+        int navi_lane_idx = navigation->entity_to_navi_lane[agent->current_lane_idx];
+        for (int hop_count = 0; hop_count < navigation->num_lanes && navi_lane_idx != -1; hop_count++) {
+            draw_lane_polyline(&env->entities[navigation->lane_entity_idx[navi_lane_idx]],
+                               Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET, PUFF_CYAN);
+            navi_lane_idx = navigation->next_lane[goal_table_offset + navi_lane_idx];
+        }
+    }
+    rlSetLineWidth(1.0f);
+    DrawSphere(
+        (Vector3){navigation->goal_x[agent->navi_goal_idx], navigation->goal_y[agent->navi_goal_idx], Z_AGENT_DETAILS},
+        NAVI_RENDER_GOAL_RADIUS_M, PUFF_CYAN);
 }
 
 void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, int show_grid) {
@@ -2965,6 +3492,10 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                 }
             }
         }
+    }
+
+    if (env->navigation != NULL && obs_only == 0) {
+        draw_navigation_overlay(env);
     }
 
     EndMode3D();
