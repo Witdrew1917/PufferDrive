@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: nvidia/cuda:12.8.1-devel-ubuntu24.04
+From: nvidia/cuda:12.2.2-devel-ubuntu22.04
 
 # PufferDrive base container.
 #
@@ -8,14 +8,14 @@ From: nvidia/cuda:12.8.1-devel-ubuntu24.04
 # CPython interpreters. Python packages are NOT installed here -- create the
 # venv on the host-side repo checkout after the image is built (see %help).
 #
-# CUDA 12.8 runs fine under a 13.0 host driver (drivers are backwards
-# compatible with older toolkits), so `--nv` works on a nvidia-smi 13.0 node.
+# HAL's existing runtime uses CUDA 12.2.2; keep the toolkit compatible with
+# those nodes while building the editable environment for PufferDrive 3.0.
 
 %labels
     Author      Emerge-Lab
     Project     PufferDrive
-    CudaVersion 12.8.1
-    BaseOS      ubuntu24.04
+    CudaVersion 12.2.2
+    BaseOS      ubuntu22.04
 
 %environment
     export LC_ALL=C.UTF-8
@@ -87,8 +87,7 @@ From: nvidia/cuda:12.8.1-devel-ubuntu24.04
 
     # ---- managed interpreters -------------------------------------------
     # Baked in so compute nodes without outbound network can still make venvs.
-    # pyproject.toml declares requires-python >=3.9; 3.12 is the default here,
-    # 3.11 matches .github/workflows/utest.yml. Add more versions as needed.
+    # PufferDrive 3.0 supports Python 3.9+; 3.12 is the training default.
     export UV_PYTHON_INSTALL_DIR=/opt/uv/python
     uv python install 3.12 3.11
     uv python list --only-installed
@@ -116,8 +115,12 @@ uv venv --python "$PYTHON_VERSION" "$VENV_DIR"
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
+echo ">>> installing CUDA 12.1 PyTorch wheels for HAL's CUDA 12.2 nodes"
+uv pip install torch --index-url https://download.pytorch.org/whl/cu121
+uv pip install "numpy<2" "setuptools<81" wheel
+
 echo ">>> installing pufferlib (editable)"
-uv pip install -e .
+uv pip install --no-build-isolation -e .
 
 echo ">>> compiling C extensions"
 python setup.py build_ext --inplace --force
@@ -148,7 +151,7 @@ EOS
     gcc --version | head -1
 
 %help
-    PufferDrive system container (CUDA 12.8.1 devel / Ubuntu 24.04).
+    PufferDrive 3.0 system container (CUDA 12.2.2 devel / Ubuntu 22.04).
 
     Contains: nvcc + gcc/g++, cmake, ffmpeg, xvfb, the X11/GL libraries raylib
     links against, and uv with managed CPython 3.12 and 3.11.
@@ -161,8 +164,8 @@ EOS
             --bind $PWD:$PWD --pwd $PWD \
             pufferdrive.sif /opt/pufferdrive/setup-venv.sh
 
-    That runs `uv venv`, `uv pip install -e .` and
-    `python setup.py build_ext --inplace --force`.
+    That installs CUDA 12.1 PyTorch wheels, installs PufferDrive without
+    build isolation, and runs `python setup.py build_ext --inplace --force`.
 
     Afterwards, the runscript activates ./.venv automatically:
 

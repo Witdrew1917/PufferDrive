@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task 128
+#SBATCH --gres=gpu:4
+#SBATCH --mem 480G
+#SBATCH --time 15-00:00:00
+#SBATCH --output /staging/agp/users/%u/logs/zpufferdrive/%j.out
+#SBATCH --partition zprod
+#SBATCH --job-name=pufferdrive-nightly
+#
+
+NUM_GPUS="${NUM_GPUS:-4}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$SCRIPT_DIR/_hal_nightly.sh" "$NUM_GPUS" "$@"

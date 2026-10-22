@@ -2,9 +2,9 @@ load_model_path: null
 load_id: null
 num_scenarios: 3
 max_runs: 200
-wandb: false
+wandb: True
 wandb_project: pufferlib
-wandb_group: debug
+wandb_group: drive
 # Unique run identifier. Doubles as the logger run id, so relaunching with the
 # same run_name and train.data_dir resumes that run instead of starting a new one.
 run_name: default_run

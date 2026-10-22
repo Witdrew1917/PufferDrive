@@ -1,0 +1,22 @@
+# Multi-agent nightly recipe with goal-directed navigation observations.
+#
+# Used by scripts/cluster/train_hal*.sh. Navigation sidecars are generated
+# into a per-job temporary directory before training.
+policy.action_type: discrete
+env.num_agents: 3200
+env.goal_source: route
+env.route_source: navigation
+env.navigation_dir: ""
+env.obs_navigation: true
+vec.num_envs: 40
+train.minibatch_size: 256000
+train.max_minibatch_size: 64000
+train.compile: true
+
+train.total_timesteps: 10_000_000_000
+train.checkpoint_interval: 500
+train.evaluation_interval_epochs: 100
+train.evaluation_benchmarks: carla_fast
+
+wandb: True
+wandb_project: nightly-multi
