@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-CONTAINER="${PUFFERDRIVE_IMAGE:-$REPO_ROOT/container/pufferdrive.sif}"
+CONTAINER="${PUFFERDRIVE_IMAGE:-/staging/agp/containers/pufferdrive_20261022.sif}"
 PROGRAM_CONFIG="${PROGRAM_CONFIG:-$REPO_ROOT/scripts/cluster_configs/nightly_navigation.yaml}"
 MAP_DIR="${MAP_DIR:-$REPO_ROOT/pufferlib/resources/drive/binaries/carla}"
 RUNS_DIR="${RUNS_DIR:-$REPO_ROOT/experiments}"
