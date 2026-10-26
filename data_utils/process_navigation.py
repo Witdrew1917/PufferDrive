@@ -3,16 +3,16 @@
 
 Reads navigation-free `.bin` maps, derives a goal-conditioned lane navigation table and writes
 `<map_stem>.navi` next to each map (or into --output-dir). The C env loads it when
-`env.route_source=navigation` and replaces the random-walk route with goal-directed routes.
+`env.obs_navigation=true` and conditions the navigation features on whatever goal the agent has.
 
 Per map:
   * lanes        every lane-type road element (types 0-9), indexed in ascending road order
   * lateral      left/right neighbour per lane: co-directional lane one lane-width to the side at
                  every probe point, with no solid line / road edge in between (legal lane change)
-  * goals        dead-end lanes + logged route-end lanes, topped up by farthest-point sampling
-  * per goal     Dijkstra (lane change cost LANE_CHANGE_COST_M) -> distance_to_goal_m;
-                 longitudinal-only Dijkstra -> next_lane (route chains follow exit lanes only);
-                 feasibility_*_m = metres one can stay in (left/own/right) lane and still reach the goal
+  * per goal     every lane is a goal; Dijkstra (lane change cost NAVI_LANE_CHANGE_COST_M) ->
+                 distance_to_goal_m from each lane start to the goal lane end;
+                 feasibility_center_m = metres one can keep following exit lanes and still reach the goal
+                 (NAVI_FEASIBILITY_CAP_M once the stay chain reaches the goal lane)
 
 Usage:
     python data_utils/process_navigation.py --input pufferlib/resources/drive/binaries/carla
@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mirror_map_bin import _is_lane, read_bin  # noqa: E402
 from navigation_bin import (  # noqa: E402
     NAVI_FEASIBILITY_CAP_M,
-    NAVI_MAX_GOALS,
+    NAVI_LANE_CHANGE_COST_M,
+    NAVI_MAX_LANES,
     NAVI_UNREACHABLE_M,
     map_fingerprint,
     navigation_path_for,
@@ -51,7 +52,6 @@ ROAD_LINE_TYPE_RANGE = (10, 19)
 ROAD_EDGE_TYPE_RANGE = (20, 29)
 
 DEFAULT_LANE_WIDTH_M = 3.7
-LANE_CHANGE_COST_M = 10.0
 MIN_EDGE_COST_M = 1.0e-3
 LATERAL_HEADING_COS_MIN = 0.9
 LATERAL_OFFSET_TOLERANCE_FRAC = 0.5
@@ -59,8 +59,6 @@ LATERAL_PROBE_FRACTIONS = (0.25, 0.5, 0.75)
 MARKER_SEARCH_RADIUS_M = 1.0
 DENSIFY_STEP_M = 0.5
 FEASIBILITY_MAX_HOPS = 512
-DEFAULT_MAX_GOALS = 64
-GOAL_SEED_BASE = 42
 DEFAULT_TIMEOUT_SECONDS = 600
 
 
@@ -177,74 +175,48 @@ def _dijkstra_to_goal(goal_lane, lane_costs, reverse_edges):
     return dist
 
 
-def _best_successor(successors, dist):
-    """Successor with minimum finite distance (lowest index on ties), or -1."""
-    best, best_dist = -1, np.inf
-    for succ in successors:
-        if dist[succ] < best_dist:
-            best, best_dist = succ, dist[succ]
-    return best
+def _stay_successors(exits, distance_to_goal):
+    """Per (goal, lane): the exit lane with the smallest distance to the goal (lowest index on ties), or -1."""
+    num_goals, num_lanes = distance_to_goal.shape
+    max_exit_count = max((len(lane_exits) for lane_exits in exits), default=0)
+    if max_exit_count == 0:
+        return np.full((num_goals, num_lanes), -1, dtype=np.int64)
+    padded_exits = np.full((num_lanes, max_exit_count), -1, dtype=np.int64)
+    for lane, lane_exits in enumerate(exits):
+        padded_exits[lane, : len(lane_exits)] = lane_exits
+    exit_distances = np.where(padded_exits[None] >= 0, distance_to_goal[:, np.maximum(padded_exits, 0)], np.inf)
+    best_slot = np.argmin(exit_distances, axis=2)
+    best_exit = np.take_along_axis(padded_exits[None].repeat(num_goals, 0), best_slot[..., None], axis=2)[..., 0]
+    has_reachable_exit = np.isfinite(np.min(exit_distances, axis=2))
+    return np.where(has_reachable_exit, best_exit, -1)
 
 
-def _center_feasibility(lane, goal_lane, lengths, dist_full, stay_next):
-    """Metres one can keep following exit lanes from `lane` start while the goal stays reachable."""
-    accumulated_m = 0.0
-    current = lane
+def _center_feasibility(lengths, distance_to_goal, stay_next):
+    """Metres one can follow stay_next from each lane start with the goal reachable; capped on the goal lane."""
+    num_goals, num_lanes = distance_to_goal.shape
+    reachable = np.isfinite(distance_to_goal)
+    goal_rows = np.arange(num_goals)[:, None]
+    is_goal_lane = np.zeros((num_goals, num_lanes), dtype=bool)
+    is_goal_lane[np.arange(num_goals), np.arange(num_goals)] = True
+    feasibility = np.zeros((num_goals, num_lanes), dtype=np.float64)
     for _ in range(FEASIBILITY_MAX_HOPS):
-        if not np.isfinite(dist_full[current]):
+        successor_feasibility = np.where(stay_next >= 0, feasibility[goal_rows, np.maximum(stay_next, 0)], 0.0)
+        updated = np.minimum(lengths[None, :] + successor_feasibility, NAVI_FEASIBILITY_CAP_M)
+        updated = np.where(is_goal_lane, NAVI_FEASIBILITY_CAP_M, updated)
+        updated = np.where(reachable, updated, 0.0)
+        if np.array_equal(updated, feasibility):
             break
-        accumulated_m += lengths[current]
-        if current == goal_lane or accumulated_m >= NAVI_FEASIBILITY_CAP_M:
-            break
-        current = stay_next[current]
-        if current == -1:
-            break
-    return min(accumulated_m, NAVI_FEASIBILITY_CAP_M)
+        feasibility = updated
+    return feasibility
 
 
-def _farthest_point_goals(endpoints, pool, preselected, count, rng):
-    selected = list(preselected)
-    pool = np.asarray(pool, dtype=np.int64)
-    if len(pool) == 0:
-        return selected
-    if not selected:
-        selected.append(int(pool[rng.integers(len(pool))]))
-    min_dist = np.full(len(pool), np.inf)
-    for goal in selected:
-        min_dist = np.minimum(min_dist, np.hypot(*(endpoints[pool] - endpoints[goal]).T))
-    while len(selected) < count:
-        pick = int(np.argmax(min_dist))
-        if min_dist[pick] <= 0.0:
-            break
-        selected.append(int(pool[pick]))
-        min_dist = np.minimum(min_dist, np.hypot(*(endpoints[pool] - endpoints[pool[pick]]).T))
-    return selected
-
-
-def select_goal_lanes(roads, lane_road_idx, exits, agents, road_to_navi, max_goals, seed):
-    drivable = [n for n, r in enumerate(lane_road_idx) if roads[r]["type"] in DRIVABLE_LANE_TYPES]
-    if not drivable:
-        raise ValueError("map has no drivable lanes")
-    drivable_set = set(drivable)
-    priority = {n for n in drivable if not exits[n]}
-    for agent in agents:
-        if agent["route"] and agent["route"][-1] in road_to_navi:
-            route_end = road_to_navi[agent["route"][-1]]
-            if route_end in drivable_set:
-                priority.add(route_end)
-    endpoints = np.array([[roads[r]["x"][-1], roads[r]["y"][-1]] for r in lane_road_idx], dtype=np.float64)
-    rng = np.random.default_rng(seed)
-    priority = sorted(priority)
-    if len(priority) >= max_goals:
-        return _farthest_point_goals(endpoints, priority, [], max_goals, rng)
-    return _farthest_point_goals(endpoints, drivable, priority, max_goals, rng)
-
-
-def build_navigation(data, max_goals=DEFAULT_MAX_GOALS, seed=GOAL_SEED_BASE):
+def build_navigation(data):
     roads = data["roads"]
     lane_road_idx = [i for i, r in enumerate(roads) if _is_lane(r["type"])]
     if not lane_road_idx:
         raise ValueError("map has no lanes")
+    if len(lane_road_idx) > NAVI_MAX_LANES:
+        raise ValueError(f"map has {len(lane_road_idx)} lanes, more than NAVI_MAX_LANES={NAVI_MAX_LANES}")
     road_to_navi = {r: n for n, r in enumerate(lane_road_idx)}
     num_lanes = len(lane_road_idx)
     lengths = np.array([roads[r]["length"] for r in lane_road_idx], dtype=np.float64)
@@ -275,56 +247,33 @@ def build_navigation(data, max_goals=DEFAULT_MAX_GOALS, seed=GOAL_SEED_BASE):
         left_lane[n] = _find_lateral_neighbor(n, roads[r], +1.0, lane_index, marker_index, marker_types)
         right_lane[n] = _find_lateral_neighbor(n, roads[r], -1.0, lane_index, marker_index, marker_types)
 
-    reverse_long = [[] for _ in range(num_lanes)]
-    reverse_full = [[] for _ in range(num_lanes)]
+    reverse_edges = [[] for _ in range(num_lanes)]
     for n in range(num_lanes):
         for succ in exits[n]:
-            reverse_long[succ].append((n, edge_costs[n]))
-            reverse_full[succ].append((n, edge_costs[n]))
+            reverse_edges[succ].append((n, edge_costs[n]))
         for side in (left_lane[n], right_lane[n]):
             if side != -1:
-                reverse_full[side].append((n, LANE_CHANGE_COST_M))
+                reverse_edges[side].append((n, NAVI_LANE_CHANGE_COST_M))
 
-    goal_lanes = select_goal_lanes(roads, lane_road_idx, exits, data["agents"], road_to_navi, max_goals, seed)
-    num_goals = len(goal_lanes)
-    next_lane = np.full((num_goals, num_lanes), -1, dtype=np.int32)
-    distance_to_goal = np.full((num_goals, num_lanes), NAVI_UNREACHABLE_M, dtype=np.float32)
-    feas_center = np.zeros((num_goals, num_lanes), dtype=np.float32)
-    for g, goal_lane in enumerate(goal_lanes):
-        dist_long = _dijkstra_to_goal(goal_lane, edge_costs, reverse_long)
-        dist_full = _dijkstra_to_goal(goal_lane, edge_costs, reverse_full)
-        stay_next = [_best_successor(exits[n], dist_full) for n in range(num_lanes)]
-        for n in range(num_lanes):
-            if n != goal_lane and np.isfinite(dist_long[n]):
-                next_lane[g, n] = _best_successor(exits[n], dist_long)
-            if np.isfinite(dist_full[n]):
-                distance_to_goal[g, n] = min(dist_full[n], NAVI_UNREACHABLE_M)
-            feas_center[g, n] = _center_feasibility(n, goal_lane, lengths, dist_full, stay_next)
-
-    feas_left = np.where(left_lane[None, :] >= 0, feas_center[:, np.maximum(left_lane, 0)], 0.0).astype(np.float32)
-    feas_right = np.where(right_lane[None, :] >= 0, feas_center[:, np.maximum(right_lane, 0)], 0.0).astype(np.float32)
-    goal_roads = [lane_road_idx[g] for g in goal_lanes]
+    distance_to_goal = np.stack(
+        [_dijkstra_to_goal(goal_lane, edge_costs, reverse_edges) for goal_lane in range(num_lanes)]
+    )
+    stay_next = _stay_successors(exits, distance_to_goal)
+    feasibility_center = _center_feasibility(lengths, distance_to_goal, stay_next)
     return {
         "num_roads": len(roads),
         "num_lanes": num_lanes,
-        "num_goals": num_goals,
         "lane_road_idx": np.asarray(lane_road_idx, dtype=np.int32),
         "left_lane": left_lane,
         "right_lane": right_lane,
-        "goal_lane": np.asarray(goal_lanes, dtype=np.int32),
-        "goal_x": np.array([roads[r]["x"][-1] for r in goal_roads], dtype=np.float32),
-        "goal_y": np.array([roads[r]["y"][-1] for r in goal_roads], dtype=np.float32),
-        "next_lane": next_lane,
-        "distance_to_goal_m": distance_to_goal,
-        "feasibility_left_m": feas_left,
-        "feasibility_center_m": feas_center,
-        "feasibility_right_m": feas_right,
+        "distance_to_goal_m": np.minimum(distance_to_goal, NAVI_UNREACHABLE_M).astype(np.float32),
+        "feasibility_center_m": feasibility_center.astype(np.float32),
     }
 
 
-def process_map(map_path, output_path, max_goals=DEFAULT_MAX_GOALS, seed=GOAL_SEED_BASE):
+def process_map(map_path, output_path):
     """Build and atomically write one sidecar. Returns the navigation dict."""
-    navi = build_navigation(read_bin(Path(map_path)), max_goals=max_goals, seed=seed)
+    navi = build_navigation(read_bin(Path(map_path)))
     navi["map_crc32"], navi["map_size_bytes"] = map_fingerprint(map_path)
     validate_navigation(navi)
     output_path = Path(output_path)
@@ -343,13 +292,13 @@ def _timeout_handler(signum, frame):
 
 
 def _worker(job):
-    map_path, output_path, max_goals, seed, timeout_s, plot_dir = job
+    map_path, output_path, timeout_s, plot_dir = job
     start = time.time()
     signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout_s)
     try:
-        navi = process_map(map_path, output_path, max_goals, seed)
-        summary = f"lanes={navi['num_lanes']} goals={navi['num_goals']}"
+        navi = process_map(map_path, output_path)
+        summary = f"lanes={navi['num_lanes']}"
         if plot_dir:
             from plot_navigation import render_map
 
@@ -372,8 +321,6 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="Map .bin file or directory of .bin maps")
     parser.add_argument("--output-dir", default=None, help="Sidecar directory (default: next to each map)")
-    parser.add_argument("--max-goals", type=int, default=DEFAULT_MAX_GOALS)
-    parser.add_argument("--seed", type=int, default=GOAL_SEED_BASE)
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     parser.add_argument("--timeout-s", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--overwrite", action="store_true", help="Rebuild sidecars that already exist")
@@ -381,9 +328,6 @@ def main(argv=None):
         "--plot-dir", default=None, help="Also write <map_stem>.html/.svg navigation plots here (plot_navigation.py)"
     )
     args = parser.parse_args(argv)
-    if not 1 <= args.max_goals <= NAVI_MAX_GOALS:
-        parser.error(f"--max-goals must be in [1, {NAVI_MAX_GOALS}]")
-
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     jobs, skipped = [], 0
@@ -392,7 +336,7 @@ def main(argv=None):
         if output_path.exists() and not args.overwrite:
             skipped += 1
             continue
-        jobs.append((str(map_path), str(output_path), args.max_goals, args.seed, args.timeout_s, args.plot_dir))
+        jobs.append((str(map_path), str(output_path), args.timeout_s, args.plot_dir))
 
     failed = 0
     with multiprocessing.Pool(min(args.workers, max(1, len(jobs)))) as pool:

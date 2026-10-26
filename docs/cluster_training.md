@@ -2,6 +2,27 @@
 
 How to run PufferDrive training on a SLURM cluster. This is written with the NYU cluster in mind but it should mostly hold for any SLURM cluster.
 
+## HAL nightly launcher
+
+`scripts/cluster/train_hal.sh` and `scripts/cluster/train_hal_mulit_gpu.sh`
+use the repository's `.venv` inside the image selected by `PUFFERDRIVE_IMAGE`
+(default `/staging/agp/containers/pufferdrive_20261022.sif`). They invoke its
+Python explicitly through `singularity exec`, without relying on the image's
+runscript or a system `python` on `PATH`. Distributed training uses the same
+interpreter via `python -m torch.distributed.run`.
+
+If Python is missing or the venv's interpreter symlink is broken inside the
+image, create or recreate the venv from the repository root using that image:
+
+```bash
+singularity exec --nv --bind "$PWD:$PWD" --pwd "$PWD" \
+    "${PUFFERDRIVE_IMAGE:-/staging/agp/containers/pufferdrive_20261022.sif}" \
+    /opt/pufferdrive/setup-venv.sh
+```
+
+The venv must be created inside the selected image: a host-created venv may
+reference a Python installation that is not available in the container.
+
 ## A quick overview of the setup and launch process
 
 ```bash

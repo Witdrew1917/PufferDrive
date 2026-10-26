@@ -108,7 +108,6 @@ class Drive(pufferlib.PufferEnv):
         config_only=False,
         goal_regen_mode="finite",
         goal_source="route",
-        route_source="random_walk",
         navigation_dir="",
         obs_goal_lane_distance=False,
         reward_conditioning=False,
@@ -238,21 +237,10 @@ class Drive(pufferlib.PufferEnv):
             "external": binding.GOAL_SOURCE_EXTERNAL,
             "gt_map": binding.GOAL_SOURCE_GT_MAP,
         }[goal_source]
-        self.route_source = {
-            "random_walk": binding.ROUTE_SOURCE_RANDOM_WALK,
-            "navigation": binding.ROUTE_SOURCE_NAVIGATION,
-        }[route_source]
-        if route_source == "navigation" and (simulation_mode != "gigaflow" or goal_source != "route"):
-            raise ValueError("route_source 'navigation' requires gigaflow simulation_mode and goal_source 'route'")
         self.navigation_dir = navigation_dir or ""
-        if route_source == "navigation" and self.navigation_dir:
-            if not os.path.isdir(self.navigation_dir):
-                raise ValueError(f"navigation_dir '{self.navigation_dir}' does not exist (run process_navigation.py)")
-            if not any(name.endswith(".navi") for name in os.listdir(self.navigation_dir)):
-                raise ValueError(f"navigation_dir '{self.navigation_dir}' contains no .navi sidecars")
         self.obs_navigation = int(bool(obs_navigation))
-        if self.obs_navigation and route_source != "navigation":
-            raise ValueError("obs_navigation requires route_source 'navigation'")
+        if self.navigation_dir and not os.path.isdir(self.navigation_dir):
+            raise ValueError(f"navigation_dir '{self.navigation_dir}' does not exist (run process_navigation.py)")
         self.obs_goal_lane_distance = int(bool(obs_goal_lane_distance))
         infraction_behavior_values = {
             "ignore": binding.INFRACTION_BEHAVIOR_IGNORE,
@@ -482,6 +470,22 @@ class Drive(pufferlib.PufferEnv):
         if config_only:
             return
 
+        sidecar_paths = [
+            os.path.join(
+                self.navigation_dir or os.path.dirname(map_file),
+                os.path.splitext(os.path.basename(map_file))[0] + ".navi",
+            )
+            for map_file in self.map_files[: self.num_maps]
+        ]
+        missing_sidecars = [sidecar for sidecar in sidecar_paths if not os.path.isfile(sidecar)]
+        self.navigation_available = len(missing_sidecars) < len(sidecar_paths)
+        if self.obs_navigation:
+            if missing_sidecars:
+                raise ValueError(
+                    f"obs_navigation needs a .navi sidecar per map (run process_navigation.py); missing: "
+                    f"{missing_sidecars[:3]}{' ...' if len(missing_sidecars) > 3 else ''}"
+                )
+
         # Iterate through all maps to count total agents that can be initialized for each map
         agent_offsets, map_ids, num_envs, maps_consumed = binding.shared(
             map_files=self.map_files,
@@ -545,7 +549,7 @@ class Drive(pufferlib.PufferEnv):
             "obs_range_road_front_m": self.obs_range_road_front_m,
             "obs_range_road_behind_m": self.obs_range_road_behind_m,
             "obs_range_road_side_m": self.obs_range_road_side_m,
-            "route_source": self.route_source,
+            "obs_navigation": self.obs_navigation,
             "navigation_dir": self.navigation_dir,
         }
         cached = binding.map_cache_preload(**preload_kwargs)
@@ -589,7 +593,6 @@ class Drive(pufferlib.PufferEnv):
             "num_goals": self.num_goals,
             "goal_regen_mode": self.goal_regen_mode,
             "goal_source": self.goal_source,
-            "route_source": self.route_source,
             "navigation_dir": self.navigation_dir,
             "obs_goal_lane_distance": self.obs_goal_lane_distance,
             "obs_slots_lane_n": self.obs_slots_lane_n,
@@ -1053,7 +1056,7 @@ class Drive(pufferlib.PufferEnv):
         }
 
     def _navigation_replay_keys(self):
-        if self.route_source != binding.ROUTE_SOURCE_NAVIGATION:
+        if not self.navigation_available:
             return ()
         return ("navi_f32", "navi_route_i32")
 

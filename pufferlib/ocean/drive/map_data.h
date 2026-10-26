@@ -1011,10 +1011,9 @@ int load_map_binary(const char *filename, Drive *drive) {
 
 #define NAVI_CRC32_POLYNOMIAL 0xEDB88320u
 #define NAVI_CRC32_CHUNK_BYTES 65536
-#define NAVI_HEADER_BYTES 36
+#define NAVI_HEADER_BYTES 32
 #define NAVI_LANE_INT_ARRAYS 3
-#define NAVI_GOAL_ARRAYS 3
-#define NAVI_GOAL_LANE_ARRAYS 5
+#define NAVI_GOAL_LANE_ARRAYS 2
 
 // zlib-compatible CRC-32 and byte size of a file; the sidecar is bound to these.
 static int navi_file_fingerprint(const char *path, uint32_t *crc_out, uint64_t *size_out) {
@@ -1104,15 +1103,6 @@ static int navi_lane_index_valid(int lane_idx, int num_lanes, int allow_none) {
     return (allow_none && lane_idx == -1) || (lane_idx >= 0 && lane_idx < num_lanes);
 }
 
-static int navi_road_has_exit(const RoadMapElement *road, int exit_road_idx) {
-    for (int exit_idx = 0; exit_idx < road->num_exits; exit_idx++) {
-        if (road->exit_lanes[exit_idx] == exit_road_idx) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 // Lanes must be exactly the map's lane-type roads, in ascending order.
 static const char *navi_validate_lanes(const Drive *drive, struct NavigationData *navigation) {
     for (int road_idx = 0; road_idx < drive->num_road_elements; road_idx++) {
@@ -1142,59 +1132,29 @@ static const char *navi_validate_lanes(const Drive *drive, struct NavigationData
     return NULL;
 }
 
-static const char *navi_validate_goals(const Drive *drive, const struct NavigationData *navigation) {
-    for (int goal = 0; goal < navigation->num_goals; goal++) {
-        if (!navi_lane_index_valid(navigation->goal_lane[goal], navigation->num_lanes, 0)) {
-            return "goal_lane index out of range";
-        }
-        if (!isfinite(navigation->goal_x[goal]) || !isfinite(navigation->goal_y[goal])) {
-            return "goal position is not finite";
-        }
-    }
-    int num_lanes = navigation->num_lanes;
-    for (int goal = 0; goal < navigation->num_goals; goal++) {
-        const int *next_row = &navigation->next_lane[(size_t) goal * num_lanes];
-        if (next_row[navigation->goal_lane[goal]] != -1) {
-            return "next_lane at the goal lane must be -1";
-        }
-        for (int lane = 0; lane < num_lanes; lane++) {
-            int next = next_row[lane];
-            if (!navi_lane_index_valid(next, num_lanes, 1)) {
-                return "next_lane index out of range";
-            }
-            if (next != -1
-                && !navi_road_has_exit(
-                    &drive->road_elements[navigation->lane_road_idx[lane]],
-                    navigation->lane_road_idx[next])) {
-                return "next_lane is not an exit of its lane";
-            }
-        }
-    }
-    size_t table_count = (size_t) navigation->num_goals * (size_t) num_lanes;
+static const char *navi_validate_goal_tables(const struct NavigationData *navigation) {
+    size_t table_count = (size_t) navigation->num_lanes * (size_t) navigation->num_lanes;
     if (navi_check_floats(navigation->distance_to_goal_m, table_count, NAVI_UNREACHABLE_M) != 0) {
         return "distance_to_goal_m must be finite and in [0, NAVI_UNREACHABLE_M]";
     }
-    if (navi_check_floats(navigation->feasibility_left_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0
-        || navi_check_floats(navigation->feasibility_center_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0
-        || navi_check_floats(navigation->feasibility_right_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0) {
-        return "feasibility must be finite and in [0, NAVI_FEASIBILITY_CAP_M]";
+    if (navi_check_floats(navigation->feasibility_center_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0) {
+        return "feasibility_center_m must be finite and in [0, NAVI_FEASIBILITY_CAP_M]";
     }
     return NULL;
 }
 
-static const char *navi_read_header(FILE *file, const Drive *drive, int *num_lanes_out, int *num_goals_out) {
+static const char *navi_read_header(FILE *file, const Drive *drive, int *num_lanes_out) {
     char magic[NAVI_MAGIC_LENGTH];
-    int32_t version, num_roads, num_lanes, num_goals;
+    int32_t version, num_roads, num_lanes;
     uint32_t map_crc32;
     uint64_t map_size_bytes;
     if (fread(magic, 1, NAVI_MAGIC_LENGTH, file) != NAVI_MAGIC_LENGTH || fread(&version, 4, 1, file) != 1
         || fread(&map_crc32, 4, 1, file) != 1 || fread(&map_size_bytes, 8, 1, file) != 1
-        || fread(&num_roads, 4, 1, file) != 1 || fread(&num_lanes, 4, 1, file) != 1
-        || fread(&num_goals, 4, 1, file) != 1) {
+        || fread(&num_roads, 4, 1, file) != 1 || fread(&num_lanes, 4, 1, file) != 1) {
         return "truncated header";
     }
     if (memcmp(magic, NAVI_MAGIC, NAVI_MAGIC_LENGTH) != 0) {
-        return "bad magic";
+        return "bad magic (v1 sidecars must be regenerated with process_navigation.py)";
     }
     if (version != NAVI_VERSION) {
         return "unsupported version";
@@ -1206,8 +1166,8 @@ static const char *navi_read_header(FILE *file, const Drive *drive, int *num_lan
     if (num_roads != drive->num_road_elements || num_lanes != map_lane_count) {
         return "road/lane counts do not match the map";
     }
-    if (num_lanes < 1 || num_lanes > NAVI_MAX_LANES || num_goals < 1 || num_goals > NAVI_MAX_GOALS) {
-        return "lane or goal count out of range";
+    if (num_lanes < 1 || num_lanes > NAVI_MAX_LANES) {
+        return "lane count out of range";
     }
     uint32_t actual_crc32;
     uint64_t actual_size_bytes;
@@ -1218,18 +1178,14 @@ static const char *navi_read_header(FILE *file, const Drive *drive, int *num_lan
         return "stale sidecar: map fingerprint mismatch (regenerate with process_navigation.py)";
     }
     *num_lanes_out = num_lanes;
-    *num_goals_out = num_goals;
     return NULL;
 }
 
 static const char *navi_read_body(FILE *file, const Drive *drive, struct NavigationData *navigation) {
     size_t num_lanes = (size_t) navigation->num_lanes;
-    size_t num_goals = (size_t) navigation->num_goals;
-    size_t table_count = num_goals * num_lanes;
+    size_t table_count = num_lanes * num_lanes;
     uint64_t expected_bytes = NAVI_HEADER_BYTES
-        + 4u
-            * ((uint64_t) NAVI_LANE_INT_ARRAYS * num_lanes + (uint64_t) NAVI_GOAL_ARRAYS * num_goals
-               + (uint64_t) NAVI_GOAL_LANE_ARRAYS * table_count);
+        + 4u * ((uint64_t) NAVI_LANE_INT_ARRAYS * num_lanes + (uint64_t) NAVI_GOAL_LANE_ARRAYS * table_count);
     if (fseek(file, 0, SEEK_END) != 0 || (uint64_t) ftell(file) != expected_bytes
         || fseek(file, NAVI_HEADER_BYTES, SEEK_SET) != 0) {
         return "file size does not match header counts (truncated or trailing bytes)";
@@ -1238,34 +1194,21 @@ static const char *navi_read_body(FILE *file, const Drive *drive, struct Navigat
     navigation->road_to_navi_lane = (int *) malloc((size_t) drive->num_road_elements * sizeof(int));
     navigation->left_lane = (int *) malloc(num_lanes * sizeof(int));
     navigation->right_lane = (int *) malloc(num_lanes * sizeof(int));
-    navigation->goal_lane = (int *) malloc(num_goals * sizeof(int));
-    navigation->goal_x = (float *) malloc(num_goals * sizeof(float));
-    navigation->goal_y = (float *) malloc(num_goals * sizeof(float));
-    navigation->next_lane = (int *) malloc(table_count * sizeof(int));
     navigation->distance_to_goal_m = (float *) malloc(table_count * sizeof(float));
-    navigation->feasibility_left_m = (float *) malloc(table_count * sizeof(float));
     navigation->feasibility_center_m = (float *) malloc(table_count * sizeof(float));
-    navigation->feasibility_right_m = (float *) malloc(table_count * sizeof(float));
     if (!navigation->lane_road_idx || !navigation->road_to_navi_lane || !navigation->left_lane
-        || !navigation->right_lane || !navigation->goal_lane || !navigation->goal_x || !navigation->goal_y
-        || !navigation->next_lane || !navigation->distance_to_goal_m || !navigation->feasibility_left_m
-        || !navigation->feasibility_center_m || !navigation->feasibility_right_m) {
+        || !navigation->right_lane || !navigation->distance_to_goal_m || !navigation->feasibility_center_m) {
         return "out of memory";
     }
     if (navi_read_array(file, navigation->lane_road_idx, num_lanes)
         || navi_read_array(file, navigation->left_lane, num_lanes)
         || navi_read_array(file, navigation->right_lane, num_lanes)
-        || navi_read_array(file, navigation->goal_lane, num_goals)
-        || navi_read_array(file, navigation->goal_x, num_goals) || navi_read_array(file, navigation->goal_y, num_goals)
-        || navi_read_array(file, navigation->next_lane, table_count)
         || navi_read_array(file, navigation->distance_to_goal_m, table_count)
-        || navi_read_array(file, navigation->feasibility_left_m, table_count)
-        || navi_read_array(file, navigation->feasibility_center_m, table_count)
-        || navi_read_array(file, navigation->feasibility_right_m, table_count)) {
+        || navi_read_array(file, navigation->feasibility_center_m, table_count)) {
         return "truncated body";
     }
     const char *error = navi_validate_lanes(drive, navigation);
-    return error != NULL ? error : navi_validate_goals(drive, navigation);
+    return error != NULL ? error : navi_validate_goal_tables(navigation);
 }
 
 // Loads and validates a sidecar against the already-loaded map in drive. Returns NAVI_LOAD_*.
@@ -1278,7 +1221,7 @@ static int load_navigation_binary(const char *path, const Drive *drive, struct N
     struct NavigationData *navigation = (struct NavigationData *) calloc(1, sizeof(struct NavigationData));
     const char *error = navigation == NULL ? "out of memory" : NULL;
     if (error == NULL) {
-        error = navi_read_header(file, drive, &navigation->num_lanes, &navigation->num_goals);
+        error = navi_read_header(file, drive, &navigation->num_lanes);
     }
     if (error == NULL) {
         error = navi_read_body(file, drive, navigation);
@@ -1293,19 +1236,19 @@ static int load_navigation_binary(const char *path, const Drive *drive, struct N
     return NAVI_LOAD_OK;
 }
 
-// Loads env->navigation when route_source is navigation. Missing -> NULL (random-walk fallback); invalid -> abort.
+// Loads env->navigation whenever its sidecar exists; missing aborts only with obs_navigation, invalid always aborts.
 static void load_env_navigation(Drive *env) {
     env->navigation = NULL;
-    if (env->route_source != ROUTE_SOURCE_NAVIGATION) {
-        return;
-    }
     char *path = navigation_path_for_map(env->map_name, env->navigation_dir);
     if (path == NULL) {
         raise_error_with_message(ERROR_MEMORY_ALLOCATION, "navigation path for map %s", env->map_name);
     }
     int status = load_navigation_binary(path, env, &env->navigation);
-    if (status == NAVI_LOAD_MISSING) {
-        fprintf(stderr, "[WARN] -> No navigation sidecar %s; falling back to random-walk routes\n", path);
+    if (status == NAVI_LOAD_MISSING && env->obs_navigation) {
+        raise_error_with_message(
+            ERROR_INITIALIZATION_FAILED,
+            "missing navigation sidecar %s (run process_navigation.py)",
+            path);
     }
     if (status == NAVI_LOAD_INVALID) {
         raise_error_with_message(ERROR_INITIALIZATION_FAILED, "invalid navigation sidecar: %s", path);
@@ -1318,7 +1261,7 @@ static struct SharedMapData *map_cache_lookup(Drive *env) {
         if (g_map_cache[i] != NULL && strcmp(g_map_cache[i]->map_name, env->map_name) == 0
             && g_map_cache[i]->obs_lane_stride == env->obs_lane_stride
             && g_map_cache[i]->obs_boundary_stride == env->obs_boundary_stride
-            && g_map_cache[i]->route_source == env->route_source
+            && g_map_cache[i]->obs_navigation == env->obs_navigation
             && strcmp(g_map_cache[i]->navigation_dir, env->navigation_dir ? env->navigation_dir : "") == 0) {
             return g_map_cache[i];
         }
@@ -1348,7 +1291,7 @@ static struct SharedMapData *map_cache_store(Drive *env) {
     entry->neighbor_offsets = env->neighbor_offsets;
     entry->lane_graph = env->lane_graph;
     entry->navigation = env->navigation;
-    entry->route_source = env->route_source;
+    entry->obs_navigation = env->obs_navigation;
     entry->navigation_dir = strdup(env->navigation_dir ? env->navigation_dir : "");
     entry->obs_lane_stride = env->obs_lane_stride;
     entry->obs_boundary_stride = env->obs_boundary_stride;

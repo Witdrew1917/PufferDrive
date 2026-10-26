@@ -36,15 +36,25 @@ mkdir -p "$RUNS_DIR"
 RUN_DIR="$RUNS_DIR/$RUN_NAME"
 mkdir -p "$RUN_DIR"
 
-CONTAINER_ARGS=(--nv --bind "$REPO_ROOT:$REPO_ROOT" --pwd "$REPO_ROOT")
-singularity run "${CONTAINER_ARGS[@]}" --bind "$NAVI_DIR:$NAVI_DIR" "$CONTAINER" \
-    python data_utils/process_navigation.py \
+CONTAINER_COMMAND=(
+    singularity exec --nv --bind "$REPO_ROOT:$REPO_ROOT" --pwd "$REPO_ROOT"
+    --bind "$NAVI_DIR:$NAVI_DIR" "$CONTAINER"
+    /bin/bash -euc '
+        source "$PWD/.venv/bin/activate"
+        if [[ ! -x "$PWD/.venv/bin/python" ]]; then
+            echo "error: repo .venv/bin/python is missing or broken inside the container; recreate the venv with /opt/pufferdrive/setup-venv.sh inside this image" >&2
+            exit 1
+        fi
+        exec "$PWD/.venv/bin/python" "$@"
+    ' pufferdrive-hal
+)
+"${CONTAINER_COMMAND[@]}" data_utils/process_navigation.py \
     --input "$MAP_DIR" \
     --output-dir "$NAVI_DIR" \
     --workers "${NAVI_WORKERS:-4}"
 
 CONFIG_OVERRIDES="$(
-    singularity run "${CONTAINER_ARGS[@]}" "$CONTAINER" python -c '
+    "${CONTAINER_COMMAND[@]}" -c '
 import sys
 import yaml
 
@@ -60,14 +70,13 @@ for key, value in config.items():
 )"
 mapfile -t NIGHTLY_ARGS <<< "$CONFIG_OVERRIDES"
 
-singularity run "${CONTAINER_ARGS[@]}" --bind "$NAVI_DIR:$NAVI_DIR" "$CONTAINER" \
-    torchrun --standalone --nnodes=1 --nproc-per-node="$NUM_GPUS" \
+"${CONTAINER_COMMAND[@]}" -m torch.distributed.run \
+    --standalone --nnodes=1 --nproc-per-node="$NUM_GPUS" \
     -m pufferlib.pufferl train puffer_drive \
     "${NIGHTLY_ARGS[@]}" \
     "$@" \
     "env.map_dir=$MAP_DIR" \
     "env.goal_source=route" \
-    "env.route_source=navigation" \
     "env.navigation_dir=$NAVI_DIR" \
     "env.obs_navigation=true" \
     "train.seed=$SEED" \

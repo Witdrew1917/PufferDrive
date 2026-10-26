@@ -1214,10 +1214,10 @@ __PAYLOAD_CHUNKS__
         // Order must match the Log fields written in env_binding.h vec_get_obs_html_frame (15 values).
         const PUFFER_LABELS = ["score","no at fault","no offroad","no red light","progress > .2","direction","ttc","progress ratio","speed limit","comfort","multi lane","wrong way dist","speed violation","multiplier","weighted avg"];
         // Order must match the REWARD_COEF_* indices in constants.h.
-        const NAVI_LABELS = ["goal","to goal m","feas left m","feas lane m","feas right m","off route"];
+        const NAVI_LABELS = ["goal lane","to goal m","feas left m","feas lane m","feas right m","off route"];
         const COEF_LABELS = ["goal radius","goal speed","collision","offroad","comfort","lane align","vel align","lane center","center bias","velocity","reverse","stop line","timestep","overspeed","throttle","steer","acc","speed"];
         const REWARD_LABELS = ["collision","offroad","red light","stop sign","goal","lane align","lane center","comfort","velocity","timestep","reverse","overspeed","ADE"];
-        const EGO_OBS_LABELS = ["speed","width","length","steer","accel lon","accel lat","lane dist","lane angle (cos | err/pi)","speed limit","stopped","lane curvature","navi active","navi feas left","navi feas lane","navi feas right"];
+        const EGO_OBS_LABELS = ["speed","width","length","steer","accel lon","accel lat","lane dist","lane angle (cos | err/pi)","speed limit","stopped","lane curvature","navi reachable","navi feas left","navi feas lane","navi feas right"];
         const EGO_COND_LABELS = ["goal radius","goal speed","collision","offroad","comfort","lane align","vel align","lane center","center bias","velocity","reverse","stop line","timestep","overspeed","C_throttle","C_steer","C_acc","C_vel"];
         const ACCEL = [-4,-2.667,-1.333,0,1.333,2.667,4], STEER = [-0.667,-0.5,-0.333,-0.167,0,0.167,0.333,0.5,0.667];
         const JLONG = [-15,-4,0,4], JLAT = [-4,0,4];
@@ -1237,7 +1237,7 @@ __PAYLOAD_CHUNKS__
         let step = 0, play = false, speed = 4, lastTick = 0;
         let cam = {x:0,y:0,z:5,drag:false,lx:0,ly:0};
         let followedId = null, isEgoCam = false, darkMode = false, showGhost = false, ghostPaths = [];
-        // navi_f32 layout: goal_idx (-1 = none), goal_x, goal_y, distance_to_goal_m, feasibility left/center/right m, off_route
+        // navi_f32 layout: goal lane road idx (-1 = none), goal_x, goal_y, distance_to_goal_m, feasibility left/center/right m, off_route
         const NAVI_GOAL = 0, NAVI_GOAL_X = 1, NAVI_GOAL_Y = 2, NAVI_DISTANCE = 3, NAVI_FEAS_LEFT = 4, NAVI_OFF_ROUTE = 7;
         const NAVI_UNREACHABLE_M = 1e8, NAVI_FEASIBILITY_CAP_M = 1000, NAVI_ROUTE_COLOR = 'rgba(249,115,22,.55)', NAVI_GOAL_COLOR = '#f97316', NAVI_FEAS_COLOR = '#dc2626';
         const NAVI_FEAS_BACK_OFFSET_M = 3.5, NAVI_FEAS_SIDE_OFFSET_M = 2.45, NAVI_FEAS_MIN_ARROW_M = 1, NAVI_FEAS_MAX_ARROW_M = 8, NAVI_FEAS_CROSS_M = .8;
@@ -1630,7 +1630,7 @@ self.onmessage = async event => {
             ctx.beginPath(); ctx.moveTo(0, r); ctx.lineTo(r, 0); ctx.lineTo(0, -r); ctx.lineTo(-r, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
             if (isEgoCam) ctx.rotate(-Math.PI/2 + agent.h); else ctx.scale(1,-1);
             ctx.fillStyle = NAVI_GOAL_COLOR; ctx.font = '700 '+(13/cam.z)+'px system-ui'; ctx.textAlign = 'center';
-            ctx.fillText('navi goal ' + navi.goal, 0, -r - 3/cam.z);
+            ctx.fillText('navi goal lane ' + navi.goal, 0, -r - 3/cam.z);
             ctx.restore();
         }
         function naviArrowLength(meters) {

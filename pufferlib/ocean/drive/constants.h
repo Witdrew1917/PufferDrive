@@ -112,10 +112,6 @@
 #define GOAL_SOURCE_EXTERNAL 3 // co-sim: goal windows pushed by the external sim (c_set_agent_goals)
 #define GOAL_SOURCE_GT_MAP 4   // logged-trajectory goals projected onto the nearest co-directional lane center
 
-// How gigaflow builds an agent's forward route (goal_source route only)
-#define ROUTE_SOURCE_RANDOM_WALK 0 // random exit-lane walk
-#define ROUTE_SOURCE_NAVIGATION 1  // follow <map>.navi next-hops toward sampled goals; random walk if no sidecar
-
 // Dynamics model
 #define DYNAMICS_MODEL_CLASSIC 0
 #define DYNAMICS_MODEL_JERK 1
@@ -249,14 +245,15 @@ static const int ROAD_OFFSETS[25][2]
 #define LANE_GRAPH_DISTANCE_NORM_M 500.0f // normalization for the GPS lane-distance feature
 
 // Navigation sidecar (<map_stem>.navi), written by data_utils/process_navigation.py
-#define NAVI_MAGIC "PDNAVI01"
+#define NAVI_MAGIC "PDNAVI02"
 #define NAVI_MAGIC_LENGTH 8
-#define NAVI_VERSION 1
+#define NAVI_VERSION 2
 #define NAVI_FILE_SUFFIX ".navi"
-#define NAVI_MAX_GOALS 1024
-#define NAVI_MAX_LANES 1000000
+#define NAVI_MAX_LANES 8192 // per-goal tables are num_lanes^2
 #define NAVI_UNREACHABLE_M 1.0e9f
 #define NAVI_FEASIBILITY_CAP_M 1000.0f
+#define NAVI_LANE_CHANGE_COST_M 10.0f // must match process_navigation.py
+#define NAVI_MIN_EDGE_COST_M 1.0e-3f  // must match process_navigation.py
 #define NAVI_LOAD_OK 0
 #define NAVI_LOAD_MISSING 1
 #define NAVI_LOAD_INVALID 2
@@ -284,7 +281,7 @@ static const int ROAD_OFFSETS[25][2]
 #define LANE_FEATURES 9
 #define LANE_SPEED_LIMIT_FEATURES 1   // appended per lane row when obs_lane_speed_limit is set
 #define NAVI_FEASIBILITY_SIDE_COUNT 3 // left, center, right
-#define NAVIGATION_EGO_FEATURES (1 + NAVI_FEASIBILITY_SIDE_COUNT) // active flag + feasibilities, when obs_navigation
+#define NAVIGATION_EGO_FEATURES (1 + NAVI_FEASIBILITY_SIDE_COUNT) // reachable flag + feasibilities, when obs_navigation
 #define NAVI_OBS_FEASIBILITY_HORIZON_S 30.0f
 #define BOUNDARY_FEATURES 6
 #define PARTNER_FEATURES 9
@@ -383,7 +380,7 @@ static const int ROAD_OFFSETS[25][2]
 #define METRICS_F32_FIELDS NUM_METRICS // must equal NUM_METRICS
 #define SCORE_F32_FIELDS 15            // Log struct fields: puffer_score .. weighted_average
 #define TRAFFIC_I16_FIELDS 3           // is_valid, type, state
-#define NAVI_F32_GOAL_IDX 0            // -1 when the agent has no active navigation goal
+#define NAVI_F32_GOAL_LANE_IDX 0       // road idx of the navigation goal lane, -1 when inactive
 #define NAVI_F32_GOAL_X_IDX 1
 #define NAVI_F32_GOAL_Y_IDX 2
 #define NAVI_F32_DISTANCE_TO_GOAL_IDX 3
@@ -392,7 +389,7 @@ static const int ROAD_OFFSETS[25][2]
 #define NAVI_F32_FEASIBILITY_RIGHT_IDX 6
 #define NAVI_F32_OFF_ROUTE_IDX 7
 #define NAVI_F32_FIELDS 8
-#define NAVI_ROUTE_PREVIEW_LANE_COUNT 16 // upcoming lanes of the active navigation leg, -1 padded
+#define NAVI_ROUTE_PREVIEW_LANE_COUNT 16 // shortest-path lanes toward the navigation goal, -1 padded
 #define REWARD_F32_EPISODE_RETURN_IDX 0
 #define REWARD_F32_COLLISION_IDX 1
 #define REWARD_F32_OFFROAD_IDX 2

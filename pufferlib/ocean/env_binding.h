@@ -875,29 +875,59 @@ static int check_navigation_frame_array(PyObject *array_obj, int type_num, int f
     return 0;
 }
 
-// Writes one agent's navigation telemetry; rows of agents without an active navigation goal stay at their defaults.
+// Writes one agent's navigation telemetry; the lane preview descends distance_to_goal_m via exits and lane changes.
 static void fill_navigation_frame_row(const Drive *drive, const Agent *agent, float *navi_row, int *route_row) {
     const struct NavigationData *navigation = drive->navigation;
-    if (navigation == NULL || agent->navi_goal_idx == -1) {
+    if (navigation == NULL || agent->navi_goal_lane_idx == -1) {
         return;
     }
-    navi_row[NAVI_F32_GOAL_IDX] = (float) agent->navi_goal_idx;
-    navi_row[NAVI_F32_GOAL_X_IDX] = navigation->goal_x[agent->navi_goal_idx];
-    navi_row[NAVI_F32_GOAL_Y_IDX] = navigation->goal_y[agent->navi_goal_idx];
+    navi_row[NAVI_F32_GOAL_LANE_IDX] = (float) agent->navi_goal_lane_idx;
+    navi_row[NAVI_F32_GOAL_X_IDX] = agent->navi_goal_x;
+    navi_row[NAVI_F32_GOAL_Y_IDX] = agent->navi_goal_y;
     navi_row[NAVI_F32_DISTANCE_TO_GOAL_IDX] = agent->navi_distance_to_goal_m;
     navi_row[NAVI_F32_FEASIBILITY_LEFT_IDX] = agent->navi_feasibility_left_m;
     navi_row[NAVI_F32_FEASIBILITY_CENTER_IDX] = agent->navi_feasibility_center_m;
     navi_row[NAVI_F32_FEASIBILITY_RIGHT_IDX] = agent->navi_feasibility_right_m;
     navi_row[NAVI_F32_OFF_ROUTE_IDX] = (float) agent->navi_off_route;
+    if (agent->current_lane_idx == -1 || agent->navi_off_route) {
+        return;
+    }
 
-    int preview_count = 0;
-    for (int route_idx = agent->navi_route_cursor;
-         route_idx < agent->navi_route_length && preview_count < NAVI_ROUTE_PREVIEW_LANE_COUNT;
-         route_idx++) {
-        if (agent->navi_route_goal_idx[route_idx] != agent->navi_goal_idx) {
+    int goal_navi_lane_idx = navigation->road_to_navi_lane[agent->navi_goal_lane_idx];
+    const float *goal_distance_row
+        = &navigation->distance_to_goal_m[(size_t) goal_navi_lane_idx * navigation->num_lanes];
+    int navi_lane_idx = navigation->road_to_navi_lane[agent->current_lane_idx];
+    for (int preview_idx = 0; preview_idx < NAVI_ROUTE_PREVIEW_LANE_COUNT; preview_idx++) {
+        route_row[preview_idx] = navigation->lane_road_idx[navi_lane_idx];
+        if (navi_lane_idx == goal_navi_lane_idx) {
             break;
         }
-        route_row[preview_count++] = agent->route[route_idx];
+        const RoadMapElement *lane = &drive->road_elements[navigation->lane_road_idx[navi_lane_idx]];
+        float lane_cost_m = fmaxf(lane->length, NAVI_MIN_EDGE_COST_M);
+        int best_navi_lane_idx = -1;
+        float best_distance_m = NAVI_UNREACHABLE_M;
+        for (int exit_idx = 0; exit_idx < lane->num_exits; exit_idx++) {
+            int exit_road_idx = lane->exit_lanes[exit_idx];
+            int exit_navi_lane_idx = (exit_road_idx >= 0) ? navigation->road_to_navi_lane[exit_road_idx] : -1;
+            if (exit_navi_lane_idx == -1 || goal_distance_row[exit_navi_lane_idx] + lane_cost_m >= best_distance_m) {
+                continue;
+            }
+            best_navi_lane_idx = exit_navi_lane_idx;
+            best_distance_m = goal_distance_row[exit_navi_lane_idx] + lane_cost_m;
+        }
+        const int side_navi_lane_idx[2] = {navigation->left_lane[navi_lane_idx], navigation->right_lane[navi_lane_idx]};
+        for (int side_idx = 0; side_idx < 2; side_idx++) {
+            int side_lane_idx = side_navi_lane_idx[side_idx];
+            if (side_lane_idx == -1 || goal_distance_row[side_lane_idx] + NAVI_LANE_CHANGE_COST_M >= best_distance_m) {
+                continue;
+            }
+            best_navi_lane_idx = side_lane_idx;
+            best_distance_m = goal_distance_row[side_lane_idx] + NAVI_LANE_CHANGE_COST_M;
+        }
+        if (best_navi_lane_idx == -1) {
+            break;
+        }
+        navi_lane_idx = best_navi_lane_idx;
     }
 }
 
@@ -931,7 +961,7 @@ static PyObject *vec_get_navigation_frame(PyObject *self, PyObject *args) {
     int env_capacity = (int) PyArray_DIM(navi_f32_array, 0);
     int agent_capacity = (int) PyArray_DIM(navi_f32_array, 1);
     for (int slot_idx = 0; slot_idx < env_capacity * agent_capacity; slot_idx++) {
-        navi_f32[slot_idx * NAVI_F32_FIELDS + NAVI_F32_GOAL_IDX] = -1.0f;
+        navi_f32[slot_idx * NAVI_F32_FIELDS + NAVI_F32_GOAL_LANE_IDX] = -1.0f;
         for (int preview_idx = 0; preview_idx < NAVI_ROUTE_PREVIEW_LANE_COUNT; preview_idx++) {
             navi_route_i32[slot_idx * NAVI_ROUTE_PREVIEW_LANE_COUNT + preview_idx] = -1;
         }
@@ -1707,8 +1737,6 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "GOAL_SOURCE_GT", GOAL_SOURCE_GT);
     PyModule_AddIntConstant(m, "GOAL_SOURCE_EXTERNAL", GOAL_SOURCE_EXTERNAL);
     PyModule_AddIntConstant(m, "GOAL_SOURCE_GT_MAP", GOAL_SOURCE_GT_MAP);
-    PyModule_AddIntConstant(m, "ROUTE_SOURCE_RANDOM_WALK", ROUTE_SOURCE_RANDOM_WALK);
-    PyModule_AddIntConstant(m, "ROUTE_SOURCE_NAVIGATION", ROUTE_SOURCE_NAVIGATION);
     PyModule_AddIntConstant(m, "CONTROLLER_STATIC", CONTROLLER_STATIC);
     PyModule_AddIntConstant(m, "CONTROLLER_POLICY", CONTROLLER_POLICY);
     PyModule_AddIntConstant(m, "CONTROLLER_REPLAY", CONTROLLER_REPLAY);

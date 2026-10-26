@@ -5,7 +5,6 @@
 policy.action_type: discrete
 env.num_agents: 3200
 env.goal_source: route
-env.route_source: navigation
 env.navigation_dir: ""
 env.obs_navigation: true
 vec.num_envs: 40

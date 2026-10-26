@@ -58,7 +58,7 @@ benchmarks:
     num_scenarios: 250
     env:
       simulation_mode: gigaflow
-      num_maps: 8
+      num_maps: 9
       max_agents_per_env: 50
       max_scenarios_per_batch: null
       scenario_length: 500

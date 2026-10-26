@@ -165,11 +165,6 @@ class GoalSource(Enum):
     gt_map = 4
 
 
-class RouteSource(Enum):
-    random_walk = 0
-    navigation = 1
-
-
 class PackageName(Enum):
     ocean = 0
 
@@ -300,7 +295,6 @@ class DriveEnvConfig:
     eval_training_render: bool = MISSING
     goal_regen_mode: GoalRegen = MISSING
     goal_source: GoalSource = MISSING
-    route_source: RouteSource = MISSING
     navigation_dir: str = MISSING
     obs_goal_lane_distance: bool = MISSING
     goal_radius: float = _constrained_field(POSITIVE_NUMBER_CONSTRAINT)
@@ -629,10 +623,6 @@ def _validate_cross_field_constraints(config, context):
         _raise_config_error(context, "env.init_step_min_horizon", "must be smaller than env.scenario_length")
     if env["goal_source"] in ("gt", "gt_map") and env["simulation_mode"] != "replay":
         _raise_config_error(context, "env.goal_source", f"'{env['goal_source']}' is only supported in replay mode")
-    if env["route_source"] == "navigation" and (env["simulation_mode"] != "gigaflow" or env["goal_source"] != "route"):
-        _raise_config_error(context, "env.route_source", "'navigation' requires gigaflow mode and goal_source 'route'")
-    if env["obs_navigation"] and env["route_source"] != "navigation":
-        _raise_config_error(context, "env.obs_navigation", "requires env.route_source 'navigation'")
     if env["stagger_first_episode"] and env["init_step"] + env["init_step_min_horizon"] > env["scenario_length"]:
         _raise_config_error(
             context,

@@ -1929,12 +1929,12 @@ static int unpack_map_cache_args(PyObject *kwargs, Drive *config, const char ***
     config->obs_range_road_front_m = (float) unpack(kwargs, "obs_range_road_front_m");
     config->obs_range_road_behind_m = (float) unpack(kwargs, "obs_range_road_behind_m");
     config->obs_range_road_side_m = (float) unpack(kwargs, "obs_range_road_side_m");
-    config->route_source = (int) unpack(kwargs, "route_source");
+    config->obs_navigation = (int) unpack(kwargs, "obs_navigation");
     if (PyErr_Occurred()) {
         return -1;
     }
-    if (config->route_source != ROUTE_SOURCE_RANDOM_WALK && config->route_source != ROUTE_SOURCE_NAVIGATION) {
-        PyErr_SetString(PyExc_ValueError, "route_source must be 0 (random_walk) or 1 (navigation)");
+    if (config->obs_navigation < 0 || config->obs_navigation > 1) {
+        PyErr_SetString(PyExc_ValueError, "obs_navigation must be 0 or 1");
         return -1;
     }
     config->navigation_dir = unpack_str(kwargs, "navigation_dir");
@@ -2063,14 +2063,6 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     }
     env->goal_regen_mode = (int) unpack(kwargs, "goal_regen_mode");
     env->goal_source = (int) unpack(kwargs, "goal_source");
-    env->route_source = (int) unpack(kwargs, "route_source");
-    if (env->route_source != ROUTE_SOURCE_RANDOM_WALK && env->route_source != ROUTE_SOURCE_NAVIGATION) {
-        PyErr_Format(
-            PyExc_ValueError,
-            "route_source must be 0 (random_walk) or 1 (navigation). Got: %d",
-            env->route_source);
-        return -1;
-    }
     env->navigation_dir = unpack_str(kwargs, "navigation_dir");
     if (env->navigation_dir == NULL) {
         return -1;
@@ -2083,8 +2075,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->obs_lane_heading_signed = (int) unpack(kwargs, "obs_lane_heading_signed");
     env->obs_lane_speed_limit = (int) unpack(kwargs, "obs_lane_speed_limit");
     env->obs_navigation = (int) unpack(kwargs, "obs_navigation");
-    if (env->obs_navigation && env->route_source != ROUTE_SOURCE_NAVIGATION) {
-        PyErr_SetString(PyExc_ValueError, "obs_navigation requires route_source 1 (navigation)");
+    if (env->obs_navigation < 0 || env->obs_navigation > 1) {
+        PyErr_Format(PyExc_ValueError, "obs_navigation must be 0 or 1. Got: %d", env->obs_navigation);
         return -1;
     }
     env->obs_slots_traffic_controls_n = (int) unpack(kwargs, "obs_slots_traffic_controls_n");
