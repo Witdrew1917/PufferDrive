@@ -6,14 +6,17 @@ How to run PufferDrive training on a SLURM cluster. This is written with the NYU
 
 `scripts/cluster/_hal.sh <cmd...>` runs any command in the repo `.venv` inside
 the container, with maps, navigation sidecars and `experiments/` bound from
-hardcoded `/staging` paths (edit them at the top of the script). With no
+hardcoded paths (edit them at the top of the script). The repo is mounted at
+its host path, so absolute paths are identical inside and outside the
+container; create `.venv` with the same mount
+(`singularity exec --nv --bind "$PWD" --pwd "$PWD" <image> /opt/pufferdrive/setup-venv.sh`). With no
 arguments it opens a shell. `scripts/cluster/train_hal.sh` and
 `scripts/cluster/train_hal_mulit_gpu.sh` wrap it for `puffer train puffer_drive`
 (single GPU, or `torch.distributed.run` with `NUM_GPUS`, default 8); extra
 arguments are passed as config overrides. Submit them from the repo root:
 
 ```bash
-sbatch scripts/cluster/train_hal.sh env.goal_source=map env.obs_navigation=true env.navigation_dir=navi
+sbatch scripts/cluster/train_hal.sh env.goal_source=map env.obs_navigation=true env.navigation_dir=navi/carla
 ```
 
 ## HAL nightly launcher
