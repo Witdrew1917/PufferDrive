@@ -1,6 +1,6 @@
 # Multi-agent nightly recipe with goal-directed navigation observations.
 #
-# Used by scripts/cluster/train_hal*.sh. Navigation sidecars are generated
+# Used by scripts/cluster/_hal_nightly.sh. Navigation sidecars are generated
 # into a per-job temporary directory before training.
 policy.action_type: discrete
 env.num_agents: 3200

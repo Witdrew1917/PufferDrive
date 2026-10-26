@@ -2,11 +2,25 @@
 
 How to run PufferDrive training on a SLURM cluster. This is written with the NYU cluster in mind but it should mostly hold for any SLURM cluster.
 
+## HAL launchers
+
+`scripts/cluster/_hal.sh <cmd...>` runs any command in the repo `.venv` inside
+the container, with maps, navigation sidecars and `experiments/` bound from
+hardcoded `/staging` paths (edit them at the top of the script). With no
+arguments it opens a shell. `scripts/cluster/train_hal.sh` and
+`scripts/cluster/train_hal_mulit_gpu.sh` wrap it for `puffer train puffer_drive`
+(single GPU, or `torch.distributed.run` with `NUM_GPUS`, default 8); extra
+arguments are passed as config overrides. Submit them from the repo root:
+
+```bash
+sbatch scripts/cluster/train_hal.sh env.goal_source=map env.obs_navigation=true env.navigation_dir=navi
+```
+
 ## HAL nightly launcher
 
-`scripts/cluster/train_hal.sh` and `scripts/cluster/train_hal_mulit_gpu.sh`
-use the repository's `.venv` inside the image selected by `PUFFERDRIVE_IMAGE`
-(default `/staging/agp/containers/pufferdrive_20261022.sif`). They invoke its
+`scripts/cluster/_hal_nightly.sh <num_gpus>`
+uses the repository's `.venv` inside the image selected by `PUFFERDRIVE_IMAGE`
+(default `/staging/agp/containers/pufferdrive_20261022.sif`). It invokes its
 Python explicitly through `singularity exec`, without relying on the image's
 runscript or a system `python` on `PATH`. Distributed training uses the same
 interpreter via `python -m torch.distributed.run`.
@@ -23,8 +37,9 @@ singularity exec --nv --bind "$PWD:/Pufferdrive" --pwd /Pufferdrive \
 The venv must be created inside the selected image: a host-created venv may
 reference a Python installation that is not available in the container.
 The HAL launcher uses the same `/Pufferdrive` mount and explicitly changes into
-it before activating the venv. It also binds the checkout at its host path so
-map, config, and output paths remain accessible.
+it before activating the venv. Maps, the program config, and the run directory
+are bound separately under `/mnt/pufferdrive`, so container commands do not
+depend on the checkout's host path being accessible.
 
 ## A quick overview of the setup and launch process
 

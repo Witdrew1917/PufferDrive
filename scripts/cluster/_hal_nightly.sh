@@ -37,8 +37,10 @@ RUN_DIR="$RUNS_DIR/$RUN_NAME"
 mkdir -p "$RUN_DIR"
 
 CONTAINER_COMMAND=(
-    singularity exec --nv --bind "$REPO_ROOT:$REPO_ROOT"
-    --bind "$REPO_ROOT:/Pufferdrive" --pwd /Pufferdrive
+    singularity exec --nv --bind "$REPO_ROOT:/Pufferdrive" --pwd /Pufferdrive
+    --bind "$MAP_DIR:/mnt/pufferdrive/maps"
+    --bind "$PROGRAM_CONFIG:/mnt/pufferdrive/program.yaml"
+    --bind "$RUN_DIR:/mnt/pufferdrive/run"
     --bind "$NAVI_DIR:$NAVI_DIR" "$CONTAINER"
     /bin/bash -euc '
         cd /Pufferdrive
@@ -51,7 +53,7 @@ CONTAINER_COMMAND=(
     ' pufferdrive-hal
 )
 "${CONTAINER_COMMAND[@]}" data_utils/process_navigation.py \
-    --input "$MAP_DIR" \
+    --input /mnt/pufferdrive/maps \
     --output-dir "$NAVI_DIR" \
     --workers "${NAVI_WORKERS:-4}"
 
@@ -68,7 +70,7 @@ for key, value in config.items():
     elif value is None:
         value = "null"
     print(f"{key}={value}")
-' "$PROGRAM_CONFIG"
+' /mnt/pufferdrive/program.yaml
 )"
 mapfile -t NIGHTLY_ARGS <<< "$CONFIG_OVERRIDES"
 
@@ -77,11 +79,11 @@ mapfile -t NIGHTLY_ARGS <<< "$CONFIG_OVERRIDES"
     -m pufferlib.pufferl train puffer_drive \
     "${NIGHTLY_ARGS[@]}" \
     "$@" \
-    "env.map_dir=$MAP_DIR" \
+    "env.map_dir=/mnt/pufferdrive/maps" \
     "env.goal_source=route" \
     "env.navigation_dir=$NAVI_DIR" \
     "env.obs_navigation=true" \
     "train.seed=$SEED" \
-    "train.data_dir=$RUN_DIR" \
+    "train.data_dir=/mnt/pufferdrive/run" \
     "run_name=$RUN_NAME" \
     "wandb_group=$DATE_STAMP"

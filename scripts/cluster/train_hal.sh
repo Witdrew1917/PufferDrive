@@ -8,10 +8,8 @@
 #SBATCH --time 3-00:00:00
 #SBATCH --output /staging/agp/users/%u/logs/zpufferdrive/%j.out
 #SBATCH --partition zprod
-#SBATCH --job-name=pufferdrive-nightly
+#SBATCH --job-name=pufferdrive
 #SBATCH --reservation=ctps2
 #
 
-NUM_GPUS="${NUM_GPUS:-1}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$SCRIPT_DIR/_hal_nightly.sh" "$NUM_GPUS" "$@"
+exec scripts/cluster/_hal.sh puffer train puffer_drive "$@"
