@@ -21,7 +21,7 @@ if [[ ! -f "$CONTAINER" ]]; then
 fi
 if [[ ! -f "$REPO_ROOT/.venv/bin/activate" ]]; then
     echo "error: missing repo .venv; create it with:" >&2
-    echo "  singularity exec --nv --bind \"$REPO_ROOT:$REPO_ROOT\" --pwd \"$REPO_ROOT\" \\" >&2
+    echo "  singularity exec --nv --bind \"$REPO_ROOT:/Pufferdrive\" --pwd /Pufferdrive \\" >&2
     echo "    \"$CONTAINER\" /opt/pufferdrive/setup-venv.sh" >&2
     exit 1
 fi
@@ -37,9 +37,11 @@ RUN_DIR="$RUNS_DIR/$RUN_NAME"
 mkdir -p "$RUN_DIR"
 
 CONTAINER_COMMAND=(
-    singularity exec --nv --bind "$REPO_ROOT:$REPO_ROOT" --pwd "$REPO_ROOT"
+    singularity exec --nv --bind "$REPO_ROOT:$REPO_ROOT"
+    --bind "$REPO_ROOT:/Pufferdrive" --pwd /Pufferdrive
     --bind "$NAVI_DIR:$NAVI_DIR" "$CONTAINER"
     /bin/bash -euc '
+        cd /Pufferdrive
         source "$PWD/.venv/bin/activate"
         if [[ ! -x "$PWD/.venv/bin/python" ]]; then
             echo "error: repo .venv/bin/python is missing or broken inside the container; recreate the venv with /opt/pufferdrive/setup-venv.sh inside this image" >&2

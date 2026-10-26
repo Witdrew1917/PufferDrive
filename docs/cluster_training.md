@@ -15,13 +15,16 @@ If Python is missing or the venv's interpreter symlink is broken inside the
 image, create or recreate the venv from the repository root using that image:
 
 ```bash
-singularity exec --nv --bind "$PWD:$PWD" --pwd "$PWD" \
+singularity exec --nv --bind "$PWD:/Pufferdrive" --pwd /Pufferdrive \
     "${PUFFERDRIVE_IMAGE:-/staging/agp/containers/pufferdrive_20261022.sif}" \
     /opt/pufferdrive/setup-venv.sh
 ```
 
 The venv must be created inside the selected image: a host-created venv may
 reference a Python installation that is not available in the container.
+The HAL launcher uses the same `/Pufferdrive` mount and explicitly changes into
+it before activating the venv. It also binds the checkout at its host path so
+map, config, and output paths remain accessible.
 
 ## A quick overview of the setup and launch process
 
