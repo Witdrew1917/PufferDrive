@@ -202,7 +202,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     conf.navigation_waypoints = NAVI_DEFAULT_WAYPOINTS;
     conf.navigation_waypoint_spacing = NAVI_DEFAULT_WAYPOINT_SPACING_M;
     if (ini_parse(env->ini_file, handler, &conf) < 0) {
-        printf("Error while loading %s", env->ini_file);
+        printf("Error while loading %s\n", env->ini_file);
     }
     if (kwargs && PyDict_GetItemString(kwargs, "episode_length")) {
         conf.episode_length = (int)unpack(kwargs, "episode_length");

@@ -132,7 +132,7 @@ Three modes determine what happens when an agent reaches its goal:
 
 Where partners = `MAX_AGENTS - 1` agents × 7 features, roads = 232 segments × 7 features
 
-With `navigation = 1` the ego block grows by 3 and `navigation_waypoints` × 3 waypoint floats are appended after the roads: `[ego | partners | roads | waypoints]`. Policies are tied to these settings.
+With `navigation = 1` the ego block grows by 3 and `navigation_waypoints` × 3 waypoint floats are appended after the roads: `[ego | partners | roads | waypoints]`. Policies are tied to these settings. See [Lane navigation](navigation.md).
 
 > [!IMPORTANT]
 > All observations are in the **ego vehicle's reference frame** (agent-centric) and are normalized. Positions rotate with the agent's heading.

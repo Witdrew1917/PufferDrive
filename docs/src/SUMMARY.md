@@ -8,6 +8,7 @@
 - [Training agents](train.md)
 - [Interact with agents](interact-with-agents.md)
 - [Simulator](simulator.md)
+- [Lane navigation](navigation.md)
 - [Interactive scenario editor](scene-editor.md)
 - [Visualizer](visualizer.md)
 

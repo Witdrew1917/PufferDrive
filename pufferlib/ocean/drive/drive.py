@@ -14,6 +14,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib
 
+DEFAULT_INI_FILE = os.path.join(os.path.dirname(pufferlib.__file__), "config", "ocean", "drive.ini")
+
+
 matplotlib.use("Agg")  # non-interactive backend
 
 
@@ -75,7 +78,7 @@ class Drive(pufferlib.PufferEnv):
         non_vehicle_controller="auto",
         max_controlled_agents=32,
         map_dir="resources/drive/binaries/training",
-        ini_file_path="pufferlib/config/ocean/drive.ini",
+        ini_file_path=DEFAULT_INI_FILE,
         reg_mode="None",
         anchor_cpt_path=None,
         uses_memory=False,

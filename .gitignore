@@ -197,3 +197,5 @@ eval_videos/*
 results/*
 
 weights/
+*.mp4
+pufferlib/resources/drive/binaries/*

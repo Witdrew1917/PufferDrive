@@ -50,15 +50,15 @@ From: nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
         software-properties-common \
         build-essential
 
-    # Rendering: raylib/GLFW (X11), EGL headless path (used with --nv), Xvfb/Mesa fallback, ffmpeg for videos
+    # Rendering: raylib/GLFW (X11) on Xvfb/Mesa, ffmpeg for videos.
+    # No EGL headers on purpose: setup.py would link -lEGL/-lGL, and `--nv` mounts the host's libEGL/libGL,
+    # which fail to load when the host glibc is newer than Ubuntu 22.04's (e.g. GLIBC_2.38 not found).
     apt-get install -y -q --no-install-recommends \
         libx11-dev \
         libxrandr-dev \
         libxinerama-dev \
         libxcursor-dev \
         libxi-dev \
-        libgl-dev \
-        libegl-dev \
         libgl1-mesa-dri \
         libglu1-mesa \
         xvfb \
@@ -75,6 +75,8 @@ From: nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
     curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/bin UV_NO_MODIFY_PATH=1 sh
 
     git config --system --add safe.directory '*'
+
+    if [ -e /usr/include/EGL/egl.h ]; then echo "EGL headers present; drive would link the host libEGL" >&2; exit 1; fi
 
     apt-get clean
     rm -rf /var/lib/apt/lists/*

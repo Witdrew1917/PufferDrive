@@ -61,6 +61,8 @@ Refer to [Simulator](simulator.md) for how the binaries are consumed during rese
 
 ## Navigation sidecars (optional)
 
+See [Lane navigation](navigation.md) for the full feature description.
+
 Lane-level navigation is stored next to each map as `map_XXX.navi` and is only read when `navigation = 1` in the `[env]` section of `drive.ini` (or `--env.navigation 1`). Generate the sidecars from existing bins (the bins are not modified):
 
 ```bash
