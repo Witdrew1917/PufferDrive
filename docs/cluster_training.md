@@ -9,7 +9,8 @@ the container, with maps, navigation sidecars and `experiments/` bound from
 hardcoded paths (edit them at the top of the script). The repo is mounted at
 its host path, so absolute paths are identical inside and outside the
 container; create `.venv` with the same mount
-(`singularity exec --nv --bind "$PWD" --pwd "$PWD" <image> /opt/pufferdrive/setup-venv.sh`). With no
+(`singularity exec --nv --bind "$(pwd -P)" --pwd "$(pwd -P)" <image> /opt/pufferdrive/setup-venv.sh`;
+`pwd -P` because a symlinked home path is not visible inside the container). With no
 arguments it opens a shell. `scripts/cluster/train_hal.sh` and
 `scripts/cluster/train_hal_mulit_gpu.sh` wrap it for `puffer train puffer_drive`
 (single GPU, or `torch.distributed.run` with `NUM_GPUS`, default 8); extra

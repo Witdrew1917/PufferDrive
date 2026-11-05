@@ -7,21 +7,22 @@
 #   scripts/cluster/_hal.sh puffer train puffer_drive env.goal_source=map env.obs_navigation=true env.navigation_dir=navi/carla
 #   scripts/cluster/_hal.sh bash -c "python setup.py build_ext --inplace --force && puffer train puffer_drive"
 
+REPO_DIR="$(pwd -P)"
 CONTAINER="/staging/agp/containers/pufferdrive_20261022.sif"
 OUTPUT_DIR="/staging/agp/projects/pufferdrive/experiments"
-CARLA_MAPS_DIR="$PWD/pufferlib/resources/drive/binaries/carla"
+CARLA_MAPS_DIR="$REPO_DIR/pufferlib/resources/drive/binaries/carla"
 CARLA_NAVI_DIR="/staging/agp/projects/pufferdrive/binaries/carla_navi"
 
-mkdir -p "$OUTPUT_DIR" "$CARLA_NAVI_DIR" "$PWD/navi/carla"
+mkdir -p "$OUTPUT_DIR" "$CARLA_NAVI_DIR" "$REPO_DIR/navi/carla"
 
-if [ ! -f "$PWD/.venv/bin/activate" ]; then
-  echo "error: no .venv in $PWD; create it inside the container with:" >&2
-  echo "  singularity exec --nv --bind \"\$PWD\" --pwd \"\$PWD\" $CONTAINER /opt/pufferdrive/setup-venv.sh" >&2
+if [ ! -f "$REPO_DIR/.venv/bin/activate" ]; then
+  echo "error: no .venv in $REPO_DIR; create it inside the container with:" >&2
+  echo "  singularity exec --nv --bind $REPO_DIR --pwd $REPO_DIR $CONTAINER /opt/pufferdrive/setup-venv.sh" >&2
   exit 1
 fi
-if ! grep -q "$PWD/.venv" "$PWD/.venv/bin/activate"; then
+if ! grep -q "$REPO_DIR/.venv" "$REPO_DIR/.venv/bin/activate"; then
   echo "error: .venv was created for another path; rm -rf .venv and recreate it with:" >&2
-  echo "  singularity exec --nv --bind \"\$PWD\" --pwd \"\$PWD\" $CONTAINER /opt/pufferdrive/setup-venv.sh" >&2
+  echo "  singularity exec --nv --bind $REPO_DIR --pwd $REPO_DIR $CONTAINER /opt/pufferdrive/setup-venv.sh" >&2
   exit 1
 fi
 
@@ -30,12 +31,12 @@ if [ $# -eq 0 ]; then
 fi
 
 singularity exec --nv \
-  --bind "$PWD" \
-  --bind "$CARLA_MAPS_DIR":"$PWD"/pufferlib/resources/drive/binaries/carla \
-  --bind "$CARLA_NAVI_DIR":"$PWD"/navi/carla \
-  --bind "$OUTPUT_DIR":"$PWD"/experiments \
+  --bind "$REPO_DIR" \
+  --bind "$CARLA_MAPS_DIR":"$REPO_DIR"/pufferlib/resources/drive/binaries/carla \
+  --bind "$CARLA_NAVI_DIR":"$REPO_DIR"/navi/carla \
+  --bind "$OUTPUT_DIR":"$REPO_DIR"/experiments \
   --bind /staging:/staging \
   --bind "$(realpath "$(git rev-parse --git-common-dir)")" \
-  --pwd "$PWD" \
+  --pwd "$REPO_DIR" \
   "$CONTAINER" \
   bash -c 'source .venv/bin/activate && exec "$@"' _hal "$@"
