@@ -44,6 +44,13 @@ int demo(const char *map_name, const char *policy_name, int show_grid, int obs_o
         fprintf(stderr, "Error: Could not load %s. Cannot determine environment configuration.\n", ini_file);
         return -1;
     }
+    if (conf.navigation) {
+        fprintf(stderr,
+                "Error: navigation = 1 is not supported by the C demo policy (drivenet.h has no waypoint "
+                "branch). Set navigation = 0 in %s or render through `puffer eval`.\n",
+                ini_file);
+        return -1;
+    }
 
     char map_buffer[100];
     if (map_name == NULL) {

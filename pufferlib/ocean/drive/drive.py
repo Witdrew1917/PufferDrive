@@ -86,6 +86,9 @@ class Drive(pufferlib.PufferEnv):
         obs_partner_noise_speed=0.0,
         obs_partner_noise_pos=0.0,
         async_resets=True,
+        navigation=0,
+        navigation_waypoints=16,
+        navigation_waypoint_spacing=5.0,
     ):
         # env
         self.dt = dt
@@ -122,6 +125,19 @@ class Drive(pufferlib.PufferEnv):
 
         # Observation space calculation
         self.ego_features = binding.EGO_FEATURES_JERK if dynamics_model == "jerk" else binding.EGO_FEATURES
+        self.navigation = int(navigation)
+        if self.navigation not in (0, 1):
+            raise ValueError(f"navigation must be 0 or 1. Got: {navigation}")
+        self.navigation_waypoints = int(navigation_waypoints)
+        self.navigation_waypoint_spacing = float(navigation_waypoint_spacing)
+        if self.navigation:
+            if not 1 <= self.navigation_waypoints <= binding.NAVI_MAX_WAYPOINTS:
+                raise ValueError(
+                    f"navigation_waypoints must be in [1, {binding.NAVI_MAX_WAYPOINTS}]. Got: {navigation_waypoints}"
+                )
+            if not self.navigation_waypoint_spacing > 0.0:
+                raise ValueError(f"navigation_waypoint_spacing must be > 0. Got: {navigation_waypoint_spacing}")
+            self.ego_features += binding.NAVIGATION_EGO_FEATURES
 
         # Extract observation shapes from constants
         # These need to be defined in C, since they determine the shape of the arrays
@@ -129,11 +145,15 @@ class Drive(pufferlib.PufferEnv):
         self.max_partner_objects = binding.MAX_AGENTS - 1
         self.partner_features = binding.PARTNER_FEATURES
         self.road_features = binding.ROAD_FEATURES
+        # Navigation waypoints are appended after the road block: (ego-frame x, y, valid) per waypoint
+        self.max_waypoints = self.navigation_waypoints if self.navigation else 0
+        self.waypoint_features = binding.NAVIGATION_WAYPOINT_FEATURES
 
         self.num_obs = (
             self.ego_features
             + self.max_partner_objects * self.partner_features
             + self.max_road_objects * self.road_features
+            + self.max_waypoints * self.waypoint_features
         )
         self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(self.num_obs,), dtype=np.float32)
 
@@ -234,6 +254,14 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(
                 f"num_maps ({num_maps}) exceeds available maps in directory ({available_maps}). Please reduce num_maps or add more maps to resources/drive/binaries."
             )
+        if self.navigation:
+            missing = [i for i in range(num_maps) if not os.path.exists(f"{map_dir}/map_{i:03d}.navi")]
+            if missing:
+                raise FileNotFoundError(
+                    f"navigation=1 but {len(missing)} of {num_maps} maps in {map_dir} lack a .navi sidecar "
+                    f"(first: map_{missing[0]:03d}.navi). Generate them with: "
+                    f"python -m pufferlib.ocean.drive.drive navigation --map-dir {map_dir}"
+                )
 
         # Iterate through all maps to count total agents that can be initialized for each map
         agent_offsets, map_ids, num_envs = binding.shared(
@@ -301,6 +329,9 @@ class Drive(pufferlib.PufferEnv):
                 fix_reward=self.fix_rewards,
                 async_resets=self.async_resets,
                 dynamics_model=self._dynamics_model_flag,
+                navigation=self.navigation,
+                navigation_waypoints=self.navigation_waypoints,
+                navigation_waypoint_spacing=self.navigation_waypoint_spacing,
             )
             self.env_ids.append(env_id)
 
@@ -397,6 +428,9 @@ class Drive(pufferlib.PufferEnv):
                 obs_partner_noise_pos=self.obs_partner_noise_pos,
                 obs_partner_noise_speed=self.obs_partner_noise_speed,
                 async_resets=int(self.async_resets),
+                navigation=self.navigation,
+                navigation_waypoints=self.navigation_waypoints,
+                navigation_waypoint_spacing=self.navigation_waypoint_spacing,
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)
@@ -1148,6 +1182,56 @@ def process_all_maps(
                 print(f"  {name}: {error}")
 
 
+def _process_single_navigation(args):
+    map_path, max_goals, seed = args
+    from pufferlib.ocean.drive.navigation import process_map_navigation
+
+    try:
+        navi = process_map_navigation(map_path, max_goals=max_goals, seed=seed)
+        return (map_path.name, True, f"lanes={navi['num_lanes']} goals={navi['num_goals']}")
+    except Exception as e:
+        return (map_path.name, False, f"{type(e).__name__}: {e}")
+
+
+def process_all_navigation(
+    map_dir="resources/drive/binaries/training",
+    num_workers=None,
+    overwrite=False,
+    max_goals=64,
+    seed=42,
+):
+    """Open every map_XXX.bin in map_dir and write its lane-navigation sidecar map_XXX.navi next to it.
+
+    Returns the number of maps that failed.
+    """
+    from pathlib import Path
+    from pufferlib.ocean.drive.navigation import NAVI_MAX_GOALS, navigation_path_for
+
+    if not 1 <= max_goals <= NAVI_MAX_GOALS:
+        raise ValueError(f"max_goals must be in [1, {NAVI_MAX_GOALS}]. Got: {max_goals}")
+    map_paths = sorted(Path(map_dir).glob("map_*.bin"))
+    if not map_paths:
+        raise FileNotFoundError(f"No map_*.bin files in {map_dir}")
+    tasks = [(p, max_goals, seed) for p in map_paths if overwrite or not navigation_path_for(p).exists()]
+    skipped = len(map_paths) - len(tasks)
+
+    with Pool(num_workers or cpu_count()) as pool:
+        results = list(
+            tqdm(
+                pool.imap_unordered(_process_single_navigation, tasks),
+                total=len(tasks),
+                desc="Building navigation",
+                unit="map",
+            )
+        )
+
+    failures = [(name, message) for name, success, message in results if not success]
+    print(f"Navigation: {len(results) - len(failures)} written, {len(failures)} failed, {skipped} skipped (existing)")
+    for name, message in failures:
+        print(f"  {name}: {message}")
+    return len(failures)
+
+
 def test_performance(timeout=10, atn_cache=12, num_agents=12):
     import time
 
@@ -1191,7 +1275,34 @@ def test_performance(timeout=10, atn_cache=12, num_agents=12):
 
 
 if __name__ == "__main__":
-    # analyze_action_space(data_folder="data/processed/training_50k", max_maps=10000)
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="PufferDrive map processing")
+    subparsers = parser.add_subparsers(dest="command")
+    maps_parser = subparsers.add_parser("maps", help="Convert JSON scenarios to map_XXX.bin (default)")
+    maps_parser.add_argument("--data-folder", default="data/processed/training")
+    navi_parser = subparsers.add_parser("navigation", help="Write map_XXX.navi lane-navigation sidecars")
+    navi_parser.add_argument("--map-dir", default="resources/drive/binaries/training")
+    navi_parser.add_argument("--workers", type=int, default=None)
+    navi_parser.add_argument("--max-goals", type=int, default=64)
+    navi_parser.add_argument("--seed", type=int, default=42)
+    navi_parser.add_argument("--overwrite", action="store_true", help="Rebuild sidecars that already exist")
+    cli_args = parser.parse_args()
+
+    if cli_args.command == "navigation":
+        failed_count = process_all_navigation(
+            map_dir=cli_args.map_dir,
+            num_workers=cli_args.workers,
+            overwrite=cli_args.overwrite,
+            max_goals=cli_args.max_goals,
+            seed=cli_args.seed,
+        )
+        sys.exit(1 if failed_count else 0)
     # test_performance()
     # Process the train dataset
-    process_all_maps(data_folder="data/processed/training")
+    process_all_maps(data_folder=getattr(cli_args, "data_folder", "data/processed/training"))
+    # Process the validation/test dataset
+    # process_all_maps(data_folder="data/processed/validation")
+    # # Process the validation_interactive dataset
+    # process_all_maps(data_folder="data/processed/validation_interactive")

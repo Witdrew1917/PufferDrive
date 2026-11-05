@@ -1083,12 +1083,7 @@ static PyObject *vec_collect_expert_data(PyObject *self, PyObject *args) {
         int num_agents = env->active_agent_count;
         int discrete_action_dim = (env->dynamics_model == DELTA_LOCAL) ? 3 : 1;
 
-        int ego_dim;
-        if (env->dynamics_model == JERK)
-            ego_dim = EGO_FEATURES_JERK;
-        else 
-            ego_dim = EGO_FEATURES;
-        int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+        int max_obs = observation_size(env);
 
         float *env_actions_discrete =
             (float *)malloc(trajectory_length * num_agents * discrete_action_dim * sizeof(float));
@@ -1217,6 +1212,9 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "PARTNER_FEATURES", PARTNER_FEATURES);
     PyModule_AddIntConstant(m, "EGO_FEATURES", EGO_FEATURES); // Default
     PyModule_AddIntConstant(m, "EGO_FEATURES_JERK", EGO_FEATURES_JERK);
+    PyModule_AddIntConstant(m, "NAVIGATION_EGO_FEATURES", NAVIGATION_EGO_FEATURES);
+    PyModule_AddIntConstant(m, "NAVIGATION_WAYPOINT_FEATURES", NAVIGATION_WAYPOINT_FEATURES);
+    PyModule_AddIntConstant(m, "NAVI_MAX_WAYPOINTS", NAVI_MAX_WAYPOINTS);
 
     return m;
 }

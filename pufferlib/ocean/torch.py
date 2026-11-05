@@ -23,6 +23,9 @@ class Drive(nn.Module):
         self.road_features = env.road_features
         self.road_features_after_onehot = env.road_features + 6  # 6 is the number of one-hot encoded categories
         self.ego_dim = env.ego_features
+        self.max_waypoints = env.max_waypoints
+        self.waypoint_features = env.waypoint_features
+        self.use_waypoints = self.max_waypoints > 0
 
         self.ego_encoder = nn.Sequential(
             pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size)),
@@ -45,9 +48,18 @@ class Drive(nn.Module):
             pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
         )
 
+        num_branches = 3
+        if self.use_waypoints:
+            self.waypoint_encoder = nn.Sequential(
+                pufferlib.pytorch.layer_init(nn.Linear(self.waypoint_features, input_size)),
+                nn.LayerNorm(input_size),
+                pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+            )
+            num_branches += 1
+
         self.shared_embedding = nn.Sequential(
             nn.GELU(),
-            pufferlib.pytorch.layer_init(nn.Linear(3 * input_size, hidden_size)),
+            pufferlib.pytorch.layer_init(nn.Linear(num_branches * input_size, hidden_size)),
         )
         self.is_continuous = isinstance(env.single_action_space, pufferlib.spaces.Box)
 
@@ -91,7 +103,17 @@ class Drive(nn.Module):
         partner_features, _ = self.partner_encoder(partner_objects).max(dim=1)
         road_features, _ = self.road_encoder(road_objects).max(dim=1)
 
-        concat_features = torch.cat([ego_features, road_features, partner_features], dim=1)
+        branch_features = [ego_features, road_features, partner_features]
+        if self.use_waypoints:
+            waypoint_start = ego_dim + partner_dim + road_dim
+            waypoint_obs = observations[
+                :, waypoint_start : waypoint_start + self.max_waypoints * self.waypoint_features
+            ]
+            waypoints = waypoint_obs.view(-1, self.max_waypoints, self.waypoint_features)
+            waypoint_features, _ = self.waypoint_encoder(waypoints).max(dim=1)
+            branch_features.append(waypoint_features)
+
+        concat_features = torch.cat(branch_features, dim=1)
 
         # Pass through shared embedding
         embedding = F.relu(self.shared_embedding(concat_features))

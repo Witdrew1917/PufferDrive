@@ -132,6 +132,8 @@ Three modes determine what happens when an agent reaches its goal:
 
 Where partners = `MAX_AGENTS - 1` agents × 7 features, roads = 232 segments × 7 features
 
+With `navigation = 1` the ego block grows by 3 and `navigation_waypoints` × 3 waypoint floats are appended after the roads: `[ego | partners | roads | waypoints]`. Policies are tied to these settings.
+
 > [!IMPORTANT]
 > All observations are in the **ego vehicle's reference frame** (agent-centric) and are normalized. Positions rotate with the agent's heading.
 
@@ -140,6 +142,8 @@ Where partners = `MAX_AGENTS - 1` agents × 7 features, roads = 232 segments × 
 **Classic (7):** goal_x, goal_y, speed, width, length, collision_flag, respawn_flag
 
 **Jerk adds (3):** steering_angle, long_accel, lat_accel
+
+**Navigation adds (3, opt-in with `navigation = 1`):** left/center/right lane feasibility (metres the agent can stay on that lane and still reach its goal, divided by 200 and capped at 1; all zero without a navigation goal). Requires [navigation sidecars](data.md#navigation-sidecars-optional). With goal behavior 1, new goals are snapped to sidecar goal lanes.
 
 
 ### Partner features (up to `MAX_AGENTS - 1` agents, 7 each)
@@ -161,6 +165,14 @@ mid_x, mid_y, length, width, dir_cos, dir_sin, type
 
 > [!NOTE]
 > Road observations use a spatial grid with 5m cells. The 21×21 vision range gives ~105m visibility in all directions.
+
+### Navigation waypoints (opt-in with `navigation = 1`, `navigation_waypoints` × 3)
+rel_x, rel_y, valid
+
+- `navigation_waypoints` (default 16, max 64) points every `navigation_waypoint_spacing` metres (default 5) along the route to the navigation goal, starting from the agent's projection onto its current (or last known) lane; positions scaled by 0.02 like road/partner features
+- The route follows `next_lane`; where the goal is only reachable through a lane change it switches to the left/right lane closer to the goal
+- Ends at the goal lane's end; remaining slots and agents without a goal or off route are zero (`valid = 0`)
+- The `Drive` torch policy encodes them in a fourth branch (shared per-waypoint MLP + max-pool). The C demo policy (`drivenet.h`) does not support navigation
 
 
 ## Rewards & metrics
@@ -208,6 +220,8 @@ mid_x, mid_y, length, width, dir_cos, dir_sin, type
 - **`goals_reached_this_episode`** - Total goals completed across all agents
 
 - **`goals_sampled_this_episode`** - Total goals assigned (>1 in multi-goal mode)
+
+- **`navi_goal_active_rate`**, **`navi_off_route_rate`** (only with `navigation = 1`) - Fraction of steps with a navigation goal, and fraction of steps on a lane from which that goal is unreachable
 
 #### Metrics interpretation by goal behavior
 

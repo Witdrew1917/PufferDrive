@@ -34,6 +34,9 @@ typedef struct {
     int non_sdc_controller;
     int non_vehicle_controller;
     int max_controlled_agents;
+    int navigation;
+    int navigation_waypoints;
+    float navigation_waypoint_spacing;
     char map_dir[256];
     char anchor_policy_path[256];
     int reg_mode;
@@ -71,6 +74,12 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->goal_behavior = atoi(value);
     } else if (MATCH("env", "goal_target_distance")) {
         env_config->goal_target_distance = atof(value);
+    } else if (MATCH("env", "navigation")) {
+        env_config->navigation = atoi(value);
+    } else if (MATCH("env", "navigation_waypoints")) {
+        env_config->navigation_waypoints = atoi(value);
+    } else if (MATCH("env", "navigation_waypoint_spacing")) {
+        env_config->navigation_waypoint_spacing = atof(value);
     } else if (MATCH("env", "reward_vehicle_collision")) {
         env_config->reward_vehicle_collision = atof(value);
     } else if (MATCH("env", "obs_partner_noise_speed")) {

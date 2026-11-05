@@ -199,6 +199,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->human_agent_idx = unpack(kwargs, "human_agent_idx");
     env->ini_file = unpack_str(kwargs, "ini_file");
     env_init_config conf = {0};
+    conf.navigation_waypoints = NAVI_DEFAULT_WAYPOINTS;
+    conf.navigation_waypoint_spacing = NAVI_DEFAULT_WAYPOINT_SPACING_M;
     if (ini_parse(env->ini_file, handler, &conf) < 0) {
         printf("Error while loading %s", env->ini_file);
     }
@@ -248,6 +250,9 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_INT(fix_lambdas);
     OVERRIDE_FLOAT(lambda_value);
     OVERRIDE_INT(async_resets);
+    OVERRIDE_INT(navigation);
+    OVERRIDE_INT(navigation_waypoints);
+    OVERRIDE_FLOAT(navigation_waypoint_spacing);
 
 #undef OVERRIDE_INT
 #undef OVERRIDE_FLOAT
@@ -278,6 +283,18 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->goal_radius = (float)unpack(kwargs, "goal_radius");
     env->goal_speed = (float)unpack(kwargs, "goal_speed");
     env->render_mode = (int)unpack(kwargs, "render_mode");
+    if (conf.navigation && (conf.navigation_waypoints < 1 || conf.navigation_waypoints > NAVI_MAX_WAYPOINTS)) {
+        PyErr_Format(PyExc_ValueError, "navigation_waypoints must be in [1, %d], got %d", NAVI_MAX_WAYPOINTS,
+                     conf.navigation_waypoints);
+        return -1;
+    }
+    if (conf.navigation && !(conf.navigation_waypoint_spacing > 0.0f)) {
+        PyErr_SetString(PyExc_ValueError, "navigation_waypoint_spacing must be > 0");
+        return -1;
+    }
+    env->navigation_enabled = conf.navigation;
+    env->navigation_waypoints = conf.navigation_waypoints;
+    env->navigation_waypoint_spacing = conf.navigation_waypoint_spacing;
     char *map_dir = unpack_str(kwargs, "map_dir");
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");
@@ -320,5 +337,7 @@ static int my_log(PyObject *dict, Log *log) {
     //  assign_to_dict(dict, "goals_reached_this_episode", log->goals_reached_this_episode);
     //  assign_to_dict(dict, "speed_at_goal", log->speed_at_goal);
     //   assign_to_dict(dict, "avg_displacement_error", log->avg_displacement_error);
+    assign_to_dict(dict, "navi_goal_active_rate", log->navi_goal_active_rate);
+    assign_to_dict(dict, "navi_off_route_rate", log->navi_off_route_rate);
     return 0;
 }
