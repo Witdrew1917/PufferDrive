@@ -13,18 +13,7 @@ OUTPUT_DIR="/staging/agp/projects/pufferdrive/experiments"
 CARLA_MAPS_DIR="$REPO_DIR/pufferlib/resources/drive/binaries/carla"
 CARLA_NAVI_DIR="/staging/agp/projects/pufferdrive/binaries/carla_navi"
 
-mkdir -p "$OUTPUT_DIR" "$CARLA_NAVI_DIR" "$REPO_DIR/navi/carla"
-
-if [ ! -f "$REPO_DIR/.venv/bin/activate" ]; then
-  echo "error: no .venv in $REPO_DIR; create it inside the container with:" >&2
-  echo "  singularity exec --nv --bind $REPO_DIR --pwd $REPO_DIR $CONTAINER /opt/pufferdrive/setup-venv.sh" >&2
-  exit 1
-fi
-if ! grep -q "$REPO_DIR/.venv" "$REPO_DIR/.venv/bin/activate"; then
-  echo "error: .venv was created for another path; rm -rf .venv and recreate it with:" >&2
-  echo "  singularity exec --nv --bind $REPO_DIR --pwd $REPO_DIR $CONTAINER /opt/pufferdrive/setup-venv.sh" >&2
-  exit 1
-fi
+mkdir -p "$OUTPUT_DIR" "$CARLA_NAVI_DIR" "$PWD/navi/carla"
 
 if [ $# -eq 0 ]; then
   set -- bash
