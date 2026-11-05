@@ -1196,7 +1196,7 @@ class WandbLogger:
 
         run_name = args.get("wandb_run_name", None)
         wandb.init(
-            id=load_id or wandb.util.generate_id(),
+            id=load_id or wandb.sdk.lib.runid.generate_id(),
             name=run_name,
             project=args["wandb_project"],
             group=args["wandb_group"],
