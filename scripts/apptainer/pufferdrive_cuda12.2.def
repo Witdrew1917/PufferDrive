@@ -1,0 +1,88 @@
+# PufferDrive environment image (CUDA 12.2.2 + cuDNN 8, Ubuntu 22.04, Python 3.12, uv).
+# Environment only: the repository and its virtualenv are bind-mounted at runtime, mirroring
+# zpufferdrive's tools/Dockerfile.puffer_env.
+#
+# Build locally (the cluster disables --fakeroot), then copy the .sif to the cluster:
+#   apptainer build --fakeroot pufferdrive_cuda12.2.2.sif scripts/apptainer/pufferdrive_cuda12.2.def
+#   rsync -P pufferdrive_cuda12.2.2.sif <cluster>:<container_dir>/
+#
+# First use (creates .venv_apptainer in the repo and compiles the C/CUDA extensions in place):
+#   apptainer exec --nv --bind "$PWD":/workspace --pwd /workspace pufferdrive_cuda12.2.2.sif bash -c \
+#     'uv venv .venv_apptainer && . .venv_apptainer/bin/activate && \
+#      uv pip install "numpy<2.0" Cython setuptools wheel torch && \
+#      uv pip install --no-build-isolation -e .'
+#
+# Train:
+#   apptainer exec --nv --bind "$PWD":/workspace --pwd /workspace pufferdrive_cuda12.2.2.sif \
+#     .venv_apptainer/bin/puffer train puffer_drive
+
+Bootstrap: docker
+From: nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
+
+%labels
+    Description PufferDrive environment (CUDA 12.2.2, cuDNN 8, Python 3.12, uv)
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONPATH=/workspace
+    export MPLCONFIGDIR=/tmp/matplotlib_cache
+    export UV_PYTHON=python3.12
+    # torch wheels built against CUDA 12.1 run on the 12.2 toolkit and match nvcc for pufferlib.cu
+    export UV_TORCH_BACKEND="${UV_TORCH_BACKEND:-cu121}"
+    # Build nodes often have no GPU visible; compile kernels for common datacenter/workstation archs
+    export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;8.6;8.9;9.0+PTX}"
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y -q --no-install-recommends \
+        git \
+        gdb \
+        vim \
+        less \
+        htop \
+        curl \
+        wget \
+        gnupg \
+        ca-certificates \
+        software-properties-common \
+        build-essential
+
+    # Rendering: raylib/GLFW (X11), EGL headless path (used with --nv), Xvfb/Mesa fallback, ffmpeg for videos
+    apt-get install -y -q --no-install-recommends \
+        libx11-dev \
+        libxrandr-dev \
+        libxinerama-dev \
+        libxcursor-dev \
+        libxi-dev \
+        libgl-dev \
+        libegl-dev \
+        libgl1-mesa-dri \
+        libglu1-mesa \
+        xvfb \
+        ffmpeg
+
+    # Python 3.12
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update
+    apt-get install -y -q --no-install-recommends python3.12 python3.12-dev python3.12-venv
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 12
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 12
+
+    # uv
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/bin UV_NO_MODIFY_PATH=1 sh
+
+    git config --system --add safe.directory '*'
+
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+    mkdir -p /workspace
+
+%runscript
+    exec /bin/bash "$@"
+
+%help
+    PufferDrive environment image. Bind the repository to /workspace and run with --nv.
+    See the header of scripts/apptainer/pufferdrive_cuda12.2.def for build, setup and train commands.
