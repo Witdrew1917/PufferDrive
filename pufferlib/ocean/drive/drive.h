@@ -118,8 +118,13 @@
 #define NAVI_FEASIBILITY_CAP_M 1000.0f
 #define NAVI_CRC32_POLYNOMIAL 0xEDB88320u
 #define NAVI_CRC32_CHUNK_BYTES 65536
-#define NAVIGATION_EGO_FEATURES 4 // active flag + left/center/right lane feasibility
+#define NAVIGATION_EGO_FEATURES 3      // left/center/right lane feasibility
+#define NAVIGATION_WAYPOINT_FEATURES 3 // ego-frame x, y, valid
+#define NAVI_MAX_WAYPOINTS 64
+#define NAVI_DEFAULT_WAYPOINTS 16
+#define NAVI_DEFAULT_WAYPOINT_SPACING_M 5.0f
 #define NAVI_OBS_FEASIBILITY_HORIZON_M 200.0f
+#define NAVI_RENDER_WAYPOINT_RADIUS_M 0.4f
 #define NAVI_RENDER_LANE_WIDTH_PX 3.0f
 #define NAVI_RENDER_ROUTE_WIDTH_PX 6.0f
 #define NAVI_RENDER_Z_OFFSET 0.05f
@@ -266,6 +271,7 @@ struct Entity {
     // Navigation (env->navigation loaded)
     int navi_goal_idx;  // -1 when the agent has no navigation goal
     int navi_off_route; // 1: current lane cannot reach the navigation goal
+    int navi_lane_idx;  // last known navi lane, -1 if never on a lane
     float navi_distance_to_goal_m;
     float navi_feasibility_left_m;
     float navi_feasibility_center_m;
@@ -431,8 +437,10 @@ struct Drive {
     int control_mode;
     int max_controlled_agents;
     int render_mode;
-    int navigation_enabled; // ini/kwarg `navigation`; requires map_XXX.navi sidecars
-    Navigation *navigation; // NULL unless navigation_enabled
+    int navigation_enabled;            // ini/kwarg `navigation`; requires map_XXX.navi sidecars
+    int navigation_waypoints;          // route waypoints in the observation when navigation_enabled
+    float navigation_waypoint_spacing; // metres between consecutive route waypoints
+    Navigation *navigation;            // NULL unless navigation_enabled
 };
 
 void add_log(Drive *env) {
@@ -1574,10 +1582,14 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     return;
 }
 
-// Arc length (m) along a lane polyline of the point closest to (x, y).
-float lane_progress_m(const Entity *lane, float x, float y) {
+// Projects (x, y) onto a lane polyline: returns the arc length (m) of the closest point and, if requested, the index
+// of the segment holding it and its coordinates.
+float lane_project(const Entity *lane, float x, float y, int *segment_out, float *x_out, float *y_out) {
     float best_distance = INFINITY;
     float best_progress_m = 0.0f;
+    int best_segment = 0;
+    float best_x = lane->traj_x[0];
+    float best_y = lane->traj_y[0];
     float segment_start_m = 0.0f;
     for (int point_idx = 0; point_idx + 1 < lane->array_size; point_idx++) {
         float start_x = lane->traj_x[point_idx];
@@ -1590,15 +1602,28 @@ float lane_progress_m(const Entity *lane, float x, float y) {
         if (segment_length_sq > 0.0f) {
             t = clip(((x - start_x) * segment_dx + (y - start_y) * segment_dy) / segment_length_sq, 0.0f, 1.0f);
         }
-        float distance = relative_distance_2d(x, y, start_x + t * segment_dx, start_y + t * segment_dy);
+        float proj_x = start_x + t * segment_dx;
+        float proj_y = start_y + t * segment_dy;
+        float distance = relative_distance_2d(x, y, proj_x, proj_y);
         if (distance < best_distance) {
             best_distance = distance;
             best_progress_m = segment_start_m + t * segment_length_m;
+            best_segment = point_idx;
+            best_x = proj_x;
+            best_y = proj_y;
         }
         segment_start_m += segment_length_m;
     }
+    if (segment_out != NULL) {
+        *segment_out = best_segment;
+        *x_out = best_x;
+        *y_out = best_y;
+    }
     return best_progress_m;
 }
+
+// Arc length (m) along a lane polyline of the point closest to (x, y).
+float lane_progress_m(const Entity *lane, float x, float y) { return lane_project(lane, x, y, NULL, NULL, NULL); }
 
 // Lane-start feasibility minus progress along the lane; forbidden (0) and capped values pass through.
 float navigation_feasibility_ahead_m(float lane_start_feasibility_m, float lane_progress) {
@@ -1612,6 +1637,7 @@ void reset_navigation_state(Drive *env, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
     agent->navi_goal_idx = env->navigation->object_goal_idx[agent_idx];
     agent->navi_off_route = 0;
+    agent->navi_lane_idx = -1;
     agent->navi_distance_to_goal_m = 0.0f;
     agent->navi_feasibility_left_m = 0.0f;
     agent->navi_feasibility_center_m = 0.0f;
@@ -1621,11 +1647,15 @@ void reset_navigation_state(Drive *env, int agent_idx) {
 // Refreshes goal distance and lane feasibility from current_lane_idx; off-lane keeps the last known state.
 void update_navigation_state(Drive *env, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
-    if (agent->navi_goal_idx == -1 || agent->current_lane_idx == -1) {
+    if (agent->current_lane_idx == -1) {
         return;
     }
     const Navigation *navigation = env->navigation;
     int navi_lane_idx = navigation->entity_to_navi_lane[agent->current_lane_idx];
+    agent->navi_lane_idx = navi_lane_idx;
+    if (agent->navi_goal_idx == -1) {
+        return;
+    }
     int table_idx = agent->navi_goal_idx * navigation->num_lanes + navi_lane_idx;
     float progress_m = lane_progress_m(&env->entities[agent->current_lane_idx], agent->x, agent->y);
     float lane_start_distance_m = navigation->distance_to_goal_m[table_idx];
@@ -1648,6 +1678,83 @@ void update_navigation_state(Drive *env, int agent_idx) {
         agent->navi_feasibility_right_m = navigation_feasibility_ahead_m(
             navigation->feasibility_right_m[table_idx], lane_progress_m(right_lane, agent->x, agent->y));
     }
+}
+
+// World-frame waypoints every spacing_m along the agent's route, starting from its projection onto its last known
+// lane. Follows next_lane; where the goal is only reachable through a lane change, hops to the left/right neighbour
+// with the shorter distance to goal (strictly decreasing, so the walk terminates). Stops at the goal lane's end.
+// Returns the number of waypoints written (0 without a goal or when off route).
+int navigation_route_waypoints(const Drive *env, const Entity *agent, int max_waypoints, float spacing_m, float *xs,
+                               float *ys) {
+    const Navigation *navigation = env->navigation;
+    if (navigation == NULL || agent->navi_goal_idx == -1 || agent->navi_lane_idx == -1) {
+        return 0;
+    }
+    int num_lanes = navigation->num_lanes;
+    const int *next_row = &navigation->next_lane[(size_t)agent->navi_goal_idx * num_lanes];
+    const float *distance_row = &navigation->distance_to_goal_m[(size_t)agent->navi_goal_idx * num_lanes];
+    int goal_lane = navigation->goal_lane[agent->navi_goal_idx];
+    int lane = agent->navi_lane_idx;
+    if (distance_row[lane] >= NAVI_UNREACHABLE_M) {
+        return 0;
+    }
+    const Entity *lane_entity = &env->entities[navigation->lane_entity_idx[lane]];
+    int segment;
+    float x, y;
+    lane_project(lane_entity, agent->x, agent->y, &segment, &x, &y);
+    int count = 0;
+    float to_travel_m = spacing_m;
+    for (int lane_hops = 0; count < max_waypoints && lane_hops <= 2 * num_lanes;) {
+        if (lane != goal_lane && next_row[lane] == -1) {
+            int side_lanes[2] = {navigation->left_lane[lane], navigation->right_lane[lane]};
+            int best_lane = -1;
+            float best_distance_m = distance_row[lane];
+            for (int side = 0; side < 2; side++) {
+                if (side_lanes[side] != -1 && distance_row[side_lanes[side]] < best_distance_m) {
+                    best_lane = side_lanes[side];
+                    best_distance_m = distance_row[best_lane];
+                }
+            }
+            if (best_lane == -1) {
+                break;
+            }
+            lane = best_lane;
+            lane_entity = &env->entities[navigation->lane_entity_idx[lane]];
+            lane_project(lane_entity, x, y, &segment, &x, &y);
+            lane_hops++;
+            continue;
+        }
+        if (segment + 1 >= lane_entity->array_size) {
+            if (lane == goal_lane) {
+                break;
+            }
+            lane = next_row[lane];
+            lane_entity = &env->entities[navigation->lane_entity_idx[lane]];
+            segment = 0;
+            x = lane_entity->traj_x[0];
+            y = lane_entity->traj_y[0];
+            lane_hops++;
+            continue;
+        }
+        float end_x = lane_entity->traj_x[segment + 1];
+        float end_y = lane_entity->traj_y[segment + 1];
+        float remaining_m = relative_distance_2d(x, y, end_x, end_y);
+        if (to_travel_m <= remaining_m) {
+            float t = to_travel_m / remaining_m;
+            x += t * (end_x - x);
+            y += t * (end_y - y);
+            xs[count] = x;
+            ys[count] = y;
+            count++;
+            to_travel_m = spacing_m;
+        } else {
+            to_travel_m -= remaining_m;
+            x = end_x;
+            y = end_y;
+            segment++;
+        }
+    }
+    return count;
 }
 
 // Reachable navigation goal whose remaining route distance is closest to goal_target_distance; -1 if none.
@@ -1960,10 +2067,19 @@ int ego_feature_count(const Drive *env) {
     return env->navigation_enabled ? dynamics_ego_dim + NAVIGATION_EGO_FEATURES : dynamics_ego_dim;
 }
 
+int waypoint_feature_count(const Drive *env) {
+    return env->navigation_enabled ? env->navigation_waypoints * NAVIGATION_WAYPOINT_FEATURES : 0;
+}
+
+// Layout: [ego | partners | road segments | navigation waypoints (navigation only)]
+int observation_size(const Drive *env) {
+    return ego_feature_count(env) + PARTNER_FEATURES * (MAX_AGENTS - 1) +
+           ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + waypoint_feature_count(env);
+}
+
 void allocate(Drive *env) {
     init(env);
-    int ego_dim = ego_feature_count(env);
-    int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = observation_size(env);
     env->observations = (float *)calloc(env->active_agent_count * max_obs, sizeof(float));
     env->actions = (float *)calloc(env->active_agent_count * 2, sizeof(float));
     env->rewards = (float *)calloc(env->active_agent_count, sizeof(float));
@@ -2262,7 +2378,8 @@ void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *leng
 
 void compute_observations(Drive *env) {
     int ego_dim = ego_feature_count(env);
-    int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = observation_size(env);
+    int waypoint_obs_start = max_obs - waypoint_feature_count(env);
     memset(env->observations, 0, max_obs * env->active_agent_count * sizeof(float));
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
     for (int i = 0; i < env->active_agent_count; i++) {
@@ -2308,10 +2425,22 @@ void compute_observations(Drive *env) {
 
         if (env->navigation != NULL && ego_entity->navi_goal_idx != -1) {
             float *navi_obs = &obs[ego_dim - NAVIGATION_EGO_FEATURES];
-            navi_obs[0] = 1.0f;
-            navi_obs[1] = fminf(ego_entity->navi_feasibility_left_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
-            navi_obs[2] = fminf(ego_entity->navi_feasibility_center_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
-            navi_obs[3] = fminf(ego_entity->navi_feasibility_right_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
+            navi_obs[0] = fminf(ego_entity->navi_feasibility_left_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
+            navi_obs[1] = fminf(ego_entity->navi_feasibility_center_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
+            navi_obs[2] = fminf(ego_entity->navi_feasibility_right_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
+
+            float waypoint_x[NAVI_MAX_WAYPOINTS];
+            float waypoint_y[NAVI_MAX_WAYPOINTS];
+            int waypoint_count = navigation_route_waypoints(env, ego_entity, env->navigation_waypoints,
+                                                            env->navigation_waypoint_spacing, waypoint_x, waypoint_y);
+            float *waypoint_obs = &obs[waypoint_obs_start];
+            for (int k = 0; k < waypoint_count; k++) {
+                float dx = waypoint_x[k] - ego_entity->x;
+                float dy = waypoint_y[k] - ego_entity->y;
+                waypoint_obs[k * NAVIGATION_WAYPOINT_FEATURES] = (dx * cos_heading + dy * sin_heading) * 0.02f;
+                waypoint_obs[k * NAVIGATION_WAYPOINT_FEATURES + 1] = (-dx * sin_heading + dy * cos_heading) * 0.02f;
+                waypoint_obs[k * NAVIGATION_WAYPOINT_FEATURES + 2] = 1.0f;
+            }
         }
 
         // Relative Pos of other cars
@@ -2948,7 +3077,7 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
     }
 
     int ego_dim = ego_feature_count(env);
-    int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = observation_size(env);
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
     float *agent_obs = &observations[agent_index][0];
     // self
@@ -2957,6 +3086,22 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
     float heading_self_y = env->entities[active_idx].heading_y;
     float px = env->entities[active_idx].x;
     float py = env->entities[active_idx].y;
+    // Navigation waypoints
+    const float *waypoint_obs = &agent_obs[max_obs - waypoint_feature_count(env)];
+    for (int k = 0; env->navigation_enabled && k < env->navigation_waypoints; k++) {
+        const float *waypoint = &waypoint_obs[k * NAVIGATION_WAYPOINT_FEATURES];
+        if (waypoint[2] == 0.0f) {
+            break;
+        }
+        float waypoint_x = waypoint[0] * 50;
+        float waypoint_y = waypoint[1] * 50;
+        if (mode == 1) {
+            float local_x = waypoint_x;
+            waypoint_x = px + (local_x * heading_self_x - waypoint_y * heading_self_y);
+            waypoint_y = py + (local_x * heading_self_y + waypoint_y * heading_self_x);
+        }
+        DrawSphere((Vector3){waypoint_x, waypoint_y, Z_AGENT_DETAILS}, NAVI_RENDER_WAYPOINT_RADIUS_M, PUFF_CYAN);
+    }
     // draw goal
     float goal_x = agent_obs[0] * 200;
     float goal_y = agent_obs[1] * 200;
@@ -3235,6 +3380,13 @@ void draw_navigation_overlay(Drive *env) {
         }
     }
     rlSetLineWidth(1.0f);
+    float waypoint_x[NAVI_MAX_WAYPOINTS];
+    float waypoint_y[NAVI_MAX_WAYPOINTS];
+    int waypoint_count = navigation_route_waypoints(env, agent, env->navigation_waypoints,
+                                                    env->navigation_waypoint_spacing, waypoint_x, waypoint_y);
+    for (int k = 0; k < waypoint_count; k++) {
+        DrawSphere((Vector3){waypoint_x[k], waypoint_y[k], Z_AGENT_DETAILS}, NAVI_RENDER_WAYPOINT_RADIUS_M, WHITE);
+    }
     DrawSphere(
         (Vector3){navigation->goal_x[agent->navi_goal_idx], navigation->goal_y[agent->navi_goal_idx], Z_AGENT_DETAILS},
         NAVI_RENDER_GOAL_RADIUS_M, PUFF_CYAN);

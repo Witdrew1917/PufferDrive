@@ -72,7 +72,7 @@ Options: `--max-goals` (goal lanes per map, default 64; logged agent goal lanes 
 - **Generation** (`pufferlib/ocean/drive/navigation.py`): lane successors are inferred from end→start proximity, lateral neighbours from parallel lanes about one lane width apart (a road edge between them forbids the lane change). For every goal lane it stores, per lane, the next lane toward the goal, the distance to the goal (lane changes allowed) and left/center/right lane feasibility, i.e. how many metres the agent can stay on that lane and still reach the goal.
 - **Format** (little-endian): 40-byte header `magic "PDNAVI01"`, `version` (int32 = 2), `map_crc32` (uint32), `map_size_bytes` (uint64), `num_objects`, `num_roads`, `num_lanes`, `num_goals` (int32), followed by `lane_entity_idx/left_lane/right_lane[num_lanes]`, `goal_lane/goal_x/goal_y[num_goals]`, `object_goal_idx[num_objects]` and the `[num_goals × num_lanes]` tables `next_lane`, `distance_to_goal_m`, `feasibility_left_m/center_m/right_m`.
 - **Validation**: the C loader rejects missing, truncated, trailing-byte, out-of-range or stale sidecars (CRC/size mismatch with the map bin) and aborts env creation; regenerate with `--overwrite` after changing a map.
-- **Rendering**: with navigation enabled the renderer colours lanes by feasibility toward the selected agent's goal (red → green, grey = unreachable), highlights its `next_lane` route in cyan and marks the goal.
+- **Rendering**: with navigation enabled the renderer colours lanes by feasibility toward the selected agent's goal (red → green, grey = unreachable), highlights its `next_lane` route in cyan, draws its observed route waypoints and marks the goal.
 
 ## Interactive scenario editor
 

@@ -20,7 +20,7 @@ void test_drivenet() {
 
     // Weights* weights = load_weights("resources/drive/puffer_drive_weights.bin");
     Weights *weights = load_weights("puffer_drive_weights.bin");
-    DriveNet *net = init_drivenet(weights, num_agents, CLASSIC, 0);
+    DriveNet *net = init_drivenet(weights, num_agents, CLASSIC);
 
     forward(net, observations, actions);
     for (int i = 0; i < num_agents * num_actions; i++) {
@@ -45,6 +45,13 @@ int demo(const char *map_name, const char *policy_name, int show_grid, int obs_o
         fprintf(stderr, "Error: Could not load %s. Cannot determine environment configuration.\n", ini_file);
         return -1;
     }
+    if (conf.navigation) {
+        fprintf(stderr,
+                "Error: navigation = 1 is not supported by the C demo policy (drivenet.h has no waypoint "
+                "branch). Set navigation = 0 in %s or render through `puffer eval`.\n",
+                ini_file);
+        return -1;
+    }
 
     char map_buffer[100];
     if (map_name == NULL) {
@@ -65,7 +72,6 @@ int demo(const char *map_name, const char *policy_name, int show_grid, int obs_o
         .goal_radius = conf.goal_radius,
         .goal_behavior = conf.goal_behavior,
         .goal_target_distance = conf.goal_target_distance,
-        .navigation_enabled = conf.navigation,
         .goal_speed = conf.goal_speed,
         .dt = conf.dt,
         .episode_length = conf.episode_length,
@@ -87,7 +93,7 @@ int demo(const char *map_name, const char *policy_name, int show_grid, int obs_o
     c_reset(&env);
     c_render(&env);
     Weights *weights = load_weights((char *)policy_name);
-    DriveNet *net = init_drivenet(weights, env.active_agent_count, env.dynamics_model, env.navigation_enabled);
+    DriveNet *net = init_drivenet(weights, env.active_agent_count, env.dynamics_model);
 
     int accel_delta = 2;
     int steer_delta = 4;

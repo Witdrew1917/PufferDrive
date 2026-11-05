@@ -50,6 +50,8 @@ class Drive(pufferlib.PufferEnv):
         max_controlled_agents=32,
         map_dir="resources/drive/binaries/training",
         navigation=0,
+        navigation_waypoints=16,
+        navigation_waypoint_spacing=5.0,
     ):
         # env
         self.dt = dt
@@ -80,7 +82,15 @@ class Drive(pufferlib.PufferEnv):
         self.navigation = int(navigation)
         if self.navigation not in (0, 1):
             raise ValueError(f"navigation must be 0 or 1. Got: {navigation}")
+        self.navigation_waypoints = int(navigation_waypoints)
+        self.navigation_waypoint_spacing = float(navigation_waypoint_spacing)
         if self.navigation:
+            if not 1 <= self.navigation_waypoints <= binding.NAVI_MAX_WAYPOINTS:
+                raise ValueError(
+                    f"navigation_waypoints must be in [1, {binding.NAVI_MAX_WAYPOINTS}]. Got: {navigation_waypoints}"
+                )
+            if not self.navigation_waypoint_spacing > 0.0:
+                raise ValueError(f"navigation_waypoint_spacing must be > 0. Got: {navigation_waypoint_spacing}")
             self.ego_features += binding.NAVIGATION_EGO_FEATURES
 
         # Extract observation shapes from constants
@@ -89,11 +99,15 @@ class Drive(pufferlib.PufferEnv):
         self.max_partner_objects = binding.MAX_AGENTS - 1
         self.partner_features = binding.PARTNER_FEATURES
         self.road_features = binding.ROAD_FEATURES
+        # Navigation waypoints are appended after the road block: (ego-frame x, y, valid) per waypoint
+        self.max_waypoints = self.navigation_waypoints if self.navigation else 0
+        self.waypoint_features = binding.NAVIGATION_WAYPOINT_FEATURES
 
         self.num_obs = (
             self.ego_features
             + self.max_partner_objects * self.partner_features
             + self.max_road_objects * self.road_features
+            + self.max_waypoints * self.waypoint_features
         )
         self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(self.num_obs,), dtype=np.float32)
 
@@ -219,6 +233,8 @@ class Drive(pufferlib.PufferEnv):
                 max_controlled_agents=self.max_controlled_agents,
                 render_mode=render_mode,
                 navigation=self.navigation,
+                navigation_waypoints=self.navigation_waypoints,
+                navigation_waypoint_spacing=self.navigation_waypoint_spacing,
             )
             self.env_ids.append(env_id)
 
@@ -286,6 +302,8 @@ class Drive(pufferlib.PufferEnv):
                 max_controlled_agents=self.max_controlled_agents,
                 render_mode=self.render_mode,
                 navigation=self.navigation,
+                navigation_waypoints=self.navigation_waypoints,
+                navigation_waypoint_spacing=self.navigation_waypoint_spacing,
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)
