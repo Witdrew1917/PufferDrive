@@ -948,9 +948,9 @@ class Evaluator:
 
         info_list = []
         for time_idx in range(self.sim_steps):
-            if mode == "human_replay" and not terminals[render_env_idx]:
-                driver.render(view_mode=view_mode, env_idx=render_env_idx)
-            elif mode == "self_play" and render_env_idx is not None:
+            if render_env_idx is not None and (
+                mode == "self_play" or (mode == "human_replay" and not terminals[render_env_idx])
+            ):
                 driver.render(view_mode=view_mode, env_idx=render_env_idx)
 
             # Get action from policy

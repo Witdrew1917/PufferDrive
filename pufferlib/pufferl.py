@@ -1358,6 +1358,26 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         vecenv.close()
         return results_dict
 
+    elif args["eval"].get("human_replay_eval", False):
+        from pufferlib.ocean.benchmark.evaluator import Evaluator
+
+        evaluator = Evaluator(args)
+        evaluator.hr_env = vecenv or load_env(env_name, evaluator.hr_eval_config)
+        try:
+            policy = policy or load_policy(args, evaluator.hr_env, env_name)
+            evaluator.rollout(policy, mode="human_replay")
+        finally:
+            evaluator.hr_env.driver_env.stop_recorder(0)
+            evaluator.hr_env.close()
+
+        results = evaluator.collect_stats()
+        import json
+
+        print("\nHUMAN_REPLAY_METRICS_START")
+        print(json.dumps(results))
+        print("HUMAN_REPLAY_METRICS_END")
+        return results
+
     else:  # Standard evaluation: Render
         backend = args["vec"]["backend"]
         if backend != "PufferEnv":

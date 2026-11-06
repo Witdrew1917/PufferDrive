@@ -54,3 +54,4 @@ puffer eval puffer_drive --eval.human-replay-eval True --load-model-path <path_t
 ```
 
 During this evaluation the self-driving car (SDC) is controlled by your policy while other agents replay log trajectories.
+The evaluation prints aggregate score and collision metrics. Rendering is enabled by default and saves the rollout video in the current directory; set `--eval.render-human-replay-eval False` to collect metrics without rendering.
