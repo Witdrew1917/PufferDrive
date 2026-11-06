@@ -1,7 +1,15 @@
+#include <Python.h>
 #include "drive.h"
 #define Env Drive
 #define MY_SHARED
 #define MY_PUT
+
+static PyObject *py_gui_take_map_request(PyObject *self, PyObject *args) {
+    return PyLong_FromLong(gui_take_map_request());
+}
+#define MY_METHODS                                                                                                     \
+    {"gui_take_map_request", py_gui_take_map_request, METH_NOARGS,                                                    \
+     "Pop the interactive viewer's pending map change (-1 previous, +1 next, 0 none)"}
 #include "../env_binding.h"
 
 static int my_put(Env *env, PyObject *args, PyObject *kwargs) {

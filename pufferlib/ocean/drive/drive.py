@@ -342,6 +342,7 @@ class Drive(pufferlib.PufferEnv):
         self.needs_resampling = self.num_maps > (self.num_agents / 2)
         self._resample_count = 0
         self.seed = seed
+        self._map_seed = seed  # seed of the currently loaded map batch
 
         self.c_envs = binding.vectorize(*self.env_ids)
 
@@ -365,10 +366,25 @@ class Drive(pufferlib.PufferEnv):
 
     def resample_maps(self):
         """Resample environment maps."""
-        self.tick = 0
-        binding.vec_close(self.c_envs)
         resample_seed = self.seed + self._resample_count
-        agent_offsets, map_ids, num_envs = binding.shared(
+        self._load_map_batch(resample_seed, self._sample_map_batch(resample_seed))
+        self._resample_count += 1
+
+    def cycle_map(self, direction: int, env_idx: int = 0):
+        """Load the previous (-1) / next (+1) map batch so env `env_idx` shows a different map (interactive viewer)."""
+        current_map = self.map_ids[env_idx] if env_idx < len(self.map_ids) else None
+        seed = self._map_seed
+        for _ in range(64):  # skip batches whose env_idx map is unchanged
+            seed += direction
+            batch = self._sample_map_batch(seed)
+            if env_idx < batch[2] and batch[1][env_idx] != current_map:
+                break
+        self._load_map_batch(seed, batch)
+        # Automatic resampling continues from here
+        self._resample_count = seed - self.seed + 1
+
+    def _sample_map_batch(self, resample_seed):
+        return binding.shared(
             seed=resample_seed,
             num_agents=self.num_agents,
             num_maps=self.num_maps,
@@ -384,6 +400,12 @@ class Drive(pufferlib.PufferEnv):
             map_dir=self.map_dir,
             max_controlled_agents=self.max_controlled_agents,
         )
+
+    def _load_map_batch(self, resample_seed, batch):
+        agent_offsets, map_ids, num_envs = batch
+        self.tick = 0
+        binding.vec_close(self.c_envs)
+        self._map_seed = resample_seed
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
@@ -437,7 +459,6 @@ class Drive(pufferlib.PufferEnv):
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)
-        self._resample_count += 1
 
         binding.vec_reset(self.c_envs, resample_seed)
         self.truncations[:] = 1
@@ -670,6 +691,12 @@ class Drive(pufferlib.PufferEnv):
 
     def render(self, view_mode: RenderView = RenderView.FULL_SIM_STATE, draw_traces: bool = True, env_idx: int = 0):
         binding.vec_render(self.c_envs, int(view_mode), draw_traces, env_idx)
+        # Interactive viewer: J / K request the previous / next map; show the new map before stepping on.
+        direction = binding.gui_take_map_request()
+        while direction != 0:
+            self.cycle_map(direction, env_idx)
+            binding.vec_render(self.c_envs, int(view_mode), draw_traces, env_idx)
+            direction = binding.gui_take_map_request()
 
     def close(self):
         binding.vec_close(self.c_envs)

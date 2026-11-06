@@ -1,6 +1,8 @@
-## Drive with trained agents
+## Interactive viewer
 
-You can take manual control of an agent in the simulator by holding **LEFT SHIFT** and using the keyboard controls. When you're in control, the action values displayed on screen will turn **yellow**.
+Rendering with `render_mode` set to the pop-up window (e.g. `puffer eval` or the standalone `./drive` demo) opens a
+resizable interactive viewer. The simulator and eval loop run as usual; the viewer only adds camera, selection and
+overlay controls. It starts **paused**: press **SPACE** to run or **ENTER** to advance one step.
 
 ### Local rendering
 
@@ -44,27 +46,42 @@ The `drive` tool supports similar CLI arguments as the visualizer to control the
 
 ### Controls
 
-**General:**
+Press **H** in the viewer to show the key-binding panel with the current state of each toggle.
 
-- **LEFT SHIFT + Arrow Keys/WASD** - Take manual control
-- **SPACE** - First-person camera view
-- **Mouse Drag** - Pan camera
-- **Mouse Wheel** - Zoom
+**Simulation**
 
-**Classic dynamics model**
+- **SPACE / P** - Pause / resume
+- **ENTER / →** - Step one frame (while paused)
+- **Q** - Quit viewer (exits the process); **ESC** asks for confirmation. **Ctrl+C** in the terminal also works while paused.
 
-- **SHIFT + UP/W** - Increase acceleration
-- **SHIFT + DOWN/S** - Decrease acceleration (brake)
-- **SHIFT + LEFT/A** - Steer left
-- **SHIFT + RIGHT/D** - Steer right
+**Camera**
 
-Each key press increments or decrements the action level. For example, tapping W multiple times increases acceleration from neutral (index 3) → 5 → 6 (maximum acceleration). We assume **no friction**, so releasing all keys maintains constant speed and heading.
+- **V** - Cycle camera: BEV (2D top-down) / 3D orbit / FPV (behind the selected agent)
+- **B** - Toggle BEV
+- **F** - Follow the selected agent
+- **R** - Reset camera to the map
+- **LMB drag** - Orbit (3D), pan (BEV) or look around (FPV)
+- **RMB / MMB drag** - Pan
+- **Mouse wheel** - Zoom towards the cursor
+- **Double-click** - Centre view on the clicked point
 
-**Jerk dynamics model**
+**Selection**
 
-- **SHIFT + UP/W** - Accelerate (+4.0 m/s³ jerk)
-- **SHIFT + DOWN/S** - Brake (-15.0 m/s³ jerk)
-- **SHIFT + LEFT/A** - Turn left (+4.0 m/s³ lateral jerk)
-- **SHIFT + RIGHT/D** - Turn right (-4.0 m/s³ lateral jerk)
+- **LMB click** - Select the agent under the cursor
+- **TAB / SHIFT+TAB** - Next / previous agent
+- **S** - Select the agent nearest to the cursor
 
-Actions are applied directly when keys are pressed. Pressing W always applies +4.0 m/s³ longitudinal jerk, regardless of how long the key is held.
+**Overlays**
+
+- **CTRL** - Toggle observation view (what the selected agent sees)
+- **O** - Toggle observation lasers
+- **N** - Navigation overlay: off / selected route / route + feasible lanes / all routes (waypoints in orange)
+- **L** - Lane feasibility of the selected agent: off / arrows / text. One indicator per lane (left, current, right)
+  shows how many metres the goal stays reachable in that lane; red **X** means the goal is unreachable from it
+  (arrow length and colour scale red → green up to 200 m). The HUD always shows the values as `feasible L / C / R`.
+- **G** - Goal markers: all / selected agent / off
+- **T** - Motion trails
+
+**Maps**
+
+- **J / K** - Previous / next map (loads a new map batch and pauses at t = 0; the HUD shows the current map)
