@@ -887,10 +887,10 @@ def train(dynamics_model: str, map_dir: str = None, num_maps_override: int = Non
 
     # Visual sanity check rollout
     # On train maps
-    try:
-        record_rollout_video(policy, dynamics_model, device)
-    except Exception as e:
-        print(f"Video recording failed (non-fatal): {e}")
+    #try:
+    #    record_rollout_video(policy, dynamics_model, device)
+    #except Exception as e:
+    #    print(f"Video recording failed (non-fatal): {e}")
 
     env.close()
     val_env.close()
