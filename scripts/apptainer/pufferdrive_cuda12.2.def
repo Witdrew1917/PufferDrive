@@ -1,20 +1,17 @@
 # PufferDrive environment image (CUDA 12.2.2 + cuDNN 8, Ubuntu 22.04, Python 3.12, uv).
-# Environment only: the repository and its virtualenv are bind-mounted at runtime, mirroring
-# zpufferdrive's tools/Dockerfile.puffer_env.
+# The Python environment is installed in the image; bind the repository at runtime.
 #
 # Build locally (the cluster disables --fakeroot), then copy the .sif to the cluster:
 #   apptainer build --fakeroot pufferdrive_cuda12.2.2.sif scripts/apptainer/pufferdrive_cuda12.2.def
 #   rsync -P pufferdrive_cuda12.2.2.sif <cluster>:<container_dir>/
 #
-# First use (creates .venv_apptainer in the repo and compiles the C/CUDA extensions in place):
+# First use (compiles the C/CUDA extensions in the bound repository):
 #   apptainer exec --nv --bind "$PWD":/workspace --pwd /workspace pufferdrive_cuda12.2.2.sif bash -c \
-#     'uv venv .venv_apptainer && . .venv_apptainer/bin/activate && \
-#      uv pip install "numpy<2.0" Cython setuptools wheel torch && \
-#      uv pip install --no-build-isolation -e .'
+#     '/opt/pufferdrive-venv/bin/python setup.py build_ext --inplace --force'
 #
 # Train:
 #   apptainer exec --nv --bind "$PWD":/workspace --pwd /workspace pufferdrive_cuda12.2.2.sif \
-#     .venv_apptainer/bin/puffer train puffer_drive
+#     /opt/pufferdrive-venv/bin/python -m pufferlib.pufferl train puffer_drive
 
 Bootstrap: docker
 From: nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
@@ -74,6 +71,15 @@ From: nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
     # uv
     curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/bin UV_NO_MODIFY_PATH=1 sh
 
+    # Keep Python and its dependencies in the image instead of requiring a host-mounted venv.
+    export UV_TORCH_BACKEND=cu121
+    uv venv /opt/pufferdrive-venv --python python3.12
+    uv pip install --python /opt/pufferdrive-venv/bin/python \
+        "numpy<2.0" Cython setuptools wheel torch \
+        "shimmy[gym-v21]" "gym==0.23" "gymnasium==0.29.1" "pettingzoo==1.24.1" \
+        psutil nvidia-ml-py rich rich_argparse imageio pyro-ppl "heavyball<2.0.0" \
+        neptune wandb matplotlib seaborn tqdm
+
     git config --system --add safe.directory '*'
 
     if [ -e /usr/include/EGL/egl.h ]; then echo "EGL headers present; drive would link the host libEGL" >&2; exit 1; fi
@@ -86,5 +92,6 @@ From: nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
     exec /bin/bash "$@"
 
 %help
-    PufferDrive environment image. Bind the repository to /workspace and run with --nv.
+    PufferDrive image with its Python environment at /opt/pufferdrive-venv.
+    Bind the repository to /workspace and run with --nv.
     See the header of scripts/apptainer/pufferdrive_cuda12.2.def for build, setup and train commands.

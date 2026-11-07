@@ -355,9 +355,11 @@ struct Entity {
     // Navigation (env->navigation loaded)
     int navi_goal_idx;    // -1 when the agent has no navigation goal
     int navi_off_route;   // 1: current lane cannot reach the navigation goal
+    int navi_off_route_sticky; // sticky version of the above, needed for reward
     int navi_lane_idx;    // last known navi lane, -1 if never on a lane
     int current_lane_idx; // closest aligned ROAD_LANE entity, -1 when off-lane (navigation only)
     float navi_distance_to_goal_m;
+    float prev_navi_distance_to_goal_m;
     float navi_feasibility_left_m;
     float navi_feasibility_center_m;
     float navi_feasibility_right_m;
@@ -660,6 +662,7 @@ struct Drive {
     float reward_goal;
     float reward_vehicle_collision;
     float reward_offroad_collision;
+    float reward_progress_navi;
     int fix_lambdas;
     float lambda_value;
     float goal_radius;
@@ -1908,9 +1911,11 @@ void reset_navigation_state(Drive *env, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
     agent->navi_goal_idx = env->navigation->object_goal_idx[agent_idx];
     agent->navi_off_route = 0;
+    agent->navi_off_route_sticky = 0;
     agent->navi_lane_idx = -1;
     agent->current_lane_idx = -1;
     agent->navi_distance_to_goal_m = 0.0f;
+    agent->prev_navi_distance_to_goal_m = 0.0f;
     agent->navi_feasibility_left_m = 0.0f;
     agent->navi_feasibility_center_m = 0.0f;
     agent->navi_feasibility_right_m = 0.0f;
@@ -1975,7 +1980,12 @@ void update_navigation_state(Drive *env, int agent_idx) {
     int table_idx = agent->navi_goal_idx * navigation->num_lanes + navi_lane_idx;
     float progress_m = lane_progress_m(&env->entities[agent->current_lane_idx], agent->x, agent->y);
     float lane_start_distance_m = navigation->distance_to_goal_m[table_idx];
-    agent->navi_off_route = lane_start_distance_m >= NAVI_UNREACHABLE_M;
+    bool off_route = lane_start_distance_m >= NAVI_UNREACHABLE_M;
+    agent->navi_off_route = off_route;
+    if (off_route) {
+        agent->navi_off_route_sticky = off_route;
+    }
+    agent->prev_navi_distance_to_goal_m = agent->navi_distance_to_goal_m;
     agent->navi_distance_to_goal_m =
         agent->navi_off_route ? NAVI_UNREACHABLE_M : fmaxf(lane_start_distance_m - progress_m, 0.0f);
     agent->navi_feasibility_center_m =
@@ -3462,6 +3472,17 @@ void c_step(Drive *env) {
             update_navigation_state(env, agent_idx);
             env->logs[i].navi_goal_active_rate += env->entities[agent_idx].navi_goal_idx != -1;
             env->logs[i].navi_off_route_rate += env->entities[agent_idx].navi_off_route;
+            // toward goal reward (or following navi reward)
+            Entity *agent = &env->entities[agent_idx];
+            if (agent->navi_goal_idx != -1 && agent->current_lane_idx != -1 && !agent->failure_before_goal &&
+                !agent->current_goal_reached &&
+                !agent->navi_off_route_sticky &&
+                agent->prev_navi_distance_to_goal_m > agent->navi_distance_to_goal_m) {
+                float r_navi = env->reward_progress_navi * env->entities[agent_idx].reward_goal_cond;
+                env->rewards[i] += r_navi;
+                env->logs[i].episode_return += r_navi;
+
+            }
         }
     }
 

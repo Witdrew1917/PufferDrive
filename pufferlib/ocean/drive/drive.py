@@ -93,6 +93,7 @@ class Drive(pufferlib.PufferEnv):
         navigation_waypoints=16,
         navigation_waypoint_spacing=5.0,
         goal_obs_dropout_prob=0.0,
+        reward_progress_navi=0.0,
     ):
         # env
         self.dt = dt
@@ -102,6 +103,7 @@ class Drive(pufferlib.PufferEnv):
         self.reward_vehicle_collision = reward_vehicle_collision
         self.reward_offroad_collision = reward_offroad_collision
         self.reward_goal = reward_goal
+        self.reward_progress_navi = reward_progress_navi
         self.goal_radius = goal_radius
         self.goal_speed = goal_speed
         self.goal_behavior = goal_behavior
@@ -308,6 +310,7 @@ class Drive(pufferlib.PufferEnv):
                 reward_vehicle_collision=reward_vehicle_collision,
                 reward_offroad_collision=reward_offroad_collision,
                 reward_goal=reward_goal,
+                reward_progress_navi=reward_progress_navi,
                 obs_partner_noise_pos=self.obs_partner_noise_pos,
                 obs_partner_noise_speed=self.obs_partner_noise_speed,
                 goal_radius=goal_radius,
@@ -430,6 +433,7 @@ class Drive(pufferlib.PufferEnv):
                 reward_vehicle_collision=self.reward_vehicle_collision,
                 reward_offroad_collision=self.reward_offroad_collision,
                 reward_goal=self.reward_goal,
+                reward_progress_navi=self.reward_progress_navi,
                 goal_radius=self.goal_radius,
                 goal_behavior=self.goal_behavior,
                 goal_target_distance=self.goal_target_distance,
