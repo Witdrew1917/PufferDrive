@@ -551,6 +551,8 @@ class PuffeRL:
                 bc_anchor_obs[:, self.reward_offroad_obs_idx] = -1.0
                 bc_anchor_obs[:, self.reward_goal_obs_idx] = 1.0
 
+                bc_anchor_obs = self.vecenv.driver_env._prepare_bc_anchor_observations(bc_anchor_obs)
+
                 with torch.no_grad():
                     # Returns a list of tensors, one per action head
                     # Classic: [logits_joint]. Delta_local: [logits_dx, logits_dy, logits_yaw].

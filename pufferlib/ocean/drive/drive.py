@@ -574,6 +574,18 @@ class Drive(pufferlib.PufferEnv):
     def _hash_pair(self, obs, act):
         return hash((obs.round(3).tobytes(), act.round(2).tobytes()))
 
+    def _prepare_bc_anchor_observations(self, observations):
+        if not self.navigation or self.dynamics_model != "delta_local":
+            return observations
+
+        base_ego_dim = self.ego_features - binding.NAVIGATION_EGO_FEATURES
+        partner_end = self.ego_features + self.max_partner_objects * self.partner_features
+        road_end = partner_end + self.max_road_objects * self.road_features
+        return torch.cat(
+            (observations[:, :base_ego_dim], observations[:, self.ego_features : road_end]),
+            dim=1,
+        )
+
     def _init_regularization_strategy(self, device="cuda"):
         bc_anchor = None
         data = {}
@@ -589,15 +601,21 @@ class Drive(pufferlib.PufferEnv):
             if self.anchor_cpt_path is None:
                 self.anchor_cpt_path = f"models/bc_{self.dynamics_model}_{self.num_maps}.pt"
 
+            anchor_ego_features = self.ego_features
+            anchor_obs_dim = self.num_obs
+            if self.navigation and self.dynamics_model == "delta_local":
+                anchor_ego_features -= binding.NAVIGATION_EGO_FEATURES
+                anchor_obs_dim -= binding.NAVIGATION_EGO_FEATURES + self.max_waypoints * self.waypoint_features
+
             bc_anchor, metrics = load_bc_policy(
                 checkpoint_path=self.anchor_cpt_path,
-                obs_dim=self.num_obs,
+                obs_dim=anchor_obs_dim,
                 input_size=128,
                 max_partner_objects=self.max_partner_objects,
                 partner_features=self.partner_features,
                 max_road_objects=self.max_road_objects,
                 road_features=self.road_features,
-                ego_dim=self.ego_features,
+                ego_dim=anchor_ego_features,
                 hidden_size=512,
                 output_sizes=output_sizes,
                 device=device,
