@@ -121,8 +121,13 @@ ENV_SCRIPT = textwrap.dedent(
     from pufferlib.ocean.torch import Drive as DrivePolicy
     env = Drive(num_agents=1, num_maps=1, map_dir=sys.argv[1], navigation=int(sys.argv[2]),
                 navigation_waypoints=int(sys.argv[3]), navigation_waypoint_spacing=float(sys.argv[4]),
-                control_mode="control_vehicles", episode_length=91, resample_frequency=0)
+                control_mode="control_vehicles", episode_length=91, resample_frequency=0,
+                goal_obs_dropout_prob=float(sys.argv[5]))
     obs, _ = env.reset()
+    goal_samples = []
+    for seed in range(int(sys.argv[6])):
+        obs, _ = env.reset(seed=seed + 1)
+        goal_samples.append(obs[0, 4:6].tolist())
     # classic dynamics: action = accel_idx * NUM_STEER_BINS + steer_idx; middle bins are zero accel/steer
     neutral_action = (binding.NUM_ACCEL_BINS // 2) * binding.NUM_STEER_BINS + binding.NUM_STEER_BINS // 2
     for _ in range(5):
@@ -133,6 +138,8 @@ ENV_SCRIPT = textwrap.dedent(
     print("RESULT " + json.dumps({
         "ego": env.ego_features,
         "obs": obs.shape[1],
+        "goal": obs[0, 4:6].tolist(),
+        "goal_samples": goal_samples,
         "feasibility": obs[0, env.ego_features - 3 : env.ego_features].tolist() if env.navigation else [],
         "waypoints": obs[0, obs.shape[1] - waypoint_dim :].reshape(-1, 3).tolist() if waypoint_dim else [],
         "value_shape": list(value.shape),
@@ -152,9 +159,19 @@ class TestNavigationEnv(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_env(self, navigation, waypoints=16, spacing=5.0):
+    def _run_env(self, navigation, waypoints=16, spacing=5.0, goal_dropout_prob=0.0, reset_count=0):
         return subprocess.run(
-            [sys.executable, "-c", ENV_SCRIPT, self.tmp.name, str(navigation), str(waypoints), str(spacing)],
+            [
+                sys.executable,
+                "-c",
+                ENV_SCRIPT,
+                self.tmp.name,
+                str(navigation),
+                str(waypoints),
+                str(spacing),
+                str(goal_dropout_prob),
+                str(reset_count),
+            ],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
@@ -211,6 +228,16 @@ class TestNavigationEnv(unittest.TestCase):
         result = self._run_env(1, waypoints=0)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("navigation_waypoints", result.stderr)
+
+    def test_goal_observation_dropout_resamples_on_reset(self):
+        visible = self._result(self._run_env(0, goal_dropout_prob=0.0))
+        masked = self._result(self._run_env(0, goal_dropout_prob=1.0))
+        self.assertTrue(any(value != 0.0 for value in visible["goal"]))
+        self.assertEqual(masked["goal"], [0.0, 0.0])
+
+        samples = self._result(self._run_env(0, goal_dropout_prob=0.5, reset_count=20))["goal_samples"]
+        self.assertIn([0.0, 0.0], samples)
+        self.assertTrue(any(any(value != 0.0 for value in sample) for sample in samples))
 
     def test_stale_sidecar_aborts_env_creation(self):
         nav.process_map_navigation(self.map_path, max_goals=4, seed=0)

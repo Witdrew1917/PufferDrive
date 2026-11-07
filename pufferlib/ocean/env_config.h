@@ -37,6 +37,7 @@ typedef struct {
     int navigation;
     int navigation_waypoints;
     float navigation_waypoint_spacing;
+    float goal_obs_dropout_prob;
     char map_dir[256];
     char anchor_policy_path[256];
     int reg_mode;
@@ -80,6 +81,8 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->navigation_waypoints = atoi(value);
     } else if (MATCH("env", "navigation_waypoint_spacing")) {
         env_config->navigation_waypoint_spacing = atof(value);
+    } else if (MATCH("env", "goal_obs_dropout_prob")) {
+        env_config->goal_obs_dropout_prob = atof(value);
     } else if (MATCH("env", "reward_vehicle_collision")) {
         env_config->reward_vehicle_collision = atof(value);
     } else if (MATCH("env", "obs_partner_noise_speed")) {

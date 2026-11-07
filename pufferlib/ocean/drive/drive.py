@@ -92,6 +92,7 @@ class Drive(pufferlib.PufferEnv):
         navigation=0,
         navigation_waypoints=16,
         navigation_waypoint_spacing=5.0,
+        goal_obs_dropout_prob=0.0,
     ):
         # env
         self.dt = dt
@@ -125,6 +126,9 @@ class Drive(pufferlib.PufferEnv):
         self.obs_partner_noise_pos = obs_partner_noise_pos
         self._dynamics_model_flag = DYNAMICS_MODEL_MAP[dynamics_model]
         self.async_resets = bool(async_resets)
+        self.goal_obs_dropout_prob = float(goal_obs_dropout_prob)
+        if not 0.0 <= self.goal_obs_dropout_prob <= 1.0:
+            raise ValueError(f"goal_obs_dropout_prob must be in [0, 1]. Got: {goal_obs_dropout_prob}")
 
         # Observation space calculation
         self.ego_features = binding.EGO_FEATURES_JERK if dynamics_model == "jerk" else binding.EGO_FEATURES
@@ -335,6 +339,7 @@ class Drive(pufferlib.PufferEnv):
                 navigation=self.navigation,
                 navigation_waypoints=self.navigation_waypoints,
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
+                goal_obs_dropout_prob=self.goal_obs_dropout_prob,
             )
             self.env_ids.append(env_id)
 
@@ -456,6 +461,7 @@ class Drive(pufferlib.PufferEnv):
                 navigation=self.navigation,
                 navigation_waypoints=self.navigation_waypoints,
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
+                goal_obs_dropout_prob=self.goal_obs_dropout_prob,
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)

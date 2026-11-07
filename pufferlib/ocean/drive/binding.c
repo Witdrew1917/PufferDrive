@@ -261,6 +261,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_INT(navigation);
     OVERRIDE_INT(navigation_waypoints);
     OVERRIDE_FLOAT(navigation_waypoint_spacing);
+    OVERRIDE_FLOAT(goal_obs_dropout_prob);
 
 #undef OVERRIDE_INT
 #undef OVERRIDE_FLOAT
@@ -300,9 +301,14 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyErr_SetString(PyExc_ValueError, "navigation_waypoint_spacing must be > 0");
         return -1;
     }
+    if (!(conf.goal_obs_dropout_prob >= 0.0f && conf.goal_obs_dropout_prob <= 1.0f)) {
+        PyErr_SetString(PyExc_ValueError, "goal_obs_dropout_prob must be in [0, 1]");
+        return -1;
+    }
     env->navigation_enabled = conf.navigation;
     env->navigation_waypoints = conf.navigation_waypoints;
     env->navigation_waypoint_spacing = conf.navigation_waypoint_spacing;
+    env->goal_obs_dropout_prob = conf.goal_obs_dropout_prob;
     char *map_dir = unpack_str(kwargs, "map_dir");
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");

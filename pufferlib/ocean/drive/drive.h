@@ -202,6 +202,7 @@ static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 #define MAX_STEER 0.7f     // rad    — max effective steering angle
 #define YAW_ACCEL_MAX 8.0f // rad/s^2 — max change in yaw rate per second
 
+
 static int COLLECT_EXPERT_TELEPORT = 1;
 static float ACCELERATION_VALUES[NUM_ACCEL_BINS];
 static float STEERING_VALUES[NUM_STEER_BINS];
@@ -316,6 +317,7 @@ struct Entity {
     float goal_position_z;
     float init_goal_x;
     float init_goal_y;
+    bool mask_goal;
     int mark_as_expert;
     int collision_state;
     int at_fault_collision_state;
@@ -459,6 +461,15 @@ static float gaussian_noise(float sigma) {
     float u1 = ((float)rand() + 1.0f) / ((float)RAND_MAX + 1.0f);
     float u2 = ((float)rand() + 1.0f) / ((float)RAND_MAX + 1.0f);
     return sigma * sqrtf(-2.0f * logf(u1)) * cosf(2.0f * M_PI * u2);
+}
+
+static bool sample_bernoulli(float prob) {
+    if (prob <= 0.0f)
+        return false;
+    if (prob >= 1.0f)
+        return true;
+    float sample = (float)rand() / ((float)RAND_MAX + 1.0f);
+    return sample < prob;
 }
 
 float relative_distance_2d(float x1, float y1, float x2, float y2) {
@@ -683,6 +694,7 @@ struct Drive {
     int navigation_waypoints;          // route waypoints in the observation when navigation_enabled
     float navigation_waypoint_spacing; // metres between consecutive route waypoints
     Navigation *navigation;            // NULL unless navigation_enabled
+    float goal_obs_dropout_prob;
 };
 
 static void idm_load_extension(FILE *file, Drive *env);
@@ -2242,6 +2254,7 @@ void set_active_agents(Drive *env) {
             env->active_agent_count++;
             env->entities[i].active_agent = 1;
             env->entities[i].controller = resolve_agent_controller(env, i, 1, 0);
+            env->entities[i].mask_goal = sample_bernoulli(env->goal_obs_dropout_prob);
         } else if (env->init_mode != INIT_ONLY_CONTROLLABLE_AGENTS) {
             static_agent_indices[env->static_agent_count] = i;
             env->static_agent_count++; // Includes expert replay and static agents
@@ -2876,8 +2889,8 @@ void compute_observations(Drive *env) {
         obs[REWARD_GOAL_IDX] = ego_entity->reward_goal_cond;
 
         // Other ego features
-        obs[4] = rel_goal_x * 0.005f;
-        obs[5] = rel_goal_y * 0.005f;
+        obs[4] = (!ego_entity->mask_goal) ? rel_goal_x * 0.005f: 0.0f;
+        obs[5] = (!ego_entity->mask_goal) ? rel_goal_y * 0.005f: 0.0f;
         obs[6] = signed_speed / MAX_SPEED;
         obs[7] = ego_entity->width / MAX_VEH_WIDTH;
         obs[8] = ego_entity->length / MAX_VEH_LEN;
@@ -3115,6 +3128,7 @@ void c_reset(Drive *env) {
         env->entities[agent_idx].current_goal_reached = 0;
         env->entities[agent_idx].stopped = 0;
         env->entities[agent_idx].removed = 0;
+        env->entities[agent_idx].mask_goal = sample_bernoulli(env->goal_obs_dropout_prob);
 
         if (env->goal_behavior == GOAL_GENERATE_NEW) {
             env->entities[agent_idx].goal_position_x = env->entities[agent_idx].init_goal_x;
