@@ -8,11 +8,13 @@ zpuffer_prepare_workdir "$ZPUFFER_COMMIT" "$ZPUFFER_DIFF_FILE" || exit 1
 
 CONTAINER="/staging/agp/containers/spicy_cuda12.2_261105.sif"
 DATASET_ROOT="/open_datasets/waymo/data/gpudrive/spicy_bins"
+ZPUFFER_VENV_PATH="$PWD/.venv"
 
 zpuffer_record_git_state "$PWD/experiments" || exit 1
 
 singularity exec --nv \
   --bind "$ZPUFFER_WORKDIR":/workspace \
+  --bind "$ZPUFFER_VENV_PATH:$ZPUFFER_VENV_PATH" \
   --bind "$DATASET_ROOT":/workspace/resources/drive/binaries \
   --bind "$ZPUFFER_GIT_STATE_DIR":/git-state:ro \
   --bind /staging:/staging \
@@ -20,5 +22,5 @@ singularity exec --nv \
   --env ZPUFFER_GIT_STATE_DIR=/git-state \
   --pwd /workspace \
   "$CONTAINER" \
-  bash -c 'source .venv/bin/activate && python setup.py build_ext --inplace --force && exec puffer "$1" puffer_drive "${@:2}" --wandb --wandb-group=pufferdrive' \
-  _ "$mode" "${@:2}"
+  bash -c 'source "$1/bin/activate" && python setup.py build_ext --inplace --force && exec python -m pufferlib.pufferl "$2" puffer_drive "${@:3}" --wandb --wandb-group=pufferdrive' \
+  _ "$ZPUFFER_VENV_PATH" "$mode" "${@:2}"
