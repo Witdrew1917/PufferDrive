@@ -18,7 +18,7 @@ zpuffer_snapshot || exit 1
 
 NUM_GPUS=${NUM_GPUS:-1}
 
-scripts/clusters/_hal.sh train $@
+scripts/clusters/_hal.sh train "$@"
 
 #
 #EOF

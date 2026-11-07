@@ -11,9 +11,6 @@ DATASET_ROOT="/open_datasets/waymo/data/gpudrive/spicy_bins"
 
 zpuffer_record_git_state "$PWD/experiments" || exit 1
 
-# Need to build prior to training
-run_cmd="source .venv/bin/activate && python setup.py build_ext --inplace --force && puffer ${mode} puffer_drive ${@:2} --wandb --wandb-group=pufferdrive"
-
 singularity exec --nv \
   --bind "$ZPUFFER_WORKDIR":/workspace \
   --bind "$DATASET_ROOT":/workspace/resources/drive/binaries \
@@ -22,5 +19,6 @@ singularity exec --nv \
   --bind "$(realpath "$(git rev-parse --git-common-dir)")" \
   --env ZPUFFER_GIT_STATE_DIR=/git-state \
   --pwd /workspace \
-  $CONTAINER \
-  bash -c "$run_cmd"
+  "$CONTAINER" \
+  bash -c 'source .venv/bin/activate && python setup.py build_ext --inplace --force && exec puffer "$1" puffer_drive "${@:2}" --wandb --wandb-group=pufferdrive' \
+  _ "$mode" "${@:2}"
