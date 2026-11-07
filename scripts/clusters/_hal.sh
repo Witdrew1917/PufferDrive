@@ -18,6 +18,7 @@ singularity exec --nv \
   --bind "$DATASET_ROOT":/workspace/resources/drive/binaries \
   --bind "$ZPUFFER_GIT_STATE_DIR":/git-state:ro \
   --bind /staging:/staging \
+  --bind /workspaces:/workspaces \
   --bind "$(realpath "$(git rev-parse --git-common-dir)")" \
   --env ZPUFFER_GIT_STATE_DIR=/git-state \
   --pwd /workspace \
