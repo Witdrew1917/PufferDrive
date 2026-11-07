@@ -14,7 +14,7 @@ zpuffer_record_git_state "$PWD/experiments" || exit 1
 
 singularity exec --nv \
   --bind "$ZPUFFER_WORKDIR":/workspace \
-  --bind "$ZPUFFER_VENV_PATH:$ZPUFFER_VENV_PATH" \
+  --bind "$ZPUFFER_VENV_PATH":/workspace/.venv \
   --bind "$DATASET_ROOT":/workspace/resources/drive/binaries \
   --bind "$ZPUFFER_GIT_STATE_DIR":/git-state:ro \
   --bind /staging:/staging \
@@ -22,5 +22,5 @@ singularity exec --nv \
   --env ZPUFFER_GIT_STATE_DIR=/git-state \
   --pwd /workspace \
   "$CONTAINER" \
-  bash -c 'source "$1/bin/activate" && python setup.py build_ext --inplace --force && exec python -m pufferlib.pufferl "$2" puffer_drive "${@:3}" --wandb --wandb-group=pufferdrive' \
+  bash -c 'source ".venv/bin/activate" && python setup.py build_ext --inplace --force && exec python -m pufferlib.pufferl "$2" puffer_drive "${@:3}" --wandb --wandb-group=pufferdrive' \
   _ "$ZPUFFER_VENV_PATH" "$mode" "${@:2}"
