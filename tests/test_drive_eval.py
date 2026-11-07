@@ -19,7 +19,7 @@ def test_eval_runs_human_replay_and_returns_aggregate_metrics(monkeypatch, capsy
 
     class FakeEvaluator:
         def __init__(self, configs):
-            assert configs["eval"]["render_human_replay_eval"] is True
+            assert configs["eval"]["render_human_replay_eval"] is False
             self.hr_eval_config = {"env": {"control_mode": "control_sdc_only"}}
             self.hr_env = None
             self.rollout_mode = None
@@ -51,7 +51,7 @@ def test_eval_runs_human_replay_and_returns_aggregate_metrics(monkeypatch, capsy
         "eval": {
             "wosac_realism_eval": False,
             "human_replay_eval": True,
-            "render_human_replay_eval": True,
+            "render_human_replay_eval": False,
         },
     }
 
@@ -63,3 +63,27 @@ def test_eval_runs_human_replay_and_returns_aggregate_metrics(monkeypatch, capsy
     assert env.closed
     output = capsys.readouterr().out
     assert json.dumps(results) in output
+
+
+def test_hr_mask_goal_overrides_environment_dropout():
+    from pufferlib.ocean.benchmark.evaluator import Evaluator
+
+    configs = {
+        "env": {"lambda_value": 0.0, "goal_obs_dropout_prob": 0.6},
+        "eval": {
+            "map_dir": "validation",
+            "num_eval_agents": 1,
+            "render_select_mode": "first",
+            "render_self_play_eval": False,
+            "render_human_replay_eval": False,
+            "hr_mask_goal": True,
+        },
+    }
+    evaluator = Evaluator(configs)
+
+    assert evaluator.hr_eval_config["env"]["goal_obs_dropout_prob"] == 1.0
+    assert evaluator.sp_eval_config["env"]["goal_obs_dropout_prob"] == 0.6
+
+    configs["eval"]["hr_mask_goal"] = False
+    evaluator = Evaluator(configs)
+    assert evaluator.hr_eval_config["env"]["goal_obs_dropout_prob"] == 0.0

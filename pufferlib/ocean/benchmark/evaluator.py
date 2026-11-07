@@ -853,6 +853,9 @@ class Evaluator:
         self.hr_eval_config = copy.deepcopy(eval_config)
         self.hr_eval_config["env"]["control_mode"] = "control_sdc_only"
         self.hr_eval_config["env"]["goal_behavior"] = 0  # Remove and terminate at goal
+        self.hr_eval_config["env"]["goal_obs_dropout_prob"] = (
+            1.0 if self.configs["eval"].get("hr_mask_goal", False) else 0.0
+        )
         self.sp_eval_config = copy.deepcopy(eval_config)
         self.sp_eval_config["env"]["control_mode"] = "control_agents"
         self.render_select_mode = self.configs["eval"]["render_select_mode"]
