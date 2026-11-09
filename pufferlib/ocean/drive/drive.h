@@ -2719,8 +2719,9 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
         }
 
         // Calculate new steering angle
+        // Note: do not floor |curvature| here; copysignf(1e-5, +0.0) biases a_lat positive, which makes the
+        // zero-crossing reset above swallow every negative lateral jerk (right turns become impossible).
         float signed_curvature = a_lat_new / fmaxf(v_new * v_new, 1e-5f);
-        signed_curvature = copysignf(fmaxf(fabsf(signed_curvature), 1e-5f), signed_curvature);
         float steering_angle = atanf(signed_curvature * agent->wheelbase);
         float delta_steer = clip(steering_angle - agent->steering_angle, -0.6f * env->dt, 0.6f * env->dt);
         float new_steering_angle = clip(agent->steering_angle + delta_steer, -0.55f, 0.55f);

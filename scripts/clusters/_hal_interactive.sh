@@ -10,10 +10,9 @@ mkdir -p "$output_dir"
 singularity exec --nv \
   --bind "$PWD":/workspace \
   --bind "$DATASET_ROOT":/workspace/resources/drive/binaries \
-  --bind "$ZPUFFER_GIT_STATE_DIR":/git-state:ro \
   --bind "$output_dir":/workspace/experiments \
   --bind /staging:/staging \
   --bind /workspaces:/workspaces \
   --pwd /workspace \
   "$CONTAINER" \
-  bash -c "exec bash && source .venv/bin/active"
+  bash -c "exec bash"
