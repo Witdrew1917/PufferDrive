@@ -8,13 +8,17 @@ zpuffer_prepare_workdir "$ZPUFFER_COMMIT" "$ZPUFFER_DIFF_FILE" || exit 1
 
 CONTAINER="/staging/agp/containers/spicy_cuda12.2_261107.sif"
 DATASET_ROOT="/open_datasets/waymo/data/gpudrive/spicy_bins"
+OUTPUT_DIR="/staging/agp/projects/pufferdrive/experiments"
 
-zpuffer_record_git_state "$PWD/experiments" || exit 1
+output_dir=$OUTPUT_DIR
+mkdir -p "$output_dir"
+zpuffer_record_git_state "$output_dir" || exit 1
 
 singularity exec --nv \
   --bind "$ZPUFFER_WORKDIR":/workspace \
   --bind "$DATASET_ROOT":/workspace/resources/drive/binaries \
   --bind "$ZPUFFER_GIT_STATE_DIR":/git-state:ro \
+  --bind "$output_dir":/workspace/experiments \
   --bind /staging:/staging \
   --bind /workspaces:/workspaces \
   --bind "$(realpath "$(git rev-parse --git-common-dir)")" \
