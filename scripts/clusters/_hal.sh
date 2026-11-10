@@ -25,5 +25,8 @@ singularity exec --nv \
   --env ZPUFFER_GIT_STATE_DIR=/git-state \
   --pwd /workspace \
   "$CONTAINER" \
-  bash -c '/opt/pufferdrive-venv/bin/python setup.py build_ext --inplace --force && exec /opt/pufferdrive-venv/bin/python -m pufferlib.pufferl "$1" puffer_drive "${@:2}" --wandb --wandb-group=pufferdrive' \
-  _ "$mode" "${@:2}"
+  bash -c '
+    /opt/pufferdrive-venv/bin/python setup.py build_ext --inplace --force &&
+      exec /opt/pufferdrive-venv/bin/python -m pufferlib.pufferl "$1" puffer_drive "${@:3}" --wandb --wandb-group=pufferdrive --tag="$2"
+  ' \
+  _ "$mode" "slurm-${SLURM_JOB_ID:-local-$$}" "${@:2}"
