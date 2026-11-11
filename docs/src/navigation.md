@@ -61,27 +61,50 @@ Each sidecar stores a CRC-32 and the byte size of its `.bin`. If a map is regene
 environment creation aborts with a fingerprint mismatch. Rebuild with `--overwrite`. Creating an env with
 `navigation = 1` also fails early, with the command to run, if any map lacks a sidecar.
 
+Split-aware navigation and overlapping goal terminals require version 4 sidecars. Regenerate older sidecars with
+`--overwrite` and rebuild the native extension; map binaries and policy observation shapes do not change.
+Existing weights remain loadable,
+but their guidance and evaluation results can change at ambiguous intersections.
+
 ### What is computed (`pufferlib/ocean/drive/navigation.py`)
 
 Map bins carry no lane connectivity, so it is inferred from geometry:
 
 - **Successors**: lane B follows lane A if B starts within 0.5 m of A's end with a compatible heading.
+- **Split branches**: nearby starts or common predecessors identify candidate siblings. A pair must share at least
+  2 m of aligned approach, with centerlines no more than 1 m apart and tangent cosine at least 0.9. The shared
+  prefix ends when either condition fails. Relations are pairwise, not transitive, and do not permit jumping
+  between separate turn pockets, crossing lanes, or ordinary adjacent lanes.
 - **Lateral neighbours**: probed at 25/50/75 % of the lane, one lane width (3.7 m) to each side. All probes must hit
   the same aligned lane, and no road edge may lie between the lanes (a road edge forbids the lane change).
-- **Goal lanes**: the goal is the end point of a goal lane. Each object's logged goal is matched to the lane
-  containing it (aligned with the object's final heading). That gives `object_goal_idx`, the goal each agent drives
-  to at reset.
+- **Goal lanes**: the visible goal is the end point of a representative goal lane. Each object's logged goal is
+  matched to the lane
+  containing it (aligned with the object's final heading). That gives `object_goal_idx`, the goal each   agent drives
+  to at reset. Other same-direction lanes sharing the goal's final 2 m of approach (within 1 m, tangent cosine
+  at least 0.9) receive hidden routing copies at the goal's exact projection. This includes a straight lane
+  overlapping the end of a turning lane, but excludes adjacent, crossing and opposing lanes.
+  Copies share the original goal ID and marker and do not consume additional goal slots or move the goal.
 - **Per goal × lane tables** (Dijkstra toward the goal lane's end, lane change cost 10 m):
-  - `next_lane`: longitudinal next hop toward the goal without lane changes, or -1.
+  - `next_lane`: longitudinal next hop toward any copy of the goal without lane changes, or -1.
+  - `longitudinal_distance_to_goal_m`: distance from the lane start without lane changes, used to rank ambiguous
+    split branches. A lane with `next_lane = -1` and a distance below `1e9` is a terminal: the distance is the
+    stopping arc length on that lane, which may be before its end. `next_lane = -1` with an unreachable
+    longitudinal distance still means no longitudinal route. This reuses the Dijkstra pass already needed for
+    `next_lane`, seeded with all copies of the same goal.
   - `distance_to_goal_m`: distance from the lane start to the goal with lane changes allowed, or `1e9` (unreachable).
   - `feasibility_left_m / center_m / right_m`: metres the agent can keep following the left / own / right lane
     (taking the best successor) while the goal stays reachable, capped at 1000 m. 0 means that lane is not
     available or does not lead to the goal.
 
+Split detection compares local candidate prefixes rather than all pairs of lane polylines. It adds one
+`float32[num_goals, num_lanes]` distance table (20% more storage for the per-goal/lane tables) and sparse split
+metadata, but no additional Dijkstra pass. Runtime selection projects onto local sibling candidates; it does not
+run a shortest-path search per agent.
+
 ### File format
 
-Little-endian. 40-byte header: magic `"PDNAVI01"`, `version` (int32 = 2), `map_crc32` (uint32), `map_size_bytes`
-(uint64), then `num_objects`, `num_roads`, `num_lanes`, `num_goals` (int32). Followed by:
+Little-endian. 44-byte header: magic `"PDNAVI01"`, `version` (int32 = 4), `map_crc32` (uint32), `map_size_bytes`
+(uint64), then `num_objects`, `num_roads`, `num_lanes`, `num_goals`, `num_branches` (int32). Followed by:
 
 | Array | Type | Size |
 |-------|------|------|
@@ -91,6 +114,17 @@ Little-endian. 40-byte header: magic `"PDNAVI01"`, `version` (int32 = 2), `map_c
 | `object_goal_idx` | int32 | `num_objects` |
 | `next_lane` | int32 | `num_goals × num_lanes` |
 | `distance_to_goal_m`, `feasibility_left_m`, `feasibility_center_m`, `feasibility_right_m` | float32 | `num_goals × num_lanes` |
+| `longitudinal_distance_to_goal_m` | float32 | `num_goals × num_lanes` |
+| `branch_offsets` | int32 | `num_lanes + 1` |
+| `branch_lane` | int32 | `num_branches` |
+| `branch_end_m`, `branch_other_end_m` | float32 | `num_branches` |
+
+`branch_offsets[lane]:branch_offsets[lane + 1]` selects its sibling entries. Each entry holds the sibling index
+and shared-prefix arc-length limits on the source and sibling lanes. Entries in each row are strictly ascending.
+
+Version 4 retains version 3's array layout; the version bump identifies the new multi-terminal routing semantics.
+Hidden goal copies require no additional arrays: a finite longitudinal distance with no next hop encodes a
+terminal's stopping position.
 
 Lane indices in the sidecar are *navi lane* indices (position in `lane_entity_idx`), not entity indices. The C loader
 (`load_navigation_binary` in `drive.h`) rejects missing, truncated, trailing-byte, out-of-range or stale files.
@@ -100,15 +134,22 @@ Lane indices in the sidecar are *navi lane* indices (position in `lane_entity_id
 Every step, for each controlled agent:
 
 1. **Current lane** (`update_current_lane`): the closest `ROAD_LANE` within 4 m. Lanes whose heading differs by more
-   than 30° get a 3 m distance penalty. Off-lane gives `current_lane_idx = -1`, and the last known lane and
-   navigation state are kept.
-2. **Navigation state** (`update_navigation_state`): from the lane-start table values minus the agent's progress
-   along its lane, compute the remaining distance to goal, the off-route flag (goal unreachable from this lane) and
-   the left / center / right feasibility. Side feasibility is measured from the agent's projection onto the
-   neighbouring lane.
-3. **Goals**: at reset each agent gets its logged goal (`object_goal_idx`). When a new goal is sampled
+   than 30° get a 3 m distance penalty. This remains the physical lane match.
+2. **Navigation anchor** (`navigation_branch_lane`): while projections onto sibling branches remain within their
+   shared prefixes, within 1 m of the agent and one another, and aligned with its heading, choose the shorter
+   reachable longitudinal route from the projected position. Near ties (within 0.1 m) prefer the previous
+   navigation anchor, then geometric fit and lane index. If none has a longitudinal route, keep the physical
+   match. After divergence the physical branch wins, even if it is longer. Off-lane preserves the last known
+   anchor and state. No goal means normal geometric matching.
+3. **Navigation state** (`update_navigation_state`): from the selected anchor's lane-start table values minus the
+   agent's projected progress, compute remaining distance, off-route status, and left / center / right feasibility.
+   These retain their original lane-change-aware semantics; only split ranking excludes lane changes. Reassigning
+   sibling anchors rebases the progress-reward comparison so selection alone cannot earn progress reward.
+   Side feasibility uses projection onto the selected anchor's neighbouring lane.
+4. **Goals**: at reset each agent gets its logged goal (`object_goal_idx`). When a new goal is sampled
    (`sample_new_goal`, e.g. goal behavior 1), it is snapped to the reachable sidecar goal whose route distance is
-   closest to `goal_target_distance`. If no sidecar goal is reachable, the normal lane-point sampling is used and
+   closest to `goal_target_distance`, resolving ambiguous branches for each prospective goal without changing
+   agent state during comparison. If no sidecar goal is reachable, the normal lane-point sampling is used and
    the agent has no navigation goal.
 
 ## Observations
@@ -134,13 +175,14 @@ features.
 
 Route walk (`navigation_route_waypoints`):
 
-- Start at the agent's projection onto its current (or last known) lane.
+- Start at the agent's projection onto its resolved navigation anchor (or last known anchor when off-lane).
 - Every `navigation_waypoint_spacing` metres along the lane polyline, emit a waypoint.
 - At the lane end, continue on `next_lane`.
 - If the current lane has no `next_lane` toward the goal (a lane change is needed), hop to the left or right
   neighbour with the smaller `distance_to_goal_m`, then keep walking from the projected position. Distance strictly
   decreases, so the walk always terminates.
-- Stop at the end of the goal lane or when no hop is possible.
+- Stop at the goal's projected position on any terminal lane, even if the lane continues beyond the goal,
+  or when no hop is possible.
 
 Unused slots, and all slots for agents without a goal or off route, are zero (`valid = 0`).
 
@@ -170,9 +212,12 @@ Logged only with `navigation = 1`:
 With navigation enabled the renderer draws, for the selected agent:
 
 - lanes coloured by feasibility toward its goal (red → green, grey = unreachable),
-- its `next_lane` route in cyan,
+- its `next_lane` route from the resolved navigation anchor in cyan,
 - its observed route waypoints (small spheres),
 - its goal.
+
+Only the original goal marker is drawn. Routes and observed waypoints can reach any hidden copy and stop there;
+they do not continue to the end of a longer overlapping lane.
 
 The observation-only view also decodes the waypoint block. `scripts/render_navigation.sh [MAP_DIR] [MODEL|latest|none]
 [0|1]` generates missing sidecars and runs `puffer eval` with the overlay.

@@ -8,11 +8,14 @@ Usage:
 Each run resolves to its model artifact at RUN_PATH:v0. Dynamics come from the
 checkpoint's full_args; --dynamics supplies them only when absent. In that case,
 full_args must explicitly set env.navigation to 0 or 1.
+Verified local artifacts are reused unless --no-cached is supplied.
 """
 
 import argparse
 import copy
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +39,7 @@ NUM_AGENTS_PER_VECENV = 1024
 DATASET = "womd"
 DYNAMICS_MODELS = ("delta_local", "classic", "jerk")
 OUTPUT_CSV = "results/checkpoint_eval_batched.csv"
+ARTIFACTS_DIR = Path("artifacts")
 METRICS = [
     "n",
     "score",
@@ -182,6 +186,9 @@ def parse_args(argv=None):
         help=f"Pair a run missing checkpoint dynamics with one of: {', '.join(DYNAMICS_MODELS)}; repeat as needed",
     )
     parser.add_argument("--output-csv", type=Path, default=Path(OUTPUT_CSV))
+    parser.add_argument(
+        "--no-cached", action="store_true", help="Force a fresh download, bypassing local and W&B caches"
+    )
     args = parser.parse_args(argv)
     dynamics = {}
     for path, model in args.dynamics:
@@ -196,13 +203,38 @@ def parse_args(argv=None):
     return args
 
 
-def download_checkpoint(api, path):
-    artifact = api.artifact(f"{path}:v0", type="model")
-    directory = Path(artifact.download())
+def find_checkpoint(directory, path):
     checkpoints = sorted(p for p in directory.rglob("*.pt") if p.name != "trainer_state.pt")
     if len(checkpoints) != 1:
         raise ValueError(f"{path}:v0: expected one model checkpoint, found {len(checkpoints)} in {directory}")
     return checkpoints[0]
+
+
+def download_checkpoint(api, path, no_cached=False):
+    artifact = api.artifact(f"{path}:v0", type="model")
+    directory = ARTIFACTS_DIR / f"{path}:v0"
+    if not no_cached:
+        # Also recognize downloads made with W&B's default, unqualified root.
+        for cached in (directory, ARTIFACTS_DIR / f"{path.split('/')[-1]}:v0"):
+            if not cached.is_dir():
+                continue
+            try:
+                artifact.verify(root=str(cached))
+            except (ValueError, FileNotFoundError) as error:
+                print(f"  Ignoring invalid cached artifact at {cached}: {error}")
+                continue
+            print(f"  Using cached artifact at {cached}")
+            return find_checkpoint(cached, path)
+
+    if no_cached:
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="artifact-download-", dir=directory.parent) as temporary:
+            downloaded = Path(artifact.download(root=temporary, skip_cache=True))
+            find_checkpoint(downloaded, path)
+            shutil.copytree(downloaded, directory, dirs_exist_ok=True)
+    else:
+        directory = Path(artifact.download(root=str(directory)))
+    return find_checkpoint(directory, path)
 
 
 def prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics=None):
@@ -227,11 +259,11 @@ def prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics=None)
     return config
 
 
-def evaluate_runs(api, paths, base_config, dynamics):
+def evaluate_runs(api, paths, base_config, dynamics, no_cached=False):
     all_rows = []
     for path in paths:
         print(f"\nEvaluating {path}")
-        checkpoint_path = download_checkpoint(api, path)
+        checkpoint_path = download_checkpoint(api, path, no_cached=no_cached)
         config = prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics.get(path))
 
         policy_config = make_eval_config(config, TRAIN_MAP_DIR, control_mode="control_vehicles", num_maps=50_000)
@@ -286,7 +318,7 @@ def main(argv=None):
     finally:
         sys.argv = original_argv
 
-    rows = evaluate_runs(wandb.Api(), args.runs, base_config, args.dynamics)
+    rows = evaluate_runs(wandb.Api(), args.runs, base_config, args.dynamics, no_cached=args.no_cached)
     df = pd.DataFrame(rows)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output_csv, index=False)

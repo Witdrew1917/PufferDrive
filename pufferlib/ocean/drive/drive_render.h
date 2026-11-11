@@ -277,8 +277,8 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         DrawSphere((Vector3){waypoint_x, waypoint_y, Z_AGENT_DETAILS}, NAVI_RENDER_WAYPOINT_RADIUS_M, PUFF_CYAN);
     }
     // draw goal
-    float goal_x = agent_obs[0] * 200;
-    float goal_y = agent_obs[1] * 200;
+    float goal_x = agent_obs[4] * 200;
+    float goal_y = agent_obs[5] * 200;
 
     int agent_type = env->entities[active_idx].type;
     Color goal_color = LIGHTBLUE;
@@ -723,6 +723,27 @@ void draw_lane_polyline(const Entity *lane, float z, Color color) {
     }
 }
 
+static void draw_navigation_route_lane(const Drive *env, int goal, int lane_idx, float z, Color color) {
+    const Navigation *navigation = env->navigation;
+    const Entity *lane = &env->entities[navigation->lane_entity_idx[lane_idx]];
+    float terminal = navigation_terminal_progress(navigation, goal, lane_idx);
+    if (terminal < 0.0f) {
+        draw_lane_polyline(lane, z, color);
+        return;
+    }
+    float progress = 0.0f;
+    for (int j = 0; j + 1 < lane->array_size && progress < terminal; j++) {
+        float sx = lane->traj_x[j], sy = lane->traj_y[j];
+        float dx = lane->traj_x[j + 1] - sx, dy = lane->traj_y[j + 1] - sy;
+        float length = hypotf(dx, dy);
+        if (length <= 0.0f)
+            continue;
+        float fraction = fminf((terminal - progress) / length, 1.0f);
+        DrawLine3D((Vector3){sx, sy, z}, (Vector3){sx + fraction * dx, sy + fraction * dy, z}, color);
+        progress += length;
+    }
+}
+
 // Lanes coloured by centre feasibility toward the selected agent's goal (red→green), grey if unreachable.
 void draw_navigation_overlay(Drive *env) {
     const Navigation *navigation = env->navigation;
@@ -744,12 +765,12 @@ void draw_navigation_overlay(Drive *env) {
         }
         draw_lane_polyline(lane, Z_ROAD_MARKINGS + NAVI_RENDER_Z_OFFSET, lane_color);
     }
-    if (agent->current_lane_idx != -1) {
+    if (agent->navi_lane_idx != -1) {
         rlSetLineWidth(NAVI_RENDER_ROUTE_WIDTH_PX);
-        int navi_lane_idx = navigation->entity_to_navi_lane[agent->current_lane_idx];
+        int navi_lane_idx = agent->navi_lane_idx;
         for (int hop_count = 0; hop_count < navigation->num_lanes && navi_lane_idx != -1; hop_count++) {
-            draw_lane_polyline(&env->entities[navigation->lane_entity_idx[navi_lane_idx]],
-                               Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET, PUFF_CYAN);
+            draw_navigation_route_lane(env, agent->navi_goal_idx, navi_lane_idx,
+                                       Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET, PUFF_CYAN);
             navi_lane_idx = navigation->next_lane[goal_table_offset + navi_lane_idx];
         }
     }
@@ -1923,12 +1944,11 @@ static void gui_draw_route(Drive *env, int active_idx, Color color, int is_selec
     if (agent->navi_goal_idx < 0)
         return;
     int goal_table_offset = agent->navi_goal_idx * navigation->num_lanes;
-    int lane_idx = agent->current_lane_idx != -1 ? navigation->entity_to_navi_lane[agent->current_lane_idx]
-                                                 : agent->navi_lane_idx;
+    int lane_idx = agent->navi_lane_idx;
     gui_set_line_width(is_selected ? NAVI_RENDER_ROUTE_WIDTH_PX : NAVI_RENDER_LANE_WIDTH_PX);
     for (int hop = 0; hop < navigation->num_lanes && lane_idx != -1; hop++) {
-        draw_lane_polyline(&env->entities[navigation->lane_entity_idx[lane_idx]],
-                           Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET, is_selected ? color : Fade(color, 0.7f));
+        draw_navigation_route_lane(env, agent->navi_goal_idx, lane_idx, Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET,
+                                   is_selected ? color : Fade(color, 0.7f));
         lane_idx = navigation->next_lane[goal_table_offset + lane_idx];
     }
     gui_set_line_width(1.0f);
@@ -1968,24 +1988,16 @@ static void gui_draw_nav(Drive *env) {
     gui_draw_route(env, g_gui.sel, gui_goal_color(env, g_gui.sel), 1);
 }
 
-// World-size multiplier so the indicators stay readable when zoomed out (BEV / orbit); 1 in FPV.
-static float gui_feasibility_scale(void) {
-    if (g_gui.cam_mode == GUI_CAM_FPV)
-        return 1.0f;
-    return fmaxf(1.0f, g_gui.view_h / 100.0f);
-}
-
 // Selected agent's left / current / right lane feasibility (metres the goal stays reachable when driving in that
 // lane). Indicators sit ahead of the agent, one per lane; has_lane[i] is 0 when there is no such neighbour lane.
 static int gui_feasibility_state(Drive *env, Vector3 base[3], Vector2 *dir, float vals[3], int has_lane[3]) {
     Entity *agent = gui_selected_entity(env);
     if (env->navigation == NULL || agent == NULL || agent->navi_goal_idx < 0 || agent->navi_lane_idx < 0)
         return 0;
-    float scale = gui_feasibility_scale();
     float hx = cosf(agent->heading);
     float hy = sinf(agent->heading);
-    float ahead = agent->length * 0.5f + 1.0f * scale;
-    float offset = GUI_FEAS_LANE_OFFSET_M * scale;
+    float ahead = agent->length * 0.5f + 1.0f;
+    float offset = GUI_FEAS_LANE_OFFSET_M;
     float lateral[3] = {offset, 0.0f, -offset};
     vals[0] = agent->navi_feasibility_left_m;
     vals[1] = agent->navi_feasibility_center_m;
@@ -2016,29 +2028,28 @@ static void gui_draw_feasibility_arrows(Drive *env) {
     if (g_gui.feas_mode != GUI_FEAS_ARROWS || !gui_feasibility_state(env, base, &dir, vals, has_lane))
         return;
     Vector2 side = {-dir.y, dir.x};
-    float k = gui_feasibility_scale();
     for (int i = 0; i < 3; i++) {
         if (!has_lane[i])
             continue;
         Color color = gui_feasibility_color(vals[i]);
         Vector3 p = base[i];
         if (vals[i] <= 0.0f) {
-            float s = 0.5f * k;
+            float s = 0.5f;
             Vector3 a1 = {p.x + (dir.x + side.x) * s, p.y + (dir.y + side.y) * s, p.z};
             Vector3 a2 = {p.x - (dir.x + side.x) * s, p.y - (dir.y + side.y) * s, p.z};
             Vector3 b1 = {p.x + (dir.x - side.x) * s, p.y + (dir.y - side.y) * s, p.z};
             Vector3 b2 = {p.x - (dir.x - side.x) * s, p.y - (dir.y - side.y) * s, p.z};
-            DrawCylinderEx(a1, a2, 0.1f * k, 0.1f * k, 8, color);
-            DrawCylinderEx(b1, b2, 0.1f * k, 0.1f * k, 8, color);
+            DrawCylinderEx(a1, a2, 0.1f, 0.1f, 8, color);
+            DrawCylinderEx(b1, b2, 0.1f, 0.1f, 8, color);
             continue;
         }
         float ratio = fminf(vals[i] / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
-        float len = (GUI_FEAS_MIN_LEN_M + (GUI_FEAS_MAX_LEN_M - GUI_FEAS_MIN_LEN_M) * ratio) * k;
-        float head = fminf(0.6f * k, len * 0.5f);
+        float len = GUI_FEAS_MIN_LEN_M + (GUI_FEAS_MAX_LEN_M - GUI_FEAS_MIN_LEN_M) * ratio;
+        float head = fminf(0.6f, len * 0.5f);
         Vector3 neck = {p.x + dir.x * (len - head), p.y + dir.y * (len - head), p.z};
         Vector3 tip = {p.x + dir.x * len, p.y + dir.y * len, p.z};
-        DrawCylinderEx(p, neck, 0.1f * k, 0.1f * k, 8, color);
-        DrawCylinderEx(neck, tip, 0.35f * k, 0.0f, 12, color);
+        DrawCylinderEx(p, neck, 0.1f, 0.1f, 8, color);
+        DrawCylinderEx(neck, tip, 0.35f, 0.0f, 12, color);
     }
 }
 

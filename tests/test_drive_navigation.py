@@ -5,6 +5,7 @@ Running the test: python -m unittest tests/test_drive_navigation.py
 
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -15,9 +16,11 @@ from pathlib import Path
 
 import numpy as np
 
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pufferlib.ocean.drive import navigation as nav
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LANE_WIDTH_M = 3.7
@@ -59,6 +62,38 @@ def write_synthetic_map(path, with_edge_between_lanes=False, goal_y=0.0):
     for road_type, (xs, ys) in zip(road_types, roads):
         _write_entity(out, road_type, xs, ys)
     Path(path).write_bytes(bytes(out))
+
+
+def write_split_map(path, reverse_lanes=False, turn_goal=False):
+    straight = (np.array([0, 10, 25, 60]), np.zeros(4))
+    turn = (np.array([0, 10, 25, 25, 60, 60]), np.array([0.2, 0.2, -15, -30, -30, 0]))
+    roads = [straight, turn, _polyline(60, 100, 0)]
+    if reverse_lanes:
+        roads[:2] = roads[1::-1]
+    out = bytearray(b"synthetic_navi00")
+    out += struct.pack("<4i", 0, 0, 1, len(roads))
+    xs = np.arange(TRAJECTORY_STEPS, dtype=np.float32) * SPEED_MPS * DT_SECONDS
+    _write_entity(
+        out, nav.VEHICLE, xs, np.zeros_like(xs), goal_x=50.0 if turn_goal else 95.0, goal_y=-30.0 if turn_goal else 0.0
+    )
+    for x, y in roads:
+        _write_entity(out, nav.ROAD_LANE, x, y)
+    Path(path).write_bytes(out)
+
+
+def write_overlapping_goal_map(path, reverse_lanes=False):
+    straight = (np.array([0, 100]), np.zeros(2))
+    incoming = (np.array([20, 35, 35, 45.3]), np.array([-20, -20, 0.1, 0.1]))
+    roads = [straight, incoming, _polyline(-20, 0, 0)]
+    if reverse_lanes:
+        roads[:2] = roads[1::-1]
+    out = bytearray(b"synthetic_navi00")
+    out += struct.pack("<4i", 0, 0, 1, len(roads))
+    xs = np.arange(TRAJECTORY_STEPS, dtype=np.float32) * SPEED_MPS * DT_SECONDS
+    _write_entity(out, nav.VEHICLE, xs, np.zeros_like(xs), goal_x=45.3, goal_y=0.1)
+    for x, y in roads:
+        _write_entity(out, nav.ROAD_LANE, x, y)
+    Path(path).write_bytes(out)
 
 
 class TestNavigationGeneration(unittest.TestCase):
@@ -108,6 +143,289 @@ class TestNavigationGeneration(unittest.TestCase):
         navi_path.write_bytes(navi_path.read_bytes() + b"\0")
         with self.assertRaises(ValueError):
             nav.read_navigation(navi_path)
+
+    def test_split_prefix_and_longitudinal_distances_round_trip(self):
+        write_split_map(self.map_path)
+        navi = nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        np.testing.assert_array_equal(navi["branch_offsets"], [0, 1, 2, 2])
+        np.testing.assert_array_equal(navi["branch_lane"], [1, 0])
+        self.assertTrue(np.all(navi["branch_end_m"] >= 2))
+        self.assertTrue(np.all(navi["branch_end_m"] <= 11))
+        goal = navi["object_goal_idx"][0]
+        self.assertLess(
+            navi["longitudinal_distance_to_goal_m"][goal, 0], navi["longitudinal_distance_to_goal_m"][goal, 1]
+        )
+        loaded = nav.read_navigation(nav.navigation_path_for(self.map_path))
+        for key in (
+            "branch_offsets",
+            "branch_lane",
+            "branch_end_m",
+            "branch_other_end_m",
+            "longitudinal_distance_to_goal_m",
+        ):
+            np.testing.assert_array_equal(loaded[key], navi[key])
+
+    def test_split_relations_are_pairwise_and_exclude_unrelated_lanes(self):
+        lanes = [_polyline(0, 20, y) for y in (0, 0.8, 1.6, LANE_WIDTH_M)]
+        lanes += [(np.array([0, 0]), np.array([0, 20])), (np.array([0, -20]), np.array([0, 0]))]
+        branches = nav._infer_split_branches(lanes, [[] for _ in lanes])
+        offsets = branches["branch_offsets"]
+        siblings = [branches["branch_lane"][offsets[i] : offsets[i + 1]].tolist() for i in range(len(lanes))]
+        self.assertEqual(siblings, [[1], [0, 2], [1], [], [], []])
+
+    def test_hidden_goal_copies_do_not_consume_goal_slots_or_move_goal(self):
+        write_overlapping_goal_map(self.map_path)
+        navi = nav.process_map_navigation(self.map_path, max_goals=1, seed=0)
+        self.assertEqual(navi["num_goals"], 1)
+        self.assertEqual(navi["object_goal_idx"][0], 0)
+        self.assertEqual(navi["goal_lane"][0], 1)
+        np.testing.assert_allclose([navi["goal_x"][0], navi["goal_y"][0]], [45.3, 0.1], atol=1e-4)
+        self.assertEqual(navi["next_lane"][0, 0], -1)
+        self.assertEqual(navi["next_lane"][0, 1], -1)
+        self.assertEqual(navi["next_lane"][0, 2], 0)
+        for key in ("longitudinal_distance_to_goal_m", "distance_to_goal_m", "feasibility_center_m"):
+            self.assertAlmostEqual(float(navi[key][0, 0]), 45.3, places=4)
+            self.assertAlmostEqual(float(navi[key][0, 2]), 65.3, places=4)
+        loaded = nav.read_navigation(nav.navigation_path_for(self.map_path))
+        np.testing.assert_array_equal(loaded["next_lane"], navi["next_lane"])
+        np.testing.assert_array_equal(
+            loaded["longitudinal_distance_to_goal_m"], navi["longitudinal_distance_to_goal_m"]
+        )
+
+    def test_goal_copies_exclude_adjacent_crossing_opposing_and_unshared_lanes(self):
+        lanes = [
+            (np.array([20, 35, 35, 45.3]), np.array([-20, -20, 0.1, 0.1])),
+            _polyline(0, 100, 0),
+            _polyline(0, 100, LANE_WIDTH_M),
+            (np.array([45.3, 45.3]), np.array([-10, 10])),
+            (np.array([100, 0]), np.zeros(2)),
+            (np.array([44.8, 45.3]), np.zeros(2)),
+        ]
+        lengths = np.array([nav._polyline_length(x, y) for x, y in lanes])
+        terminals = nav._goal_lane_terminals(0, lanes, lengths, nav._SpatialIndex(list(enumerate(lanes))))
+        self.assertEqual(set(terminals), {0, 1})
+        self.assertAlmostEqual(terminals[1], 45.3, places=4)
+
+    def test_rejects_old_version_and_invalid_split_metadata(self):
+        write_split_map(self.map_path)
+        navi = nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        path = nav.navigation_path_for(self.map_path)
+        raw = bytearray(path.read_bytes())
+        struct.pack_into("<i", raw, 8, nav.NAVI_VERSION - 1)
+        path.write_bytes(raw)
+        with self.assertRaisesRegex(ValueError, "unsupported version.*overwrite"):
+            nav.read_navigation(path)
+        for field, value in (
+            ("branch_offsets", -1),
+            ("branch_lane", navi["num_lanes"]),
+            ("branch_end_m", np.nan),
+            ("longitudinal_distance_to_goal_m", -1),
+        ):
+            invalid = {**navi, field: navi[field].copy()}
+            invalid[field].flat[0] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                nav.validate_navigation(invalid)
+
+
+class TestNavigationSplits(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.build_dir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.build_dir.cleanup)
+        compiler = shutil.which("cc")
+        if compiler is None:
+            raise unittest.SkipTest("C compiler is required for native navigation tests")
+        raylib = "raylib-5.5_macos" if sys.platform == "darwin" else "raylib-5.5_linux_amd64"
+        cls.harness = str(Path(cls.build_dir.name) / "navigation_harness")
+        completed = subprocess.run(
+            [
+                compiler,
+                "-O1",
+                "-D_GNU_SOURCE",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-I" + str(REPO_ROOT / "pufferlib/ocean/drive"),
+                "-I" + str(REPO_ROOT / raylib / "include"),
+                "-I" + str(REPO_ROOT / "inih-r62"),
+                str(REPO_ROOT / "tests/drive_navigation_harness.c"),
+                "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
+                "-lm",
+                "-o",
+                cls.harness,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if completed.returncode:
+            raise RuntimeError(completed.stderr)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.map_path = Path(self.tmp.name) / "map_000.bin"
+        write_split_map(self.map_path)
+        self.navi = nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+
+    def run_harness(self, x=5.0, y=0.18, heading=0.0, previous=-1, goal=None):
+        args = [self.harness, str(self.map_path), str(x), str(y), str(heading), str(previous)]
+        if goal is not None:
+            args.append(str(goal))
+        completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=30)
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT "))
+        return json.loads(line[len("RESULT ") :])
+
+    def test_shorter_branch_drives_waypoints_renderers_and_metrics(self):
+        result = self.run_harness(previous=1)
+        self.assertEqual((result["physical"], result["selected"]), (1, 0))
+        self.assertEqual(result["off_route"], 0)
+        self.assertAlmostEqual(result["distance"], 95.0, places=4)
+        self.assertGreater(result["center_feasibility"], 0)
+        np.testing.assert_allclose(np.array(result["waypoints"])[:, 1], 0)
+        self.assertEqual(result["gui_min_y"], 0)
+        self.assertEqual(result["legacy_min_y"], 0)
+        self.assertEqual(result["gui_goals"], 1)
+        self.assertEqual(result["legacy_goals"], 1)
+        self.assertEqual(result["previous_distance"], result["distance"])
+        self.assertEqual(result["stationary_delta"], 0)
+        self.assertEqual(result["sampled_goal"], int(self.navi["object_goal_idx"][0]))
+        moved = self.run_harness(x=6, previous=0)
+        self.assertAlmostEqual(result["distance"] - moved["distance"], 1.0, places=4)
+
+    def test_selection_does_not_depend_on_lane_order(self):
+        write_split_map(self.map_path, reverse_lanes=True)
+        nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        result = self.run_harness()
+        self.assertEqual((result["physical"], result["selected"]), (0, 1))
+
+    def test_goal_can_select_the_turn_instead(self):
+        write_split_map(self.map_path, turn_goal=True)
+        nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        result = self.run_harness(y=0.02)
+        self.assertEqual((result["physical"], result["selected"]), (0, 1))
+        self.assertLess(result["gui_min_y"], -20)
+        self.assertLess(result["legacy_min_y"], -20)
+        self.assertEqual(result["off_route"], 0)
+
+    def test_overlapping_goal_is_reachable_without_entering_incoming_turn(self):
+        write_overlapping_goal_map(self.map_path)
+        nav.process_map_navigation(self.map_path, max_goals=1, seed=0)
+        result = self.run_harness(x=15, y=0)
+        self.assertEqual((result["physical"], result["selected"]), (0, 0))
+        self.assertEqual(result["off_route"], 0)
+        self.assertAlmostEqual(result["distance"], 30.3, places=4)
+        self.assertAlmostEqual(result["center_feasibility"], 30.3, places=4)
+        self.assertEqual((result["gui_goals"], result["legacy_goals"]), (1, 1))
+        np.testing.assert_allclose(result["waypoints"], [[x, 0] for x in range(20, 46, 5)], atol=1e-4)
+        self.assertAlmostEqual(result["gui_max_x"], 45.3, places=4)
+        self.assertAlmostEqual(result["legacy_max_x"], 45.3, places=4)
+        self.assertEqual(result["gui_min_y"], 0)
+        self.assertEqual(result["legacy_min_y"], 0)
+        upstream = self.run_harness(x=-5, y=0)
+        self.assertEqual(upstream["selected"], 2)
+        self.assertEqual(upstream["off_route"], 0)
+        self.assertAlmostEqual(upstream["distance"], 50.3, places=4)
+        self.assertAlmostEqual(upstream["gui_max_x"], 45.3, places=4)
+        past_goal = self.run_harness(x=50, y=0)
+        self.assertEqual(past_goal["waypoints"], [])
+
+    def test_overlapping_goal_routes_survive_lane_reordering(self):
+        write_overlapping_goal_map(self.map_path, reverse_lanes=True)
+        nav.process_map_navigation(self.map_path, max_goals=1, seed=0)
+        result = self.run_harness(x=15, y=0)
+        self.assertEqual(result["selected"], 1)
+        self.assertEqual(result["off_route"], 0)
+        self.assertAlmostEqual(result["distance"], 30.3, places=4)
+        self.assertAlmostEqual(result["gui_max_x"], 45.3, places=4)
+
+    def test_native_loader_rejects_goal_terminal_beyond_lane_end(self):
+        write_overlapping_goal_map(self.map_path)
+        navi = nav.process_map_navigation(self.map_path, max_goals=1, seed=0)
+        path = nav.navigation_path_for(self.map_path)
+        raw = bytearray(path.read_bytes())
+        tables = struct.calcsize(nav._HEADER_FMT) + 4 * (
+            3 * navi["num_lanes"] + 3 * navi["num_goals"] + navi["num_objects"]
+        )
+        longitudinal_table = tables + 4 * 5 * navi["num_lanes"] * navi["num_goals"]
+        struct.pack_into("<f", raw, longitudinal_table, 1000.0)
+        path.write_bytes(raw)
+        completed = subprocess.run(
+            [self.harness, str(self.map_path), "15", "0", "0"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("terminal progress", completed.stderr + completed.stdout)
+
+    def test_commit_to_turn_after_divergence(self):
+        result = self.run_harness(x=20, y=-10, heading=-0.79, previous=0)
+        self.assertEqual((result["physical"], result["selected"]), (1, 1))
+        self.assertLess(result["gui_min_y"], -20)
+        self.assertLess(np.array(result["waypoints"])[:, 1].min(), -20)
+
+    def test_no_goal_and_outside_shared_prefix_use_physical_lane(self):
+        result = self.run_harness(goal=-1)
+        self.assertEqual((result["physical"], result["selected"]), (1, 1))
+        self.assertEqual(result["waypoints"], [])
+        result = self.run_harness(x=12, y=-1.8, heading=-0.79)
+        self.assertEqual((result["physical"], result["selected"]), (1, 1))
+
+    def test_equal_cost_prefers_previous_branch_and_unreachable_retains_fallback(self):
+        goal = self.navi["object_goal_idx"][0]
+        for costs, previous, expected in (([100, 100], 0, 0), ([100, 100], 1, 1), ([nav.NAVI_UNREACHABLE_M] * 2, 0, 1)):
+            self.navi["longitudinal_distance_to_goal_m"][goal, :2] = costs
+            nav.write_navigation(self.navi, nav.navigation_path_for(self.map_path))
+            result = self.run_harness(previous=previous)
+            self.assertEqual(result["selected"], expected)
+
+    def test_off_lane_retains_anchor_and_opposing_heading_does_not_choose_a_branch(self):
+        result = self.run_harness(x=-10000, previous=0)
+        self.assertEqual((result["physical"], result["selected"]), (-1, 0))
+        result = self.run_harness(heading=np.pi)
+        self.assertEqual((result["physical"], result["selected"]), (1, 1))
+
+    def test_native_loader_rejects_bad_split_metadata_and_old_version(self):
+        path = nav.navigation_path_for(self.map_path)
+        original = path.read_bytes()
+        branch_offset = len(original) - 4 * (3 * self.navi["num_branches"] + self.navi["num_lanes"] + 1)
+        branch_lane_offset = branch_offset + 4 * (self.navi["num_lanes"] + 1)
+        prefix_offset = branch_lane_offset + 4 * self.navi["num_branches"]
+        cases = [
+            (8, "<i", nav.NAVI_VERSION - 1, "unsupported version"),
+            (struct.calcsize(nav._HEADER_FMT) + 4, "<i", 1000000, "non-lane entity"),
+            (branch_offset, "<i", -1, "branch_offsets"),
+            (branch_lane_offset, "<i", self.navi["num_lanes"], "branch_lane"),
+            (prefix_offset, "<f", float("nan"), "prefix limit"),
+            (prefix_offset, "<f", 10000.0, "prefix limit"),
+        ]
+        for offset, fmt, value, message in cases:
+            raw = bytearray(original)
+            struct.pack_into(fmt, raw, offset, value)
+            path.write_bytes(raw)
+            result = subprocess.run(
+                [self.harness, str(self.map_path), "5", "0.18", "0"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr + result.stdout)
+        for raw in (original[:-1], original + b"\0"):
+            path.write_bytes(raw)
+            result = subprocess.run(
+                [self.harness, str(self.map_path), "5", "0.18", "0"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("file size", result.stderr + result.stdout)
 
 
 ENV_SCRIPT = textwrap.dedent(
@@ -173,6 +491,7 @@ class TestNavigationEnv(unittest.TestCase):
                 str(reset_count),
             ],
             cwd=REPO_ROOT,
+            check=False,
             capture_output=True,
             text=True,
             timeout=120,
@@ -209,6 +528,17 @@ class TestNavigationEnv(unittest.TestCase):
         waypoints = np.array(custom["waypoints"])
         self.assertEqual(waypoints.shape, (4, 3))
         np.testing.assert_allclose(np.diff(waypoints[:, 0]), 10.0 * 0.02, atol=1e-4)
+
+    def test_waypoints_reach_hidden_goal_copy_on_overlapping_straight_lane(self):
+        write_overlapping_goal_map(self.map_path)
+        nav.process_map_navigation(self.map_path, max_goals=1, seed=0)
+        result = self._result(self._run_env(1))
+        waypoints = np.array(result["waypoints"])
+        valid = waypoints[:, 2] == 1
+        self.assertTrue(0 < valid.sum() < 16)
+        np.testing.assert_allclose(waypoints[valid, 1], 0, atol=1e-3)
+        np.testing.assert_array_equal(waypoints[~valid], 0)
+        self.assertGreater(result["feasibility"][1], 0)
 
     def test_waypoints_follow_lane_change_and_stop_at_goal(self):
         write_synthetic_map(self.map_path, goal_y=LANE_WIDTH_M)

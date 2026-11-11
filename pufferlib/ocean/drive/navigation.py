@@ -8,18 +8,24 @@ Loaded by `load_navigation_binary` in drive.h when `navigation = 1` in drive.ini
 
 Layout (little-endian):
     char[8]  magic "PDNAVI01"
-    int32    version (2: PufferDrive 2.0 layout)
+    int32    version (4: overlapping goal terminals)
     uint32   map_crc32        zlib CRC-32 of the source map .bin bytes
     uint64   map_size_bytes
-    int32    num_objects, num_roads, num_lanes, num_goals
+    int32    num_objects, num_roads, num_lanes, num_goals, num_branches
     int32    lane_entity_idx[num_lanes]           entity index of each ROAD_LANE (ascending)
     int32    left_lane[num_lanes], right_lane[num_lanes]   navi lane idx of a legal lane change, or -1
-    int32    goal_lane[num_goals]                 navi lane whose end point is the goal
+    int32    goal_lane[num_goals]                 representative lane whose end point is the goal
     float32  goal_x[num_goals], goal_y[num_goals]
     int32    object_goal_idx[num_objects]         goal of each object's logged goal, or -1
-    int32    next_lane[num_goals * num_lanes]     longitudinal next hop toward the goal, -1 if none
+    int32    next_lane[num_goals * num_lanes]     longitudinal next hop, -1 at terminals or if none
     float32  distance_to_goal_m[num_goals * num_lanes]   from lane start; NAVI_UNREACHABLE_M if unreachable
     float32  feasibility_left_m / center_m / right_m [num_goals * num_lanes]
+    float32  longitudinal_distance_to_goal_m[num_goals * num_lanes]
+    int32    branch_offsets[num_lanes + 1], branch_lane[num_branches]
+    float32  branch_end_m[num_branches], branch_other_end_m[num_branches]
+
+A lane with next_lane == -1 and finite longitudinal_distance_to_goal_m (< NAVI_UNREACHABLE_M)
+is a goal terminal. Its longitudinal distance is the goal's projected arc length on that lane.
 """
 
 import heapq
@@ -30,8 +36,9 @@ from pathlib import Path
 
 import numpy as np
 
+
 NAVI_MAGIC = b"PDNAVI01"
-NAVI_VERSION = 2
+NAVI_VERSION = 4
 NAVI_SUFFIX = ".navi"
 NAVI_MAX_GOALS = 1024
 NAVI_UNREACHABLE_M = 1.0e9
@@ -65,14 +72,19 @@ GOAL_LANE_MATCH_RADIUS_M = 3.0
 GOAL_HEADING_COS_MIN = 0.5
 DENSIFY_STEP_M = 0.5
 FEASIBILITY_MAX_HOPS = 512
+SPLIT_START_RADIUS_M = 1.0
+SPLIT_MAX_SEPARATION_M = 1.0
+SPLIT_MIN_SHARED_M = 2.0
+SPLIT_HEADING_COS_MIN = 0.9
 
-_HEADER_FMT = "<8siIQiiii"
+_HEADER_FMT = "<8siIQiiiii"
 _PER_GOAL_LANE_FIELDS = (
     ("next_lane", "<i4"),
     ("distance_to_goal_m", "<f4"),
     ("feasibility_left_m", "<f4"),
     ("feasibility_center_m", "<f4"),
     ("feasibility_right_m", "<f4"),
+    ("longitudinal_distance_to_goal_m", "<f4"),
 )
 
 
@@ -139,6 +151,10 @@ def validate_navigation(navi: dict) -> None:
     expected_shapes = {"lane_entity_idx": (num_lanes,), "left_lane": (num_lanes,), "right_lane": (num_lanes,)}
     expected_shapes.update({key: (num_goals,) for key in ("goal_lane", "goal_x", "goal_y")})
     expected_shapes["object_goal_idx"] = (num_objects,)
+    expected_shapes["branch_offsets"] = (num_lanes + 1,)
+    expected_shapes.update(
+        {key: (navi["num_branches"],) for key in ("branch_lane", "branch_end_m", "branch_other_end_m")}
+    )
     expected_shapes.update({key: (num_goals, num_lanes) for key, _ in _PER_GOAL_LANE_FIELDS})
     for key, shape in expected_shapes.items():
         if navi[key].shape != shape:
@@ -155,11 +171,30 @@ def validate_navigation(navi: dict) -> None:
         raise ValueError("goal_lane out of range")
     if np.any(navi["object_goal_idx"] < -1) or np.any(navi["object_goal_idx"] >= num_goals):
         raise ValueError(f"object_goal_idx out of range [-1, {num_goals})")
-    for key in ("goal_x", "goal_y", "distance_to_goal_m"):
+    offsets = navi["branch_offsets"]
+    if offsets[0] != 0 or offsets[-1] != navi["num_branches"] or np.any(np.diff(offsets) < 0):
+        raise ValueError("invalid branch_offsets")
+    for lane in range(num_lanes):
+        siblings = navi["branch_lane"][offsets[lane] : offsets[lane + 1]]
+        if np.any(siblings < 0) or np.any(siblings >= num_lanes) or np.any(siblings == lane):
+            raise ValueError("branch_lane out of range or self-referencing")
+        if np.any(np.diff(siblings) <= 0):
+            raise ValueError("branch lanes must be strictly ascending")
+    for key in ("branch_end_m", "branch_other_end_m"):
+        if not np.all(np.isfinite(navi[key])) or np.any(navi[key] < SPLIT_MIN_SHARED_M):
+            raise ValueError(f"{key} must contain finite shared-prefix limits")
+    for key in ("goal_x", "goal_y", "distance_to_goal_m", "longitudinal_distance_to_goal_m"):
         if not np.all(np.isfinite(navi[key])):
             raise ValueError(f"{key} contains NaN/Inf")
-    if np.any(navi["distance_to_goal_m"] < 0) or np.any(navi["distance_to_goal_m"] > NAVI_UNREACHABLE_M):
-        raise ValueError("distance_to_goal_m out of range")
+    for key in ("distance_to_goal_m", "longitudinal_distance_to_goal_m"):
+        if np.any(navi[key] < 0) or np.any(navi[key] > NAVI_UNREACHABLE_M):
+            raise ValueError(f"{key} out of range")
+    for goal, lane in enumerate(navi["goal_lane"]):
+        if (
+            navi["next_lane"][goal, lane] != -1
+            or navi["longitudinal_distance_to_goal_m"][goal, lane] >= NAVI_UNREACHABLE_M
+        ):
+            raise ValueError("representative goal lane must be a terminal")
     for key in ("feasibility_left_m", "feasibility_center_m", "feasibility_right_m"):
         values = navi[key]
         if not np.all(np.isfinite(values)) or np.any(values < 0) or np.any(values > NAVI_FEASIBILITY_CAP_M):
@@ -178,16 +213,23 @@ def write_navigation(navi: dict, path) -> None:
         navi["num_roads"],
         navi["num_lanes"],
         navi["num_goals"],
+        navi["num_branches"],
     )
     with open(path, "wb") as f:
         f.write(header)
-        for key in ("lane_entity_idx", "left_lane", "right_lane", "goal_lane"):
-            f.write(np.ascontiguousarray(navi[key], dtype="<i4").tobytes())
-        for key in ("goal_x", "goal_y"):
-            f.write(np.ascontiguousarray(navi[key], dtype="<f4").tobytes())
+        f.writelines(
+            np.ascontiguousarray(navi[key], dtype="<i4").tobytes()
+            for key in ("lane_entity_idx", "left_lane", "right_lane", "goal_lane")
+        )
+        f.writelines(np.ascontiguousarray(navi[key], dtype="<f4").tobytes() for key in ("goal_x", "goal_y"))
         f.write(np.ascontiguousarray(navi["object_goal_idx"], dtype="<i4").tobytes())
-        for key, dtype in _PER_GOAL_LANE_FIELDS:
-            f.write(np.ascontiguousarray(navi[key], dtype=dtype).tobytes())
+        f.writelines(np.ascontiguousarray(navi[key], dtype=dtype).tobytes() for key, dtype in _PER_GOAL_LANE_FIELDS)
+        f.writelines(
+            np.ascontiguousarray(navi[key], dtype="<i4").tobytes() for key in ("branch_offsets", "branch_lane")
+        )
+        f.writelines(
+            np.ascontiguousarray(navi[key], dtype="<f4").tobytes() for key in ("branch_end_m", "branch_other_end_m")
+        )
 
 
 def read_navigation(path) -> dict:
@@ -195,16 +237,20 @@ def read_navigation(path) -> dict:
     header_size = struct.calcsize(_HEADER_FMT)
     if len(raw) < header_size:
         raise ValueError(f"{path}: truncated header")
-    magic, version, crc32, size_bytes, num_objects, num_roads, num_lanes, num_goals = struct.unpack_from(
+    magic, version, crc32, size_bytes, num_objects, num_roads, num_lanes, num_goals, num_branches = struct.unpack_from(
         _HEADER_FMT, raw, 0
     )
     if magic != NAVI_MAGIC:
         raise ValueError(f"{path}: bad magic {magic!r}")
     if version != NAVI_VERSION:
-        raise ValueError(f"{path}: unsupported version {version}")
+        raise ValueError(f"{path}: unsupported version {version}; regenerate navigation with --overwrite")
     if num_objects < 0 or num_roads < 0 or num_lanes <= 0 or not 1 <= num_goals <= NAVI_MAX_GOALS:
         raise ValueError(f"{path}: invalid counts objects={num_objects} lanes={num_lanes} goals={num_goals}")
-    expected_size = header_size + 4 * (3 * num_lanes + 3 * num_goals + num_objects + 5 * num_goals * num_lanes)
+    if not 0 <= num_branches <= num_lanes * (num_lanes - 1):
+        raise ValueError(f"{path}: invalid branch count {num_branches}")
+    expected_size = header_size + 4 * (
+        4 * num_lanes + 1 + 3 * num_goals + num_objects + 6 * num_goals * num_lanes + 3 * num_branches
+    )
     if len(raw) != expected_size:
         raise ValueError(f"{path}: size {len(raw)} != expected {expected_size}")
     offset = header_size
@@ -222,6 +268,7 @@ def read_navigation(path) -> dict:
         "num_roads": num_roads,
         "num_lanes": num_lanes,
         "num_goals": num_goals,
+        "num_branches": num_branches,
         "lane_entity_idx": take(num_lanes, "<i4"),
         "left_lane": take(num_lanes, "<i4"),
         "right_lane": take(num_lanes, "<i4"),
@@ -232,6 +279,10 @@ def read_navigation(path) -> dict:
     }
     for key, dtype in _PER_GOAL_LANE_FIELDS:
         navi[key] = take(num_goals * num_lanes, dtype).reshape(num_goals, num_lanes)
+    navi["branch_offsets"] = take(num_lanes + 1, "<i4")
+    navi["branch_lane"] = take(num_branches, "<i4")
+    navi["branch_end_m"] = take(num_branches, "<f4")
+    navi["branch_other_end_m"] = take(num_branches, "<f4")
     validate_navigation(navi)
     return navi
 
@@ -331,6 +382,62 @@ def _infer_exits(lane_polylines):
     return exits
 
 
+def _infer_split_branches(lane_polylines, exits):
+    """Pairwise interchangeable prefixes; never group lanes transitively across an intersection."""
+    starts = np.array([[xs[0], ys[0]] for xs, ys in lane_polylines])
+    buckets = {}
+    pairs = set()
+    for lane, start in enumerate(starts):
+        cell = tuple(np.floor(start / SPLIT_START_RADIUS_M).astype(int))
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for other in buckets.get((cell[0] + dx, cell[1] + dy), ()):
+                    if np.linalg.norm(start - starts[other]) <= SPLIT_START_RADIUS_M:
+                        pairs.add((other, lane))
+        buckets.setdefault(cell, []).append(lane)
+    for successors in exits:
+        for i, lane in enumerate(successors):
+            for other in successors[i + 1 :]:
+                pairs.add((min(lane, other), max(lane, other)))
+    samples = {}
+    branches = [[] for _ in lane_polylines]
+    for lane, other in sorted(pairs):
+        if np.linalg.norm(starts[lane] - starts[other]) > SPLIT_START_RADIUS_M:
+            continue
+        for idx in (lane, other):
+            if idx not in samples:
+                samples[idx] = _densify(*lane_polylines[idx], DENSIFY_STEP_M)
+        p, d, s = samples[lane]
+        op, od, os = samples[other]
+        if len(s) == 0 or len(os) == 0:
+            continue
+        length = min(s[-1], os[-1])
+        arc = np.append(np.arange(0.0, length, DENSIFY_STEP_M), length)
+        point = np.column_stack([np.interp(arc, s, p[:, k]) for k in (0, 1)])
+        other_point = np.column_stack([np.interp(arc, os, op[:, k]) for k in (0, 1)])
+        direction = d[np.minimum(np.searchsorted(s, arc, side="right") - 1, len(d) - 1)]
+        other_direction = od[np.minimum(np.searchsorted(os, arc, side="right") - 1, len(od) - 1)]
+        valid = np.linalg.norm(point - other_point, axis=1) <= SPLIT_MAX_SEPARATION_M
+        valid &= np.sum(direction * other_direction, axis=1) >= SPLIT_HEADING_COS_MIN
+        bad = np.flatnonzero(~valid)
+        end = float(arc[bad[0] - 1]) if len(bad) and bad[0] > 0 else (0.0 if len(bad) else float(length))
+        if end >= SPLIT_MIN_SHARED_M:
+            branches[lane].append((other, end, end))
+            branches[other].append((lane, end, end))
+    offsets = np.zeros(len(branches) + 1, dtype=np.int32)
+    entries = []
+    for lane, siblings in enumerate(branches):
+        entries.extend(sorted(siblings))
+        offsets[lane + 1] = len(entries)
+    return {
+        "num_branches": len(entries),
+        "branch_offsets": offsets,
+        "branch_lane": np.array([b[0] for b in entries], dtype=np.int32),
+        "branch_end_m": np.array([b[1] for b in entries], dtype=np.float32),
+        "branch_other_end_m": np.array([b[2] for b in entries], dtype=np.float32),
+    }
+
+
 def _find_lateral_neighbor(lane, xs, ys, length_m, side_sign, lane_index, edge_index):
     """Navi lane on one side (+1 left, -1 right) at every probe with no road edge in between, or -1."""
     neighbor = None
@@ -352,11 +459,13 @@ def _find_lateral_neighbor(lane, xs, ys, length_m, side_sign, lane_index, edge_i
     return neighbor
 
 
-def _dijkstra_to_goal(goal_lane, edge_costs, reverse_edges):
-    """Distance from each lane's start to the goal lane's end over reversed weighted edges."""
+def _dijkstra_to_goal(terminals, edge_costs, reverse_edges):
+    """Distance from lane starts to any terminal's goal projection over reversed weighted edges."""
     dist = np.full(len(edge_costs), np.inf)
-    dist[goal_lane] = edge_costs[goal_lane]
-    heap = [(dist[goal_lane], goal_lane)]
+    for lane, progress in terminals.items():
+        dist[lane] = progress
+    heap = [(progress, lane) for lane, progress in terminals.items()]
+    heapq.heapify(heap)
     while heap:
         d, lane = heapq.heappop(heap)
         if d > dist[lane]:
@@ -378,15 +487,15 @@ def _best_successor(successors, dist):
     return best
 
 
-def _center_feasibility(lane, goal_lane, lengths, dist_full, stay_next):
+def _center_feasibility(lane, terminals, lengths, dist_full, stay_next):
     """Metres one can keep following exit lanes from `lane` start while the goal stays reachable."""
     accumulated_m = 0.0
     current = lane
     for _ in range(FEASIBILITY_MAX_HOPS):
         if not np.isfinite(dist_full[current]):
             break
-        accumulated_m += lengths[current]
-        if current == goal_lane or accumulated_m >= NAVI_FEASIBILITY_CAP_M:
+        accumulated_m += terminals.get(current, lengths[current])
+        if current in terminals or accumulated_m >= NAVI_FEASIBILITY_CAP_M:
             break
         current = stay_next[current]
         if current == -1:
@@ -435,6 +544,56 @@ def _match_object_goal_lane(entity, lane_index, lane_lengths):
     return int(owners[best])
 
 
+def _goal_lane_terminals(goal_lane, lane_polylines, lane_lengths, lane_index):
+    """Aligned lanes sharing the goal's final approach, with exact projected stopping positions."""
+    xs, ys = lane_polylines[goal_lane]
+    goal = np.array([xs[-1], ys[-1]])
+    length = lane_lengths[goal_lane]
+    terminals = {goal_lane: max(length, MIN_EDGE_COST_M)}
+    if length < SPLIT_MIN_SHARED_M:
+        return terminals
+    _, heading = _lane_pose_at(xs, ys, length)
+    idx, _ = lane_index.query(goal, SPLIT_MAX_SEPARATION_M + DENSIFY_STEP_M)
+    offsets = np.arange(0.0, SPLIT_MIN_SHARED_M + DENSIFY_STEP_M / 2, DENSIFY_STEP_M)
+    approach = [_lane_pose_at(xs, ys, length - offset) for offset in offsets]
+    for lane in np.unique(lane_index.owners[idx]):
+        if lane == goal_lane:
+            continue
+        ox, oy = lane_polylines[lane]
+        points = np.column_stack((ox, oy))
+        segments = np.diff(points, axis=0)
+        lengths = np.linalg.norm(segments, axis=1)
+        if not np.any(lengths > 0):
+            continue
+        directions = np.divide(segments, lengths[:, None], out=np.zeros_like(segments), where=lengths[:, None] > 0)
+        fractions = np.divide(
+            np.sum((goal - points[:-1]) * segments, axis=1),
+            lengths**2,
+            out=np.zeros_like(lengths),
+            where=lengths > 0,
+        )
+        fractions = np.clip(fractions, 0.0, 1.0)
+        distances = np.linalg.norm(points[:-1] + fractions[:, None] * segments - goal, axis=1)
+        aligned = directions @ heading >= SPLIT_HEADING_COS_MIN
+        distances[~aligned] = np.inf
+        segment = int(np.argmin(distances))
+        if distances[segment] > SPLIT_MAX_SEPARATION_M:
+            continue
+        progress = float(np.sum(lengths[:segment]) + fractions[segment] * lengths[segment])
+        if progress < SPLIT_MIN_SHARED_M:
+            continue
+        for offset, (point, direction) in zip(offsets, approach):
+            other_point, other_direction = _lane_pose_at(ox, oy, progress - offset)
+            if (
+                np.linalg.norm(point - other_point) > SPLIT_MAX_SEPARATION_M
+                or direction @ other_direction < SPLIT_HEADING_COS_MIN
+            ):
+                break
+        else:
+            terminals[int(lane)] = progress
+    return terminals
+
+
 def build_navigation(map_data, max_goals=DEFAULT_MAX_GOALS, seed=GOAL_SEED_BASE) -> dict:
     entities = map_data["entities"]
     num_objects = map_data["num_objects"]
@@ -451,6 +610,7 @@ def build_navigation(map_data, max_goals=DEFAULT_MAX_GOALS, seed=GOAL_SEED_BASE)
     lengths = np.array([_polyline_length(xs, ys) for xs, ys in lane_polylines], dtype=np.float64)
     edge_costs = np.maximum(lengths, MIN_EDGE_COST_M)
     exits = _infer_exits(lane_polylines)
+    split_branches = _infer_split_branches(lane_polylines, exits)
 
     lane_index = _SpatialIndex(list(enumerate(lane_polylines)))
     edge_index = _SpatialIndex([(i, (e["x"], e["y"])) for i, e in enumerate(entities) if e["type"] == ROAD_EDGE])
@@ -489,17 +649,20 @@ def build_navigation(map_data, max_goals=DEFAULT_MAX_GOALS, seed=GOAL_SEED_BASE)
     num_goals = len(goal_lanes)
     next_lane = np.full((num_goals, num_lanes), -1, dtype=np.int32)
     distance_to_goal = np.full((num_goals, num_lanes), NAVI_UNREACHABLE_M, dtype=np.float32)
+    longitudinal_distance = np.full_like(distance_to_goal, NAVI_UNREACHABLE_M)
     feas_center = np.zeros((num_goals, num_lanes), dtype=np.float32)
     for goal, goal_lane in enumerate(goal_lanes):
-        dist_long = _dijkstra_to_goal(goal_lane, edge_costs, reverse_long)
-        dist_full = _dijkstra_to_goal(goal_lane, edge_costs, reverse_full)
+        terminals = _goal_lane_terminals(goal_lane, lane_polylines, lengths, lane_index)
+        dist_long = _dijkstra_to_goal(terminals, edge_costs, reverse_long)
+        dist_full = _dijkstra_to_goal(terminals, edge_costs, reverse_full)
+        longitudinal_distance[goal] = np.minimum(dist_long, NAVI_UNREACHABLE_M)
         stay_next = [_best_successor(exits[lane], dist_full) for lane in range(num_lanes)]
         for lane in range(num_lanes):
-            if lane != goal_lane and np.isfinite(dist_long[lane]):
+            if lane not in terminals and np.isfinite(dist_long[lane]):
                 next_lane[goal, lane] = _best_successor(exits[lane], dist_long)
             if np.isfinite(dist_full[lane]):
                 distance_to_goal[goal, lane] = min(dist_full[lane], NAVI_UNREACHABLE_M)
-            feas_center[goal, lane] = _center_feasibility(lane, goal_lane, lengths, dist_full, stay_next)
+            feas_center[goal, lane] = _center_feasibility(lane, terminals, lengths, dist_full, stay_next)
 
     feas_left = np.where(left_lane[None, :] >= 0, feas_center[:, np.maximum(left_lane, 0)], 0.0).astype(np.float32)
     feas_right = np.where(right_lane[None, :] >= 0, feas_center[:, np.maximum(right_lane, 0)], 0.0).astype(np.float32)
@@ -517,9 +680,11 @@ def build_navigation(map_data, max_goals=DEFAULT_MAX_GOALS, seed=GOAL_SEED_BASE)
         "object_goal_idx": object_goal_idx,
         "next_lane": next_lane,
         "distance_to_goal_m": distance_to_goal,
+        "longitudinal_distance_to_goal_m": longitudinal_distance,
         "feasibility_left_m": feas_left,
         "feasibility_center_m": feas_center,
         "feasibility_right_m": feas_right,
+        **split_branches,
     }
 
 

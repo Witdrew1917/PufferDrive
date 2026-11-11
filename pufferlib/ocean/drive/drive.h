@@ -130,12 +130,12 @@
 // Navigation sidecar (map_XXX.navi), written by pufferlib/ocean/drive/navigation.py
 #define NAVI_MAGIC "PDNAVI01"
 #define NAVI_MAGIC_LENGTH 8
-#define NAVI_VERSION 2
+#define NAVI_VERSION 4
 #define NAVI_FILE_SUFFIX ".navi"
-#define NAVI_HEADER_BYTES 40
+#define NAVI_HEADER_BYTES 44
 #define NAVI_LANE_ARRAY_COUNT 3
 #define NAVI_GOAL_ARRAY_COUNT 3
-#define NAVI_GOAL_LANE_ARRAY_COUNT 5
+#define NAVI_GOAL_LANE_ARRAY_COUNT 6
 #define NAVI_MAX_GOALS 1024
 #define NAVI_MAX_LANES 1000000
 #define NAVI_UNREACHABLE_M 1.0e9f
@@ -152,6 +152,10 @@
 #define NAVI_LANE_MAX_DISTANCE_M 4.0f
 #define NAVI_LANE_HEADING_TOLERANCE_RAD ((float)M_PI / 6.0f)
 #define NAVI_LANE_MISALIGNED_PENALTY_M 3.0f
+#define NAVI_SPLIT_MAX_SEPARATION_M 1.0f
+#define NAVI_SPLIT_MIN_SHARED_M 2.0f
+#define NAVI_SPLIT_HEADING_COS_MIN 0.9f
+#define NAVI_SPLIT_COST_TOLERANCE_M 0.1f
 #define NAVI_RENDER_LANE_WIDTH_PX 3.0f
 #define NAVI_RENDER_ROUTE_WIDTH_PX 6.0f
 #define NAVI_RENDER_Z_OFFSET 0.05f
@@ -589,6 +593,7 @@ typedef struct Navigation Navigation;
 struct Navigation {
     int num_lanes;
     int num_goals;
+    int num_branches;
     int *lane_entity_idx;     // navi lane -> entity idx
     int *entity_to_navi_lane; // entity idx -> navi lane, -1 for non-lanes; sized num_entities
     int *left_lane;
@@ -602,6 +607,11 @@ struct Navigation {
     float *feasibility_left_m;
     float *feasibility_center_m;
     float *feasibility_right_m;
+    float *longitudinal_distance_to_goal_m;
+    int *branch_offsets;
+    int *branch_lane;
+    float *branch_end_m;
+    float *branch_other_end_m;
 };
 
 void free_navigation(Navigation *navigation) {
@@ -621,7 +631,19 @@ void free_navigation(Navigation *navigation) {
     free(navigation->feasibility_left_m);
     free(navigation->feasibility_center_m);
     free(navigation->feasibility_right_m);
+    free(navigation->longitudinal_distance_to_goal_m);
+    free(navigation->branch_offsets);
+    free(navigation->branch_lane);
+    free(navigation->branch_end_m);
+    free(navigation->branch_other_end_m);
     free(navigation);
+}
+
+// Hidden copies of one goal terminate on any overlapping lane, possibly before that lane's end.
+static float navigation_terminal_progress(const Navigation *navigation, int goal, int lane) {
+    size_t idx = (size_t)goal * navigation->num_lanes + lane;
+    float distance = navigation->longitudinal_distance_to_goal_m[idx];
+    return navigation->next_lane[idx] == -1 && distance < NAVI_UNREACHABLE_M ? distance : -1.0f;
 }
 
 struct Drive {
@@ -962,9 +984,9 @@ static int navi_index_valid(int idx, int count, int allow_none) {
     return (allow_none && idx == -1) || (idx >= 0 && idx < count);
 }
 
-static const char *navi_read_header(FILE *file, const Drive *env, int *num_lanes_out, int *num_goals_out) {
+static const char *navi_read_header(FILE *file, const Drive *env, Navigation *navigation) {
     char magic[NAVI_MAGIC_LENGTH];
-    int32_t version, num_objects, num_roads, num_lanes, num_goals;
+    int32_t version, num_objects, num_roads, num_lanes, num_goals, num_branches;
     uint32_t map_crc32;
     uint64_t map_size_bytes;
     if (fread(magic, 1, NAVI_MAGIC_LENGTH, file) != NAVI_MAGIC_LENGTH || fread(&version, 4, 1, file) != 1 ||
@@ -977,8 +999,11 @@ static const char *navi_read_header(FILE *file, const Drive *env, int *num_lanes
         return "bad magic";
     }
     if (version != NAVI_VERSION) {
-        return "unsupported version (expected the PufferDrive 2.0 layout)";
+        return "unsupported version (regenerate with python -m pufferlib.ocean.drive.drive navigation --map-dir "
+               "<map_dir> --overwrite)";
     }
+    if (fread(&num_branches, 4, 1, file) != 1)
+        return "truncated branch count";
     int map_lane_count = 0;
     for (int entity_idx = 0; entity_idx < env->num_entities; entity_idx++) {
         map_lane_count += env->entities[entity_idx].type == ROAD_LANE;
@@ -989,6 +1014,8 @@ static const char *navi_read_header(FILE *file, const Drive *env, int *num_lanes
     if (num_lanes < 1 || num_lanes > NAVI_MAX_LANES || num_goals < 1 || num_goals > NAVI_MAX_GOALS) {
         return "lane or goal count out of range";
     }
+    if (num_branches < 0 || (uint64_t)num_branches > (uint64_t)num_lanes * (num_lanes - 1))
+        return "branch count out of range";
     uint32_t actual_crc32;
     uint64_t actual_size_bytes;
     if (navi_file_fingerprint(env->map_name, &actual_crc32, &actual_size_bytes) != 0) {
@@ -997,8 +1024,9 @@ static const char *navi_read_header(FILE *file, const Drive *env, int *num_lanes
     if (actual_crc32 != map_crc32 || actual_size_bytes != map_size_bytes) {
         return "stale sidecar: map fingerprint mismatch (regenerate with drive.py navigation --overwrite)";
     }
-    *num_lanes_out = num_lanes;
-    *num_goals_out = num_goals;
+    navigation->num_lanes = num_lanes;
+    navigation->num_goals = num_goals;
+    navigation->num_branches = num_branches;
     return NULL;
 }
 
@@ -1019,10 +1047,18 @@ static const char *navi_allocate(const Drive *env, Navigation *navigation) {
     navigation->feasibility_left_m = (float *)malloc(table_count * sizeof(float));
     navigation->feasibility_center_m = (float *)malloc(table_count * sizeof(float));
     navigation->feasibility_right_m = (float *)malloc(table_count * sizeof(float));
+    navigation->longitudinal_distance_to_goal_m = (float *)malloc(table_count * sizeof(float));
+    navigation->branch_offsets = (int *)malloc((num_lanes + 1) * sizeof(int));
+    size_t branches = navigation->num_branches > 0 ? (size_t)navigation->num_branches : 1;
+    navigation->branch_lane = (int *)malloc(branches * sizeof(int));
+    navigation->branch_end_m = (float *)malloc(branches * sizeof(float));
+    navigation->branch_other_end_m = (float *)malloc(branches * sizeof(float));
     if (!navigation->lane_entity_idx || !navigation->entity_to_navi_lane || !navigation->left_lane ||
         !navigation->right_lane || !navigation->goal_lane || !navigation->goal_x || !navigation->goal_y ||
         !navigation->object_goal_idx || !navigation->next_lane || !navigation->distance_to_goal_m ||
-        !navigation->feasibility_left_m || !navigation->feasibility_center_m || !navigation->feasibility_right_m) {
+        !navigation->feasibility_left_m || !navigation->feasibility_center_m || !navigation->feasibility_right_m ||
+        !navigation->longitudinal_distance_to_goal_m || !navigation->branch_offsets || !navigation->branch_lane ||
+        !navigation->branch_end_m || !navigation->branch_other_end_m) {
         return "out of memory";
     }
     return NULL;
@@ -1042,6 +1078,35 @@ static const char *navi_validate_lanes(const Drive *env, Navigation *navigation)
             return "lane_entity_idx is not strictly ascending";
         }
         navigation->entity_to_navi_lane[entity_idx] = lane;
+    }
+    if (navigation->branch_offsets[0] != 0 ||
+        navigation->branch_offsets[navigation->num_lanes] != navigation->num_branches)
+        return "invalid branch_offsets";
+    for (int lane = 0; lane < navigation->num_lanes; lane++) {
+        int start = navigation->branch_offsets[lane], end = navigation->branch_offsets[lane + 1];
+        if (start < 0 || end < start || end > navigation->num_branches)
+            return "invalid branch_offsets";
+        const Entity *entity = &env->entities[navigation->lane_entity_idx[lane]];
+        float length = 0.0f;
+        for (int j = 0; j + 1 < entity->array_size; j++)
+            length += hypotf(entity->traj_x[j + 1] - entity->traj_x[j], entity->traj_y[j + 1] - entity->traj_y[j]);
+        for (int b = start; b < end; b++) {
+            int other = navigation->branch_lane[b];
+            if (!navi_index_valid(other, navigation->num_lanes, 0) || other == lane ||
+                (b > start && other <= navigation->branch_lane[b - 1]))
+                return "invalid branch_lane";
+            float limit = navigation->branch_end_m[b], other_limit = navigation->branch_other_end_m[b];
+            if (!isfinite(limit) || !isfinite(other_limit) || limit < NAVI_SPLIT_MIN_SHARED_M ||
+                other_limit < NAVI_SPLIT_MIN_SHARED_M || limit > length + 0.01f)
+                return "invalid branch prefix limit";
+            const Entity *sibling = &env->entities[navigation->lane_entity_idx[other]];
+            float other_length = 0.0f;
+            for (int j = 0; j + 1 < sibling->array_size; j++)
+                other_length +=
+                    hypotf(sibling->traj_x[j + 1] - sibling->traj_x[j], sibling->traj_y[j + 1] - sibling->traj_y[j]);
+            if (other_limit > other_length + 0.01f)
+                return "invalid branch prefix limit";
+        }
     }
     for (int lane = 0; lane < navigation->num_lanes; lane++) {
         int left = navigation->left_lane[lane];
@@ -1071,6 +1136,18 @@ static const char *navi_validate_goals(const Drive *env, const Navigation *navig
             if (!navi_index_valid(next_row[lane], num_lanes, 1)) {
                 return "next_lane index out of range";
             }
+            float terminal = navigation_terminal_progress(navigation, goal, lane);
+            if (lane == navigation->goal_lane[goal] && terminal < 0.0f)
+                return "representative goal lane must be a terminal";
+            if (terminal >= 0.0f) {
+                const Entity *entity = &env->entities[navigation->lane_entity_idx[lane]];
+                float length = 0.0f;
+                for (int j = 0; j + 1 < entity->array_size; j++)
+                    length +=
+                        hypotf(entity->traj_x[j + 1] - entity->traj_x[j], entity->traj_y[j + 1] - entity->traj_y[j]);
+                if (terminal > length + 0.01f)
+                    return "goal terminal progress exceeds lane length";
+            }
         }
     }
     for (int object_idx = 0; object_idx < env->num_objects; object_idx++) {
@@ -1082,6 +1159,8 @@ static const char *navi_validate_goals(const Drive *env, const Navigation *navig
     if (navi_check_floats(navigation->distance_to_goal_m, table_count, NAVI_UNREACHABLE_M) != 0) {
         return "distance_to_goal_m must be finite and in [0, NAVI_UNREACHABLE_M]";
     }
+    if (navi_check_floats(navigation->longitudinal_distance_to_goal_m, table_count, NAVI_UNREACHABLE_M) != 0)
+        return "longitudinal_distance_to_goal_m must be finite and in [0, NAVI_UNREACHABLE_M]";
     if (navi_check_floats(navigation->feasibility_left_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0 ||
         navi_check_floats(navigation->feasibility_center_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0 ||
         navi_check_floats(navigation->feasibility_right_m, table_count, NAVI_FEASIBILITY_CAP_M) != 0) {
@@ -1098,6 +1177,7 @@ static const char *navi_read_body(FILE *file, const Drive *env, Navigation *navi
         NAVI_HEADER_BYTES +
         4u * ((uint64_t)NAVI_LANE_ARRAY_COUNT * num_lanes + (uint64_t)NAVI_GOAL_ARRAY_COUNT * num_goals +
               (uint64_t)env->num_objects + (uint64_t)NAVI_GOAL_LANE_ARRAY_COUNT * table_count);
+    expected_bytes += 4u * ((uint64_t)num_lanes + 1u + 3u * (uint64_t)navigation->num_branches);
     if (fseek(file, 0, SEEK_END) != 0 || (uint64_t)ftell(file) != expected_bytes ||
         fseek(file, NAVI_HEADER_BYTES, SEEK_SET) != 0) {
         return "file size does not match header counts (truncated or trailing bytes)";
@@ -1116,7 +1196,12 @@ static const char *navi_read_body(FILE *file, const Drive *env, Navigation *navi
         navi_read_array(file, navigation->distance_to_goal_m, table_count) ||
         navi_read_array(file, navigation->feasibility_left_m, table_count) ||
         navi_read_array(file, navigation->feasibility_center_m, table_count) ||
-        navi_read_array(file, navigation->feasibility_right_m, table_count)) {
+        navi_read_array(file, navigation->feasibility_right_m, table_count) ||
+        navi_read_array(file, navigation->longitudinal_distance_to_goal_m, table_count) ||
+        navi_read_array(file, navigation->branch_offsets, num_lanes + 1) ||
+        navi_read_array(file, navigation->branch_lane, (size_t)navigation->num_branches) ||
+        navi_read_array(file, navigation->branch_end_m, (size_t)navigation->num_branches) ||
+        navi_read_array(file, navigation->branch_other_end_m, (size_t)navigation->num_branches)) {
         return "truncated body";
     }
     error = navi_validate_lanes(env, navigation);
@@ -1148,7 +1233,7 @@ Navigation *load_navigation_binary(Drive *env) {
     Navigation *navigation = (Navigation *)calloc(1, sizeof(Navigation));
     const char *error = navigation == NULL ? "out of memory" : NULL;
     if (error == NULL) {
-        error = navi_read_header(file, env, &navigation->num_lanes, &navigation->num_goals);
+        error = navi_read_header(file, env, navigation);
     }
     if (error == NULL) {
         error = navi_read_body(file, env, navigation);
@@ -1964,7 +2049,80 @@ void update_current_lane(Drive *env, int agent_idx) {
     }
 }
 
-// Refreshes goal distance and lane feasibility from current_lane_idx; off-lane keeps the last known state.
+// Goal-aware navigation anchor, restricted to pairwise shared approaches of the physically matched lane.
+static int navigation_branch_lane(const Drive *env, const Entity *agent, int goal_idx) {
+    const Navigation *navigation = env->navigation;
+    if (agent->current_lane_idx == -1)
+        return -1;
+    int lane = navigation->entity_to_navi_lane[agent->current_lane_idx];
+    if (goal_idx == -1 || navigation->branch_offsets[lane] == navigation->branch_offsets[lane + 1])
+        return lane;
+    const Entity *physical = &env->entities[agent->current_lane_idx];
+    if (physical->array_size < 2)
+        return lane;
+    int segment;
+    float px, py;
+    float progress = lane_project(physical, agent->x, agent->y, &segment, &px, &py);
+    float dx = physical->traj_x[segment + 1] - physical->traj_x[segment];
+    float dy = physical->traj_y[segment + 1] - physical->traj_y[segment];
+    float norm = hypotf(dx, dy);
+    if (norm <= 0.0f || hypotf(agent->x - px, agent->y - py) > NAVI_SPLIT_MAX_SEPARATION_M)
+        return lane;
+    dx /= norm;
+    dy /= norm;
+    if (dx * cosf(agent->heading) + dy * sinf(agent->heading) < cosf(NAVI_LANE_HEADING_TOLERANCE_RAD))
+        return lane;
+    const float *costs = &navigation->longitudinal_distance_to_goal_m[(size_t)goal_idx * navigation->num_lanes];
+    int best = lane;
+    float best_cost = costs[lane] >= NAVI_UNREACHABLE_M ? NAVI_UNREACHABLE_M : fmaxf(costs[lane] - progress, 0.0f);
+    float best_fit = hypotf(agent->x - px, agent->y - py);
+    for (int b = navigation->branch_offsets[lane]; b < navigation->branch_offsets[lane + 1]; b++) {
+        int other = navigation->branch_lane[b];
+        if (progress > navigation->branch_end_m[b] || costs[other] >= NAVI_UNREACHABLE_M)
+            continue;
+        const Entity *sibling = &env->entities[navigation->lane_entity_idx[other]];
+        if (sibling->array_size < 2)
+            continue;
+        int other_segment;
+        float ox, oy;
+        float other_progress = lane_project(sibling, agent->x, agent->y, &other_segment, &ox, &oy);
+        float fit = hypotf(agent->x - ox, agent->y - oy);
+        if (other_progress > navigation->branch_other_end_m[b] || fit > NAVI_SPLIT_MAX_SEPARATION_M ||
+            hypotf(px - ox, py - oy) > NAVI_SPLIT_MAX_SEPARATION_M)
+            continue;
+        float odx = sibling->traj_x[other_segment + 1] - sibling->traj_x[other_segment];
+        float ody = sibling->traj_y[other_segment + 1] - sibling->traj_y[other_segment];
+        float other_norm = hypotf(odx, ody);
+        if (other_norm <= 0.0f)
+            continue;
+        odx /= other_norm;
+        ody /= other_norm;
+        if (dx * odx + dy * ody < NAVI_SPLIT_HEADING_COS_MIN ||
+            odx * cosf(agent->heading) + ody * sinf(agent->heading) < cosf(NAVI_LANE_HEADING_TOLERANCE_RAD))
+            continue;
+        float cost = fmaxf(costs[other] - other_progress, 0.0f);
+        int tied = fabsf(cost - best_cost) <= NAVI_SPLIT_COST_TOLERANCE_M;
+        int prefer_tie = other == agent->navi_lane_idx ||
+                         (best != agent->navi_lane_idx && (fit < best_fit || (fit == best_fit && other < best)));
+        if (cost < best_cost - NAVI_SPLIT_COST_TOLERANCE_M || (tied && prefer_tie)) {
+            best = other;
+            best_cost = cost;
+            best_fit = fit;
+        }
+    }
+    return best;
+}
+
+static int navigation_sibling_lanes(const Navigation *navigation, int lane, int other) {
+    if (lane < 0 || other < 0)
+        return 0;
+    for (int b = navigation->branch_offsets[lane]; b < navigation->branch_offsets[lane + 1]; b++)
+        if (navigation->branch_lane[b] == other)
+            return 1;
+    return 0;
+}
+
+// Refreshes goal distance and lane feasibility from the resolved anchor; off-lane keeps the last known state.
 void update_navigation_state(Drive *env, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
     update_current_lane(env, agent_idx);
@@ -1972,13 +2130,14 @@ void update_navigation_state(Drive *env, int agent_idx) {
         return;
     }
     const Navigation *navigation = env->navigation;
-    int navi_lane_idx = navigation->entity_to_navi_lane[agent->current_lane_idx];
+    int previous_lane = agent->navi_lane_idx;
+    int navi_lane_idx = navigation_branch_lane(env, agent, agent->navi_goal_idx);
     agent->navi_lane_idx = navi_lane_idx;
     if (agent->navi_goal_idx == -1) {
         return;
     }
     int table_idx = agent->navi_goal_idx * navigation->num_lanes + navi_lane_idx;
-    float progress_m = lane_progress_m(&env->entities[agent->current_lane_idx], agent->x, agent->y);
+    float progress_m = lane_progress_m(&env->entities[navigation->lane_entity_idx[navi_lane_idx]], agent->x, agent->y);
     float lane_start_distance_m = navigation->distance_to_goal_m[table_idx];
     bool off_route = lane_start_distance_m >= NAVI_UNREACHABLE_M;
     agent->navi_off_route = off_route;
@@ -1988,6 +2147,11 @@ void update_navigation_state(Drive *env, int agent_idx) {
     agent->prev_navi_distance_to_goal_m = agent->navi_distance_to_goal_m;
     agent->navi_distance_to_goal_m =
         agent->navi_off_route ? NAVI_UNREACHABLE_M : fmaxf(lane_start_distance_m - progress_m, 0.0f);
+    // A branch reassignment is not motion toward the goal.
+    if (previous_lane == -1 ||
+        (previous_lane != navi_lane_idx && (navigation_sibling_lanes(navigation, previous_lane, navi_lane_idx) ||
+                                            navigation_sibling_lanes(navigation, navi_lane_idx, previous_lane))))
+        agent->prev_navi_distance_to_goal_m = agent->navi_distance_to_goal_m;
     agent->navi_feasibility_center_m =
         navigation_feasibility_ahead_m(navigation->feasibility_center_m[table_idx], progress_m);
     int left_navi_lane_idx = navigation->left_lane[navi_lane_idx];
@@ -2008,7 +2172,7 @@ void update_navigation_state(Drive *env, int agent_idx) {
 
 // World-frame waypoints every spacing_m along the agent's route, starting from its projection onto its last known
 // lane. Follows next_lane; where the goal is only reachable through a lane change, hops to the left/right neighbour
-// with the shorter distance to goal (strictly decreasing, so the walk terminates). Stops at the goal lane's end.
+// with the shorter distance to goal (strictly decreasing, so the walk terminates). Stops at any hidden goal copy.
 // Returns the number of waypoints written (0 without a goal or when off route).
 int navigation_route_waypoints(const Drive *env, const Entity *agent, int max_waypoints, float spacing_m, float *xs,
                                float *ys) {
@@ -2019,7 +2183,6 @@ int navigation_route_waypoints(const Drive *env, const Entity *agent, int max_wa
     int num_lanes = navigation->num_lanes;
     const int *next_row = &navigation->next_lane[(size_t)agent->navi_goal_idx * num_lanes];
     const float *distance_row = &navigation->distance_to_goal_m[(size_t)agent->navi_goal_idx * num_lanes];
-    int goal_lane = navigation->goal_lane[agent->navi_goal_idx];
     int lane = agent->navi_lane_idx;
     if (distance_row[lane] >= NAVI_UNREACHABLE_M) {
         return 0;
@@ -2027,11 +2190,14 @@ int navigation_route_waypoints(const Drive *env, const Entity *agent, int max_wa
     const Entity *lane_entity = &env->entities[navigation->lane_entity_idx[lane]];
     int segment;
     float x, y;
-    lane_project(lane_entity, agent->x, agent->y, &segment, &x, &y);
+    float progress = lane_project(lane_entity, agent->x, agent->y, &segment, &x, &y);
     int count = 0;
     float to_travel_m = spacing_m;
     for (int lane_hops = 0; count < max_waypoints && lane_hops <= 2 * num_lanes;) {
-        if (lane != goal_lane && next_row[lane] == -1) {
+        float terminal = navigation_terminal_progress(navigation, agent->navi_goal_idx, lane);
+        if (terminal >= 0.0f && progress >= terminal)
+            break;
+        if (terminal < 0.0f && next_row[lane] == -1) {
             int side_lanes[2] = {navigation->left_lane[lane], navigation->right_lane[lane]};
             int best_lane = -1;
             float best_distance_m = distance_row[lane];
@@ -2046,17 +2212,18 @@ int navigation_route_waypoints(const Drive *env, const Entity *agent, int max_wa
             }
             lane = best_lane;
             lane_entity = &env->entities[navigation->lane_entity_idx[lane]];
-            lane_project(lane_entity, x, y, &segment, &x, &y);
+            progress = lane_project(lane_entity, x, y, &segment, &x, &y);
             lane_hops++;
             continue;
         }
         if (segment + 1 >= lane_entity->array_size) {
-            if (lane == goal_lane) {
+            if (terminal >= 0.0f) {
                 break;
             }
             lane = next_row[lane];
             lane_entity = &env->entities[navigation->lane_entity_idx[lane]];
             segment = 0;
+            progress = 0.0f;
             x = lane_entity->traj_x[0];
             y = lane_entity->traj_y[0];
             lane_hops++;
@@ -2065,18 +2232,26 @@ int navigation_route_waypoints(const Drive *env, const Entity *agent, int max_wa
         float end_x = lane_entity->traj_x[segment + 1];
         float end_y = lane_entity->traj_y[segment + 1];
         float remaining_m = relative_distance_2d(x, y, end_x, end_y);
+        if (terminal >= 0.0f && remaining_m > terminal - progress) {
+            float fraction = (terminal - progress) / remaining_m;
+            end_x = x + fraction * (end_x - x);
+            end_y = y + fraction * (end_y - y);
+            remaining_m = terminal - progress;
+        }
         if (to_travel_m <= remaining_m) {
             float t = to_travel_m / remaining_m;
             x += t * (end_x - x);
             y += t * (end_y - y);
             xs[count] = x;
             ys[count] = y;
+            progress += to_travel_m;
             count++;
             to_travel_m = spacing_m;
         } else {
             to_travel_m -= remaining_m;
             x = end_x;
             y = end_y;
+            progress += remaining_m;
             segment++;
         }
     }
@@ -2090,11 +2265,12 @@ int closest_navigation_goal(Drive *env, int agent_idx) {
         return -1;
     }
     const Navigation *navigation = env->navigation;
-    int navi_lane_idx = navigation->entity_to_navi_lane[agent->current_lane_idx];
-    float progress_m = lane_progress_m(&env->entities[agent->current_lane_idx], agent->x, agent->y);
     int best_goal_idx = -1;
     float best_distance_error_m = INFINITY;
     for (int goal_idx = 0; goal_idx < navigation->num_goals; goal_idx++) {
+        int navi_lane_idx = navigation_branch_lane(env, agent, goal_idx);
+        float progress_m =
+            lane_progress_m(&env->entities[navigation->lane_entity_idx[navi_lane_idx]], agent->x, agent->y);
         float lane_start_distance_m = navigation->distance_to_goal_m[goal_idx * navigation->num_lanes + navi_lane_idx];
         float remaining_distance_m = lane_start_distance_m - progress_m;
         if (lane_start_distance_m >= NAVI_UNREACHABLE_M || remaining_distance_m < env->goal_radius) {
@@ -3069,6 +3245,8 @@ void sample_new_goal(Drive *env, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
     if (env->navigation != NULL) {
         agent->navi_goal_idx = closest_navigation_goal(env, agent_idx);
+        agent->navi_lane_idx = -1;
+        update_navigation_state(env, agent_idx);
         if (agent->navi_goal_idx != -1) {
             agent->goal_position_x = env->navigation->goal_x[agent->navi_goal_idx];
             agent->goal_position_y = env->navigation->goal_y[agent->navi_goal_idx];

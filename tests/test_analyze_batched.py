@@ -17,6 +17,10 @@ class TestAnalyzeBatched(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
+        self.artifacts = self.directory / "artifacts"
+        artifacts_patch = patch.object(batched, "ARTIFACTS_DIR", self.artifacts)
+        artifacts_patch.start()
+        self.addCleanup(artifacts_patch.stop)
         self.checkpoint = self.directory / "model.pt"
         self.base = {"env": {"dynamics_model": "classic", "navigation": 0}, "load_id": "training-run"}
 
@@ -36,6 +40,75 @@ class TestAnalyzeBatched(unittest.TestCase):
         (self.directory / "another.pt").touch()
         with self.assertRaisesRegex(ValueError, "expected one model checkpoint, found 2"):
             batched.download_checkpoint(api, RUN)
+
+    def test_reuses_verified_cached_artifacts(self):
+        for cached in (self.artifacts / f"{RUN}:v0", self.artifacts / "ssuuqvs3:v0"):
+            with self.subTest(cached=cached):
+                cached.mkdir(parents=True)
+                checkpoint = cached / "model.pt"
+                checkpoint.touch()
+                api = Mock()
+                self.assertEqual(batched.download_checkpoint(api, RUN), checkpoint)
+                api.artifact.return_value.verify.assert_called_once_with(root=str(cached))
+                api.artifact.return_value.download.assert_not_called()
+                checkpoint.unlink()
+                cached.rmdir()
+
+    def test_invalid_cached_artifact_is_downloaded_again(self):
+        cached = self.artifacts / f"{RUN}:v0"
+        cached.mkdir(parents=True)
+        api = Mock()
+        artifact = api.artifact.return_value
+
+        def download(**kwargs):
+            checkpoint = cached / "model.pt"
+            checkpoint.write_bytes(b"fresh model")
+            return str(cached)
+
+        artifact.download.side_effect = download
+        for error in (ValueError("digest mismatch"), FileNotFoundError("missing model")):
+            with self.subTest(error=error):
+                artifact.verify.side_effect = error
+                self.assertEqual(batched.download_checkpoint(api, RUN).read_bytes(), b"fresh model")
+                artifact.download.assert_called_with(root=str(cached))
+
+    def test_no_cached_forces_fresh_download_and_persists_it(self):
+        cached = self.artifacts / f"{RUN}:v0"
+        cached.mkdir(parents=True)
+        checkpoint = cached / "model.pt"
+        checkpoint.write_bytes(b"old model")
+        api = Mock()
+        artifact = api.artifact.return_value
+
+        def download(root, skip_cache):
+            self.assertTrue(skip_cache)
+            self.assertNotEqual(Path(root), cached)
+            self.assertEqual(list(Path(root).iterdir()), [])
+            (Path(root) / "model.pt").write_bytes(b"fresh model")
+            return root
+
+        artifact.download.side_effect = download
+        result = batched.download_checkpoint(api, RUN, no_cached=True)
+        self.assertEqual(result, checkpoint)
+        self.assertEqual(result.read_bytes(), b"fresh model")
+        artifact.verify.assert_not_called()
+        artifact.download.assert_called_once()
+        self.assertFalse(Path(artifact.download.call_args.kwargs["root"]).exists())
+        self.assertEqual(batched.download_checkpoint(api, RUN), checkpoint)
+        self.assertEqual(artifact.download.call_count, 1)
+
+    def test_incomplete_forced_download_preserves_existing_checkpoint(self):
+        cached = self.artifacts / f"{RUN}:v0"
+        cached.mkdir(parents=True)
+        checkpoint = cached / "model.pt"
+        checkpoint.write_bytes(b"old model")
+        api = Mock()
+        artifact = api.artifact.return_value
+        artifact.download.side_effect = lambda root, skip_cache: root
+        with self.assertRaisesRegex(ValueError, "expected one model checkpoint, found 0"):
+            batched.download_checkpoint(api, RUN, no_cached=True)
+        self.assertEqual(checkpoint.read_bytes(), b"old model")
+        self.assertFalse(Path(artifact.download.call_args.kwargs["root"]).exists())
 
     def test_checkpoint_dynamics_are_preserved(self):
         self.save_config({"dynamics_model": "jerk", "navigation": 1})
@@ -68,6 +141,8 @@ class TestAnalyzeBatched(unittest.TestCase):
         args = batched.parse_args([RUN, other, "--dynamics", RUN, "classic", "--dynamics", other, "jerk"])
         self.assertEqual(args.runs, [RUN, other])
         self.assertEqual(args.dynamics, {RUN: "classic", other: "jerk"})
+        self.assertFalse(args.no_cached)
+        self.assertTrue(batched.parse_args([RUN, "--no-cached"]).no_cached)
         for arguments in (
             ["invalid"],
             [RUN, "--dynamics", other, "classic"],
@@ -132,26 +207,27 @@ class TestAnalyzeBatched(unittest.TestCase):
             patch.object(batched.sys, "argv", original_argv),
             patch.object(batched, "load_config", side_effect=load_base_config),
             patch.object(batched.wandb, "Api"),
-            patch.object(batched, "download_checkpoint", return_value=self.checkpoint),
+            patch.object(batched, "download_checkpoint", return_value=self.checkpoint) as download_checkpoint,
             patch.object(batched, "load_env") as load_env,
             patch.object(batched, "load_policy") as load_policy,
             patch.object(batched, "CheckpointEvaluator"),
             patch.object(batched, "run_mode", side_effect=rollout) as run_mode,
         ):
-            df = batched.main([*paths, "--output-csv", str(output)])
+            df = batched.main([*paths, "--no-cached", "--output-csv", str(output)])
             self.assertIs(batched.sys.argv, original_argv)
         rows = df.to_dict("records")
-        self.assertEqual(len(batched.pd.read_csv(output)), 10)
+        self.assertEqual(len(batched.pd.read_csv(output)), 8)
         self.assertEqual(load_policy.call_count, 2)
         self.assertEqual(load_env.return_value.close.call_count, 2)
-        self.assertEqual(run_mode.call_count, 10)
+        self.assertEqual(run_mode.call_count, 8)
+        self.assertEqual(download_checkpoint.call_count, 2)
+        for call in download_checkpoint.call_args_list:
+            self.assertTrue(call.kwargs["no_cached"])
         self.assertEqual({row["run_path"] for row in rows}, set(paths))
-        self.assertEqual(
-            {row["mode"] for row in rows}, {"sp_train", "sp_val", "hr_val", "hr_interactive", "idm_interactive"}
-        )
-        idm_call = run_mode.call_args
-        self.assertEqual(idm_call.kwargs["controller_overrides"]["non_sdc_controller"], "idm")
-        self.assertEqual(idm_call.kwargs["total_eval_agents"], batched.NUM_TOTAL_INTERACTIVE_EVAL_AGENTS)
+        self.assertEqual({row["mode"] for row in rows}, {"sp_train", "sp_val", "hr_val", "hr_interactive"})
+        interactive_call = run_mode.call_args
+        self.assertIsNone(interactive_call.kwargs["controller_overrides"])
+        self.assertEqual(interactive_call.kwargs["total_eval_agents"], batched.NUM_TOTAL_INTERACTIVE_EVAL_AGENTS)
         self.assertFalse({"sp_maps", "is_regularized", "anchor_maps"} & rows[0].keys())
 
 
