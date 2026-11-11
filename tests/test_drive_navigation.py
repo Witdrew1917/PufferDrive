@@ -277,6 +277,49 @@ class TestNavigationSplits(unittest.TestCase):
         line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT "))
         return json.loads(line[len("RESULT ") :])
 
+    def run_reward_steps(self, scenario):
+        args = [self.harness, str(self.map_path), "5", "0", "0", "-1", str(self.navi["object_goal_idx"][0]), scenario]
+        completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=30)
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT "))
+        return json.loads(line[len("RESULT ") :])
+
+    def test_progress_reward_each_forward_step_and_branch_change(self):
+        for scenario in ("progress", "branch"):
+            with self.subTest(scenario=scenario):
+                result = self.run_reward_steps(scenario)
+                self.assertEqual(result["rewards"], [0.5, 0.5, 0.0, 0.5, 0.5, 0.0])
+                self.assertEqual(result["episode_return"], 2.0)
+
+    def test_progress_reward_stops_on_failure_and_stays_stopped(self):
+        for scenario in ("collision", "offroad", "offroute"):
+            with self.subTest(scenario=scenario):
+                result = self.run_reward_steps(scenario)
+                self.assertEqual(result["rewards"], [0.5, 0.0, 0.0, 0.0, 0.0, 0.0])
+                self.assertEqual(result["episode_return"], 0.5)
+
+    def test_progress_reward_requires_new_closest_distance(self):
+        result = self.run_reward_steps("retrace")
+        self.assertEqual(result["rewards"], [0.5, 0.5, 0.0, 0.0, 0.5, 0.5])
+        self.assertEqual(result["episode_return"], 2.0)
+
+    def test_progress_baseline_resets_for_new_goal(self):
+        result = self.run_reward_steps("newgoal_reset")
+        self.assertEqual(result["rewards"][:4], [0.5, 2.0, 0.0, 0.5])
+
+    def test_progress_baseline_and_failure_reset_for_new_episode(self):
+        result = self.run_reward_steps("collision_reset")
+        self.assertEqual(result["rewards"], [0.5, 0.0, 0.5, 0.5, 0.5, 0.0])
+
+    def test_progress_reward_includes_step_reaching_goal(self):
+        for scenario in ("goal", "newgoal", "removegoal"):
+            with self.subTest(scenario=scenario):
+                result = self.run_reward_steps(scenario)
+                self.assertEqual(result["rewards"][:2], [0.5, 2.5])
+                if scenario != "newgoal":
+                    self.assertEqual(result["rewards"][2:], [0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(self.run_reward_steps("collisiongoal")["rewards"][:2], [0.5, 2.0])
+
     def test_shorter_branch_drives_waypoints_renderers_and_metrics(self):
         result = self.run_harness(previous=1)
         self.assertEqual((result["physical"], result["selected"]), (1, 0))

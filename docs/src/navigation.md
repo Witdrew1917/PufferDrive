@@ -143,9 +143,12 @@ Every step, for each controlled agent:
    anchor and state. No goal means normal geometric matching.
 3. **Navigation state** (`update_navigation_state`): from the selected anchor's lane-start table values minus the
    agent's projected progress, compute remaining distance, off-route status, and left / center / right feasibility.
-   These retain their original lane-change-aware semantics; only split ranking excludes lane changes. Reassigning
-   sibling anchors rebases the progress-reward comparison so selection alone cannot earn progress reward.
+   These retain their original lane-change-aware semantics; only split ranking excludes lane changes. When sibling
+   anchors change, progress is measured on the new anchor for both positions, so movement still counts but
+   selection alone cannot earn progress reward.
    Side feasibility uses projection onto the selected anchor's neighbouring lane.
+   The progress reward requires a new closest navigation distance for the current goal; retracing a route does not
+   earn the same progress again. The closest distance is initialized again when a new goal is sampled.
 4. **Goals**: at reset each agent gets its logged goal (`object_goal_idx`). When a new goal is sampled
    (`sample_new_goal`, e.g. goal behavior 1), it is snapped to the reachable sidecar goal whose route distance is
    closest to `goal_target_distance`, resolving ambiguous branches for each prospective goal without changing
