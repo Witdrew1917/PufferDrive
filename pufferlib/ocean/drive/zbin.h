@@ -1,8 +1,8 @@
 // Loader and navigation runtime for zpufferdrive ("zdrive") v14 map binaries.
 //
 // Scene (Sections 1-2) is loaded into PufferDrive entities; the navigation data (Sections 3-4) is loaded into a
-// ZNavigation that reproduces zdrive's non-expert navigation (lane localization, route lookup, NaviWalk lookahead)
-// exactly. Ports cite the zpufferdrive source they mirror (paths relative to zpufferdrive/ocean/zdrive/).
+// ZNavigation following zdrive's non-expert navigation, with lane candidates ranked by the projected route sample.
+// Ports cite the zpufferdrive source they mirror (paths relative to zpufferdrive/ocean/zdrive/).
 // Included from drive.h right after struct Drive.
 
 #define MAP_FORMAT_LEGACY 0
@@ -858,7 +858,7 @@ static int znavi_lane_entity_index(const Drive *env, int entity_idx, int waypoin
     if (table == NULL)
         return -1;
     int num_segments = env->entities[entity_idx].array_size - 1;
-    if (waypoint_idx >= num_segments || goal_index < 0 || goal_index >= zn->num_goals)
+    if (waypoint_idx < 0 || waypoint_idx >= num_segments || goal_index < 0 || goal_index >= zn->num_goals)
         return -1;
     int navi_idx = table[waypoint_idx + num_segments * goal_index];
     if (navi_idx < 0 || navi_idx >= zn->total)
@@ -866,24 +866,23 @@ static int znavi_lane_entity_index(const Drive *env, int entity_idx, int waypoin
     return navi_idx;
 }
 
-// zdrive_agent_obs.c lane_has_navi_route + lane_navi_route_distance_to_goal: 1 and the first reachable sample's
-// distance when the lane segment carries a route to the goal.
-static int znavi_lane_route(const Drive *env, int entity_idx, int waypoint_idx, int goal_index, float *out_distance) {
+// Resolve the same projected sub-segment for candidate selection and navigation state.
+static int znavi_lane_point(const Drive *env, const Entity *agent, int entity_idx, int waypoint_idx, int goal_index,
+                            int *out_navi_idx) {
     const ZNavigation *zn = env->znavigation;
     int navi_idx = znavi_lane_entity_index(env, entity_idx, waypoint_idx, goal_index);
     if (navi_idx < 0)
-        return 0;
-    int num_points = znavi_num_points(zn, navi_idx);
-    if (num_points < 2)
-        return 0;
-    const float *distance = &zn->distance_to_goal[znavi_sample_base(zn, navi_idx)];
-    for (int s = 0; s < num_points - 1; s++) {
-        if (distance[s] < (ZNAVI_UNREACHABLE_DISTANCE - 0.01F)) {
-            *out_distance = distance[s];
-            return 1;
-        }
-    }
-    return 0;
+        return -1;
+    int navi_line_size = znavi_num_points(zn, navi_idx) - 1;
+    if (navi_line_size <= 0)
+        return -1;
+    const Entity *lane = &env->entities[entity_idx];
+    float t = znavi_projection_scalar(agent->x, agent->y, lane->traj_x[waypoint_idx], lane->traj_y[waypoint_idx],
+                                      lane->traj_x[waypoint_idx + 1], lane->traj_y[waypoint_idx + 1], 0);
+    float scaled = t * navi_line_size;
+    int point = (scaled > -2.0e9f && scaled < 2.0e9f) ? (int)scaled : INT32_MIN;
+    *out_navi_idx = navi_idx;
+    return ZB_CLAMP(point, 0, navi_line_size - 1);
 }
 
 // Non-expert localization of zdrive_agent_obs.c compute_agent_metrics (closest/routed lane selection,
@@ -923,9 +922,16 @@ static int znavi_localize(Drive *env, Entity *agent, float *out_distance_to_goal
             closest_lane_waypoint_idx = waypoint_idx;
             closest_speed_limit = road_entity->road_speed_limit;
         }
-        float route_distance;
-        if (dist < ZNAVI_MAX_NEARBY_LANE_DISTANCE &&
-            znavi_lane_route(env, entity_idx, waypoint_idx, goal_index, &route_distance)) {
+        int candidate_navi_idx;
+        int candidate_point =
+            dist < ZNAVI_MAX_NEARBY_LANE_DISTANCE
+                ? znavi_lane_point(env, agent, entity_idx, waypoint_idx, goal_index, &candidate_navi_idx)
+                : -1;
+        if (candidate_point >= 0) {
+            size_t sample = znavi_sample_base(zn, candidate_navi_idx) + ZB_MAX(candidate_point - 1, 0);
+            float route_distance = zn->distance_to_goal[sample];
+            if (!(route_distance < ZNAVI_UNREACHABLE_DISTANCE - 0.01F))
+                continue;
             int tied_with_best =
                 closest_navi_lane_entity_idx >= 0 && fabsf(dist - min_navi_lane_distance) <= ZNAVI_LANE_TIE_DISTANCE;
             int wins =
@@ -952,17 +958,12 @@ static int znavi_localize(Drive *env, Entity *agent, float *out_distance_to_goal
     float proj_x = agent->x;
     float proj_y = agent->y;
     if (closest_lane_entity_idx >= 0 && closest_lane_waypoint_idx >= 0) {
-        int navi_idx = znavi_lane_entity_index(env, closest_lane_entity_idx, closest_lane_waypoint_idx, goal_index);
-        if (navi_idx >= 0) {
-            const Entity *lane = &env->entities[closest_lane_entity_idx];
+        int navi_idx;
+        int point =
+            znavi_lane_point(env, agent, closest_lane_entity_idx, closest_lane_waypoint_idx, goal_index, &navi_idx);
+        if (point >= 0) {
             navi_entity_idx = navi_idx;
-            float t = znavi_projection_scalar(
-                agent->x, agent->y, lane->traj_x[closest_lane_waypoint_idx], lane->traj_y[closest_lane_waypoint_idx],
-                lane->traj_x[closest_lane_waypoint_idx + 1], lane->traj_y[closest_lane_waypoint_idx + 1], 0);
-            int navi_line_size = znavi_num_points(zn, navi_idx) - 1;
-            float scaled = t * navi_line_size;
-            int point = (scaled > -2.0e9f && scaled < 2.0e9f) ? (int)scaled : INT32_MIN; // x86 cvttss2si overflow
-            navi_point_idx = ZB_CLAMP(point, 0, navi_line_size - 1);
+            navi_point_idx = point;
             float x_a, y_a, x_b, y_b;
             znavi_point(zn, navi_idx, navi_point_idx, &x_a, &y_a);
             znavi_point(zn, navi_idx, navi_point_idx + 1, &x_b, &y_b);

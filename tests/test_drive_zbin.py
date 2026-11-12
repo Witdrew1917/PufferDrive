@@ -87,6 +87,32 @@ def write_zbin(path, num_goals=1):
     Path(path).write_bytes(struct.pack("<6I", 14, 4, *offsets) + section1 + section2 + section3 + section4)
 
 
+def write_lane_selection_zbin(path, distances, lane_ys=(0.0, 0.2), num_goals=1):
+    write_zbin(path)
+    original = Path(path).read_bytes()
+    _, _, section1_start, section2_start, _, _ = struct.unpack_from("<6I", original)
+    section1 = original[section1_start:section2_start]
+    section2 = bytearray(struct.pack("<i", len(lane_ys)))
+    section3 = bytearray(struct.pack("<3i", len(lane_ys), 0, 4))
+    for i, y in enumerate(lane_ys):
+        section2 += struct.pack("<3i", 4, 100 + i, 2)
+        section2 += struct.pack("<2f", 0.0, 20.0) + struct.pack("<2f", y, y) + bytes(8)
+        section2 += struct.pack("<2fi", 3.7, 10.0 + i, 0)
+        section3 += struct.pack("<3i", 100 + i, 0, 4)
+    section4 = bytearray(struct.pack("<i", num_goals))
+    for goal in range(num_goals):
+        for i, values in enumerate(distances):
+            entity = goal * len(lane_ys) + i
+            section4 += struct.pack("<4i", entity, entity, entity, entity)
+            section4 += struct.pack("<4i", 1, 2, 3, 4)
+            section4 += bytes(16) + struct.pack("<4f", *([20.0 + i * 10.0] * 4)) + bytes(16)
+            section4 += struct.pack("<4f", *values)
+    offsets = [24]
+    for section in (section1, section2, section3):
+        offsets.append(offsets[-1] + len(section))
+    Path(path).write_bytes(struct.pack("<6I", 14, 4, *offsets) + section1 + section2 + section3 + section4)
+
+
 ENV_SCRIPT = textwrap.dedent(
     """
     import json
@@ -218,6 +244,96 @@ class TestZbinEnv(unittest.TestCase):
         completed = self._run_env(navigation=0)
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("malformed zpufferdrive binary", completed.stdout + completed.stderr)
+
+
+class TestZbinLaneSelection(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        compiler = shutil.which("cc")
+        if compiler is None:
+            raise unittest.SkipTest("C compiler is required for lane selection tests")
+        cls.build_dir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.build_dir.cleanup)
+        cls.harness = str(Path(cls.build_dir.name) / "zbin_navigation_harness")
+        raylib = "raylib-5.5_macos" if sys.platform == "darwin" else "raylib-5.5_linux_amd64"
+        command = [
+            compiler,
+            "-O1",
+            "-D_GNU_SOURCE",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-I" + str(REPO_ROOT / "pufferlib/ocean/drive"),
+            "-I" + str(REPO_ROOT / raylib / "include"),
+            "-I" + str(REPO_ROOT / "inih-r62"),
+            str(REPO_ROOT / "tests/zbin_navigation_harness.c"),
+            "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
+            "-lm",
+            "-o",
+            cls.harness,
+        ]
+        subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "map_000.bin"
+
+    def probe(self, x=17.0, y=0.01, heading=0.0, goal=0, navigation=1):
+        completed = subprocess.run(
+            [
+                self.harness,
+                str(self.path),
+                "1",
+                "1",
+                "2",
+                "probe",
+                str(x),
+                str(y),
+                str(heading),
+                str(goal),
+                str(navigation),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return json.loads(next(line[7:] for line in completed.stdout.splitlines() if line.startswith("RESULT ")))
+
+    def test_projected_sample_selects_route_and_consistent_navigation_state(self):
+        write_lane_selection_zbin(self.path, [[10, 10, 200, 200], [100, 100, 30, 30]])
+        result = self.probe()
+        self.assertEqual((result["lane"], result["entity"], result["point"]), (101, 1, 3))
+        self.assertEqual((result["distance"], result["center"], result["speed_limit"]), (30, 30, 11))
+        self.assertEqual(result["previous_distance"], result["distance"])
+        self.assertGreater(result["waypoint_y"], 0)
+        self.assertEqual(result["off_route"], 0)
+        self.assertEqual(self.probe(navigation=0)["lane"], 101)
+        self.assertEqual(self.probe(x=2)["lane"], 100)
+        self.assertEqual(self.probe(x=10)["lane"], 100)
+
+    def test_reachability_is_checked_at_projection_and_falls_back_to_geometry(self):
+        write_lane_selection_zbin(self.path, [[10, 10, 2000, 2000], [100, 100, 30, 30]])
+        self.assertEqual(self.probe()["lane"], 101)
+        write_lane_selection_zbin(self.path, [[10, 10, 2000, 2000], [100, 100, 2000, 2000]])
+        fallback = self.probe()
+        self.assertEqual((fallback["lane"], fallback["entity"], fallback["off_route"]), (100, 0, 1))
+        self.assertEqual(self.probe(goal=-1)["lane"], 100)
+        self.assertEqual(self.probe(goal=5)["lane"], 100)
+        write_lane_selection_zbin(self.path, [[10] * 4, [30] * 4], num_goals=0)
+        self.assertEqual(self.probe(goal=-1)["lane"], 100)
+
+    def test_route_preference_respects_distance_and_heading_limits(self):
+        write_lane_selection_zbin(self.path, [[200] * 4, [30] * 4], lane_ys=(0, 1.5))
+        self.assertEqual(self.probe(y=0)["lane"], 100)
+        write_lane_selection_zbin(self.path, [[2000] * 4, [30] * 4], lane_ys=(0, 4.1))
+        self.assertEqual(self.probe(y=0)["lane"], 100)
+        write_lane_selection_zbin(self.path, [[200] * 4, [30] * 4])
+        self.assertEqual(self.probe(heading=np.pi)["lane"], -1)
+
+    def test_projected_ranking_does_not_depend_on_closer_lane_order(self):
+        write_lane_selection_zbin(self.path, [[100, 100, 30, 30], [10, 10, 200, 200]], lane_ys=(0.2, 0))
+        self.assertEqual(self.probe()["lane"], 100)
 
 
 class TestZbinParity(unittest.TestCase):

@@ -3,8 +3,8 @@
 Lane navigation gives agents a lane-level route to their goal. There are two backends, chosen by the map format:
 
 - **Legacy PufferDrive maps** use a precomputed `map_XXX.navi` sidecar next to every `map_XXX.bin` (see [Sidecars](#sidecars)).
-- **zpufferdrive (zdrive) v14 maps** carry their own routes, and PufferDrive reproduces zdrive's navigation exactly
-  (see [zpufferdrive maps](#zpufferdrive-maps)).
+- **zpufferdrive (zdrive) v14 maps** carry their own routes; PufferDrive follows zdrive's navigation with a
+  projected-distance lane-selection refinement (see [zpufferdrive maps](#zpufferdrive-maps)).
 
 Navigation data is **loaded whenever it is present** (sidecar or built-in sections). It then drives the
 `navi_*` metrics and the render overlay. Agents only **use** it when `navigation = 1`. With `navigation = 0`
@@ -196,12 +196,13 @@ right feasibility (capped at 500 m). The loader validates every index and reject
 with `malformed zpufferdrive binary`.
 
 Each step, for each agent with a route, PufferDrive follows zdrive's non-expert path (`compute_agent_metrics` in
-`zdrive_agent_obs.c`). Every port cites its zdrive source in a comment.
+`zdrive_agent_obs.c`), except for the projected-distance refinement below.
 
 1. **Localize**: find the closest lane, with a 1000 m penalty for lanes whose heading differs by more than 60°.
    Among lanes within 4 m, prefer those routed to the agent's goal. Near-ties (within 0.75 m) go to the shorter
-   distance to goal. Candidates come from the same spatial grid and in the same order as zdrive, since the
-   tie-break depends on it.
+   distance to goal at the projected sample. Unlike zdrive's first-reachable-sample ranking, a candidate is
+   reachable only if that projected sample is reachable. If none qualifies, use the geometric match.
+   Candidates come from the same spatial grid and in the same order as zdrive, since the tie-break depends on it.
 2. **Look up** the navi entity and point on that lane. `distance_to_goal` and feasibility are read at point
    `max(p - 1, 0)`. Values of 1999.99 m or more, or a failed lookup, mean unreachable: 0 feasibility and
    2000 m distance (`navi_off_route`).
@@ -305,7 +306,8 @@ rejection.
 route-end padding, `navigation = 0` ignoring loaded routes, unmoved goals, config validation and truncated-file
 rejection. Its parity test compiles `tests/zdrive_navigation_oracle.c` against a zpufferdrive checkout and
 `tests/zbin_navigation_harness.c` against PufferDrive. Both teleport every object to each logged pose and print
-`distance_to_goal`, feasibility and the lookahead with `%.9g`, and the outputs must match byte for byte. Configure it
-with `ZPUFFERDRIVE_ROOT` (default `~/Repositories/zpufferdrive`), `ZBIN_MAP_DIR` (default
+`distance_to_goal`, feasibility and the lookahead with `%.9g`. The existing real-map fixture outputs match byte for
+byte; other maps may differ where projected-sample lane selection differs from zdrive. Configure it with
+`ZPUFFERDRIVE_ROOT` (default `~/Repositories/zpufferdrive`), `ZBIN_MAP_DIR` (default
 `~/Data/zpufferdrive/waymo_binaries/interactive_1k`) and `ZBIN_PARITY_MAPS` (default 20). It is skipped when these
 are missing.
