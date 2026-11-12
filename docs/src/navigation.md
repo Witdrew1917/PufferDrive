@@ -1,16 +1,24 @@
 # Lane navigation
 
-Lane navigation gives agents a lane-level route to their goal. It is **opt-in**: with `navigation = 0` (default) the
-environment, observations and policy are identical to a build without it.
+Lane navigation gives agents a lane-level route to their goal. There are two backends, chosen by the map format:
+
+- **Legacy PufferDrive maps** use a precomputed `map_XXX.navi` sidecar next to every `map_XXX.bin` (see [Sidecars](#sidecars)).
+- **zpufferdrive (zdrive) v14 maps** carry their own routes, and PufferDrive reproduces zdrive's navigation exactly
+  (see [zpufferdrive maps](#zpufferdrive-maps)).
+
+Navigation data is **loaded whenever it is present** (sidecar or built-in sections). It then drives the
+`navi_*` metrics and the render overlay. Agents only **use** it when `navigation = 1`. With `navigation = 0`
+(default), observations, rewards, goals and the policy are identical to a run without navigation data.
 
 With `navigation = 1` the environment:
 
-- loads a precomputed `map_XXX.navi` sidecar next to every `map_XXX.bin`,
 - tracks each agent's current lane, distance to goal and lane feasibility,
 - extends the **ego observation by 3** (left / center / right lane feasibility),
-- appends a **route-waypoint stream** (`navigation_waypoints` × 3 floats) to the observation,
-- snaps newly sampled goals to sidecar goal lanes,
-- logs navigation metrics and draws a navigation overlay when rendering.
+- appends a **route-waypoint stream** to the observation (`navigation_waypoints` × 3 floats for legacy maps,
+  × 2 for zpufferdrive maps),
+- enables the `reward_progress_navi` reward,
+- for legacy maps only, snaps newly sampled goals to sidecar goal lanes. zpufferdrive goals are never moved by
+  navigation.
 
 ## Quick start
 
@@ -36,13 +44,16 @@ The C extension needs no rebuild when switching `navigation` on or off; all sett
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `navigation` | `0` | `1` enables lane navigation. Requires a `.navi` sidecar for every map in `map_dir`. |
-| `navigation_waypoints` | `16` | Route waypoints observed per agent, in `[1, 64]` (`NAVI_MAX_WAYPOINTS`). |
-| `navigation_waypoint_spacing` | `5.0` | Metres between consecutive waypoints along the route (> 0). |
+| `navigation` | `0` | `1` lets agents use navigation. Legacy maps then need a `.navi` sidecar for every map in `map_dir`. |
+| `navigation_waypoints` | `16` | Route waypoints observed per agent: `[1, 64]` (`NAVI_MAX_WAYPOINTS`) for legacy maps, `[1, 50]` (`NAVI_LOOKAHEAD_WAYPOINTS_MAX`) for zpufferdrive maps. |
+| `navigation_waypoint_spacing` | `5.0` | Legacy maps: metres between consecutive waypoints along the route (> 0). |
+| `navigation_lookahead_distance` | `120.0` | zpufferdrive maps: route arclength covered by the waypoints, in metres. Must satisfy `0 < distance <= navigation_lookahead_norm`. |
+| `navigation_lookahead_norm` | `150.0` | zpufferdrive maps: metres that waypoint coordinates are divided by. |
 
 > [!IMPORTANT]
-> `navigation` and `navigation_waypoints` change the observation size. A policy trained with one setting cannot be
-> loaded with another. `navigation_waypoint_spacing` keeps the shape but changes the meaning of the inputs.
+> `navigation`, `navigation_waypoints` and the map format change the observation size. A policy trained with one
+> setting cannot be loaded with another. `navigation_waypoint_spacing`, `navigation_lookahead_distance` and
+> `navigation_lookahead_norm` keep the shape but change the meaning of the inputs.
 
 ## Sidecars
 
@@ -59,7 +70,8 @@ python -m pufferlib.ocean.drive.drive navigation --map-dir <map_dir> [--workers 
 
 Each sidecar stores a CRC-32 and the byte size of its `.bin`. If a map is regenerated, its sidecar becomes stale and
 environment creation aborts with a fingerprint mismatch. Rebuild with `--overwrite`. Creating an env with
-`navigation = 1` also fails early, with the command to run, if any map lacks a sidecar.
+`navigation = 1` also fails early, with the command to run, if any map lacks a sidecar. Sidecars that exist are
+also loaded (and validated) with `navigation = 0`, for metrics and rendering.
 
 Split-aware navigation and overlapping goal terminals require version 4 sidecars. Regenerate older sidecars with
 `--overwrite` and rebuild the native extension; map binaries and policy observation shapes do not change.
@@ -155,23 +167,77 @@ Every step, for each controlled agent:
    agent state during comparison. If no sidecar goal is reachable, the normal lane-point sampling is used and
    the agent has no navigation goal.
 
+## zpufferdrive maps
+
+zpufferdrive v14 binaries (`map_XXX.bin` written by zpufferdrive's `scripts/python/process_maps.py`) are detected
+automatically: the file starts with version 14, at least 4 section offsets, and the offsets are increasing and
+within the file. The format of a map directory is taken from `map_000.bin`; all maps in it must share that format.
+`pufferlib/ocean/drive/zbin.h` holds the loader and the navigation runtime. No sidecar or conversion is needed.
+
+### Scene
+
+Sections 1 and 2 populate the agents and roads:
+
+- Object types: vehicle, pedestrian and cyclist keep their type. Motorcyclist becomes cyclist.
+- Road types: solid road line becomes road line, and road edge, stop sign, crosswalk, speed bump and driveway are
+  shifted down by one to PufferDrive's numbering. Each road keeps its `speed_limit`, which only navigation uses.
+- Each object's goal is its last valid logged position, as in legacy PufferDrive maps (the scenario JSON
+  `goalPosition`). zdrive's route-snapped `goal_x`, `goal_y` is ignored, so a route (`goal_index`, which is kept) can
+  end a few metres from the goal. Objects with a non-zero `expert_type`, and zombies, are marked as experts and replay
+  their logs. Expert-action arrays are filled with -1.
+- Up to 128 objects are loaded. `scenario_id` is truncated to 16 characters. Hybrid-action and turn-indicator data
+  are ignored.
+
+### Navigation runtime
+
+Sections 3 and 4 hold, per goal, a route graph over sub-sampled lane segments ("navi entities"). Each sample has a
+next hop (which may move to another lane or mid-lane), the remaining distance to the goal, and left / center /
+right feasibility (capped at 500 m). The loader validates every index and rejects truncated or trailing-byte files
+with `malformed zpufferdrive binary`.
+
+Each step, for each agent with a route, PufferDrive follows zdrive's non-expert path (`compute_agent_metrics` in
+`zdrive_agent_obs.c`). Every port cites its zdrive source in a comment.
+
+1. **Localize**: find the closest lane, with a 1000 m penalty for lanes whose heading differs by more than 60°.
+   Among lanes within 4 m, prefer those routed to the agent's goal. Near-ties (within 0.75 m) go to the shorter
+   distance to goal. Candidates come from the same spatial grid and in the same order as zdrive, since the
+   tie-break depends on it.
+2. **Look up** the navi entity and point on that lane. `distance_to_goal` and feasibility are read at point
+   `max(p - 1, 0)`. Values of 1999.99 m or more, or a failed lookup, mean unreachable: 0 feasibility and
+   2000 m distance (`navi_off_route`).
+3. **Goals**: the agent keeps its original route, including after `goal_behavior = 1` resamples the visible goal
+   with the normal (non-snapping) lane-point sampler, as zdrive does. `reward_progress_navi` is driven by
+   `distance_to_goal`.
+
 ## Observations
 
 Layout with `navigation = 1`:
 
 ```
-[ ego (dynamics ego + 3) | partners ((MAX_AGENTS-1) × 7) | roads (128 × 7) | waypoints (navigation_waypoints × 3) ]
+[ ego (dynamics ego + 3) | partners ((MAX_AGENTS-1) × 7) | roads (128 × 7) | waypoints (navigation_waypoints × F) ]
 ```
 
-The partner and road blocks keep their offsets. Waypoints come last.
+`F` (`env.waypoint_features`) is 3 for legacy maps and 2 for zpufferdrive maps. The partner and road blocks keep
+their offsets. Waypoints come last.
 
 ### Ego: lane feasibility (+3)
 
-The last 3 ego features are `left, center, right` = `min(feasibility_m / 200, 1)`: how far (up to a 200 m horizon) the
-agent can stay in that lane and still reach its goal. 0 means the lane doesn't exist, isn't allowed or doesn't lead
-to the goal. All three are 0 when the agent has no navigation goal.
+The last 3 ego features are `left, center, right` lane feasibility: how far the agent can stay in that lane and
+still reach its goal. 0 means the lane doesn't exist, isn't allowed or doesn't lead to the goal. All three are 0
+when the agent has no navigation goal.
 
-### Waypoints (`navigation_waypoints` × 3)
+- Legacy maps: `min(feasibility_m / 200, 1)`, a 200 m horizon.
+- zpufferdrive maps: `clamp(feasibility_m / speed_limit / 30, 0, 1)`, time at the current lane's speed limit over a
+  30 s horizon. All three are 0 when the lane has no speed limit.
+
+### Waypoints, zpufferdrive maps (`navigation_waypoints` × 2)
+
+Per waypoint: `x_forward, y_left`, in the ego frame and divided by `navigation_lookahead_norm`. Waypoint `w`
+(0-based) lies `(w + 1) × navigation_lookahead_distance / navigation_waypoints` metres along the route from the
+agent's localized navi point, following the route's next hops (zdrive's `NaviWalk`). Slots beyond the route end,
+and all slots for agents without a route, are `(0, 0)`. There is no valid flag.
+
+### Waypoints, legacy maps (`navigation_waypoints` × 3)
 
 Per waypoint: `rel_x, rel_y, valid`. Positions are in the ego frame and scaled by 0.02, like partner and road
 features.
@@ -194,7 +260,7 @@ Unused slots, and all slots for agents without a goal or off route, are zero (`v
 The `Drive` policy reads `env.max_waypoints` and `env.waypoint_features`. When navigation is on it adds a fourth
 branch next to the ego, partner and road encoders:
 
-- `waypoint_encoder`: a shared per-waypoint `Linear(3, input_size) → LayerNorm → Linear(input_size, input_size)`,
+- `waypoint_encoder`: a shared per-waypoint `Linear(F, input_size) → LayerNorm → Linear(input_size, input_size)`,
   max-pooled over waypoints.
 - `shared_embedding` input grows from `3 × input_size` to `4 × input_size`.
 
@@ -205,17 +271,17 @@ The C demo policy (`drivenet.h`, used by `drive.c`) has no waypoint branch and r
 
 ## Metrics
 
-Logged only with `navigation = 1`:
+Logged whenever navigation data is loaded:
 
 - `navi_goal_active_rate`: fraction of agent-steps with a navigation goal.
 - `navi_off_route_rate`: fraction of agent-steps on a lane from which the goal is unreachable.
 
 ## Rendering
 
-With navigation enabled the renderer draws, for the selected agent:
+When navigation data is loaded the renderer draws, for the selected agent:
 
 - lanes coloured by feasibility toward its goal (red → green, grey = unreachable),
-- its `next_lane` route from the resolved navigation anchor in cyan,
+- its route in cyan: legacy `next_lane` from the resolved navigation anchor, or the zdrive route lookahead,
 - its observed route waypoints (small spheres),
 - its goal.
 
@@ -228,8 +294,18 @@ The observation-only view also decodes the waypoint block. `scripts/render_navig
 ## Tests
 
 ```bash
-python -m pytest tests/test_drive_navigation.py -q
+python -m unittest tests.test_drive_navigation tests.test_drive_zbin
 ```
 
-The tests cover sidecar topology and round trip, `next_lane` termination, road-edge-blocked lane changes, reader
-validation, observation sizes, waypoint count and spacing, lane-change waypoints and stale-sidecar rejection.
+`test_drive_navigation` covers sidecar topology and round trip, `next_lane` termination, road-edge-blocked lane
+changes, reader validation, observation sizes, waypoint count and spacing, lane-change waypoints and stale-sidecar
+rejection.
+
+`test_drive_zbin` covers zpufferdrive maps on a synthetic binary: format detection, observation sizes and values,
+route-end padding, `navigation = 0` ignoring loaded routes, unmoved goals, config validation and truncated-file
+rejection. Its parity test compiles `tests/zdrive_navigation_oracle.c` against a zpufferdrive checkout and
+`tests/zbin_navigation_harness.c` against PufferDrive. Both teleport every object to each logged pose and print
+`distance_to_goal`, feasibility and the lookahead with `%.9g`, and the outputs must match byte for byte. Configure it
+with `ZPUFFERDRIVE_ROOT` (default `~/Repositories/zpufferdrive`), `ZBIN_MAP_DIR` (default
+`~/Data/zpufferdrive/waymo_binaries/interactive_1k`) and `ZBIN_PARITY_MAPS` (default 20). It is skipped when these
+are missing.

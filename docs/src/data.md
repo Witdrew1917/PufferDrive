@@ -50,6 +50,8 @@ The simulator reads the compact binary layout produced by `save_map_binary` in `
 - **Road elements**: Each road entry stores `scenario_id`, a remapped `type` (`4` lane, `5` road line, `6` road edge, `7` stop sign, `8` crosswalk, `9` speed bump, `10` driveway), `id`, `array_size` (#points), then `x/y/z` arrays of that length and scalars `width/length/height`, `goalPosition`, `mark_as_expert`. `save_map_binary` also simplifies long polylines (`len(geometry) > 10` and `type <= 16`) with a 0.1 area threshold to keep files small.
 - **Control hints**: `tracks_to_predict` and `mark_as_expert` influence which agents are controllable (`control_mode` in the simulator) versus replayed as experts or static actors (`set_active_agents` in `drive.h`).
 
+`load_map_binary` also reads [zpufferdrive binaries](#zpufferdrive-binaries); the format is detected per map directory.
+
 Refer to [Simulator](simulator.md) for how the binaries are consumed during resets, observation construction, and reward logging.
 
 ## Verifying data availability
@@ -59,11 +61,19 @@ Refer to [Simulator](simulator.md) for how the binaries are consumed during rese
 - With binaries in place, run `puffer train puffer_drive` from [Getting Started](getting-started.md) as a smoke test that the build, data, and bindings are wired together.
 - To inspect the binary output, convert a single JSON file with `load_map(<json>, <id>, <output_path>)` inside `drive.py`.
 
+## zpufferdrive binaries
+
+zpufferdrive (zdrive) v14 `map_XXX.bin` files, such as the Waymo binaries written by zpufferdrive's `scripts/python/process_maps.py`, can be used as a `map_dir` directly, with no conversion or sidecars. The format is detected from `map_000.bin`, and every map in the directory must use it. Agents, roads (with per-lane speed limits), goals (the last valid logged position, as in legacy maps) and zdrive's built-in navigation routes are loaded. Agents only see the routes with `navigation = 1`. See [Lane navigation](navigation.md#zpufferdrive-maps).
+
+```bash
+puffer train puffer_drive --env.map-dir ~/Data/zpufferdrive/waymo_binaries/interactive_1k --env.navigation 1
+```
+
 ## Navigation sidecars (optional)
 
 See [Lane navigation](navigation.md) for the full feature description.
 
-Lane-level navigation is stored next to each map as `map_XXX.navi` and is only read when `navigation = 1` in the `[env]` section of `drive.ini` (or `--env.navigation 1`). Generate the sidecars from existing bins (the bins are not modified):
+Lane-level navigation for legacy maps is stored next to each map as `map_XXX.navi`. Sidecars that exist are always loaded (for metrics and rendering), and they are required, and used by agents, when `navigation = 1` in the `[env]` section of `drive.ini` (or `--env.navigation 1`). Generate the sidecars from existing bins (the bins are not modified):
 
 ```bash
 python -m pufferlib.ocean.drive.drive navigation --map-dir resources/drive/binaries/training --workers 16

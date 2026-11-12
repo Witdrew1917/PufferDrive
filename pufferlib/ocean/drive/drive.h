@@ -206,7 +206,6 @@ static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 #define MAX_STEER 0.7f     // rad    — max effective steering angle
 #define YAW_ACCEL_MAX 8.0f // rad/s^2 — max change in yaw rate per second
 
-
 static int COLLECT_EXPERT_TELEPORT = 1;
 static float ACCELERATION_VALUES[NUM_ACCEL_BINS];
 static float STEERING_VALUES[NUM_STEER_BINS];
@@ -357,11 +356,11 @@ struct Entity {
     int removed;
 
     // Navigation (env->navigation loaded)
-    int navi_goal_idx;    // -1 when the agent has no navigation goal
-    int navi_off_route;   // 1: current lane cannot reach the navigation goal
+    int navi_goal_idx;         // -1 when the agent has no navigation goal
+    int navi_off_route;        // 1: current lane cannot reach the navigation goal
     int navi_off_route_sticky; // sticky version of the above, needed for reward
-    int navi_lane_idx;    // last known navi lane, -1 if never on a lane
-    int current_lane_idx; // closest aligned ROAD_LANE entity, -1 when off-lane (navigation only)
+    int navi_lane_idx;         // last known navi lane, -1 if never on a lane
+    int current_lane_idx;      // closest aligned ROAD_LANE entity, -1 when off-lane (navigation only)
     float navi_distance_to_goal_m;
     float prev_navi_distance_to_goal_m;
     float closest_navi_distance_to_goal_m;
@@ -370,6 +369,14 @@ struct Entity {
     float navi_feasibility_left_m;
     float navi_feasibility_center_m;
     float navi_feasibility_right_m;
+    // zpufferdrive (zbin) maps only
+    int zdrive_goal_index;  // goal_index from the zbin, -1 for legacy maps or no route
+    float road_speed_limit; // roads: lane speed limit (m/s)
+    int znavi_entity_idx;   // route edge the agent is projected onto, -1 when none
+    int znavi_point_idx;
+    float znavi_proj_x; // projection onto the route edge (agent position when none)
+    float znavi_proj_y;
+    float navi_speed_limit; // speed limit of the localized lane
     float a_long;
     float a_lat;
     float jerk_long;
@@ -649,6 +656,8 @@ static float navigation_terminal_progress(const Navigation *navigation, int goal
     return navigation->next_lane[idx] == -1 && distance < NAVI_UNREACHABLE_M ? distance : -1.0f;
 }
 
+typedef struct ZNavigation ZNavigation;
+
 struct Drive {
     Client *client;
     float *observations;
@@ -718,12 +727,24 @@ struct Drive {
     bool async_resets;
     IDMMap *idm_map;
     IDMAgentState *idm_agent_states;
-    int navigation_enabled;            // ini/kwarg `navigation`; requires map_XXX.navi sidecars
+    int navigation_enabled;            // ini/kwarg `navigation`; legacy maps require map_XXX.navi sidecars
     int navigation_waypoints;          // route waypoints in the observation when navigation_enabled
     float navigation_waypoint_spacing; // metres between consecutive route waypoints
-    Navigation *navigation;            // NULL unless navigation_enabled
+    Navigation *navigation;            // legacy map_XXX.navi sidecar, NULL when absent
     float goal_obs_dropout_prob;
+    int map_format;                      // MAP_FORMAT_LEGACY or MAP_FORMAT_ZBIN
+    ZNavigation *znavigation;            // zbin navigation sections, NULL for legacy maps
+    float navigation_lookahead_distance; // zbin: route arclength covered by the waypoints (m)
+    float navigation_lookahead_norm;     // zbin: waypoint coordinate normalisation (m)
 };
+
+#include "zbin.h"
+
+// Navigation data is loaded whenever available (metrics, rendering); agents only observe it, are rewarded by it and
+// have goals driven by it when navigation_enabled.
+static inline int navigation_loaded(const Drive *env) { return env->navigation != NULL || env->znavigation != NULL; }
+
+static inline int navigation_active(const Drive *env) { return env->navigation_enabled && navigation_loaded(env); }
 
 static void idm_load_extension(FILE *file, Drive *env);
 static void idm_shift_map(Drive *env, float mean_x, float mean_y);
@@ -830,6 +851,11 @@ void init_action_space() {
 }
 
 Entity *load_map_binary(const char *filename, Drive *env) {
+    if (drive_map_format(filename) == MAP_FORMAT_ZBIN) {
+        env->map_format = MAP_FORMAT_ZBIN;
+        return load_zbin_map(filename, env);
+    }
+    env->map_format = MAP_FORMAT_LEGACY;
     FILE *file = fopen(filename, "rb");
     if (!file)
         return NULL;
@@ -855,9 +881,10 @@ Entity *load_map_binary(const char *filename, Drive *env) {
     fread(&env->num_objects, sizeof(int), 1, file);
     fread(&env->num_roads, sizeof(int), 1, file);
     env->num_entities = env->num_objects + env->num_roads;
-    Entity *entities = (Entity *)malloc(env->num_entities * sizeof(Entity));
+    Entity *entities = (Entity *)calloc(env->num_entities, sizeof(Entity));
 
     for (int i = 0; i < env->num_entities; i++) {
+        entities[i].zdrive_goal_index = -1;
         // Read base entity data
         fread(&entities[i].scenario_id, sizeof(int), 1, file);
         fread(&entities[i].type, sizeof(int), 1, file);
@@ -1211,12 +1238,15 @@ static const char *navi_read_body(FILE *file, const Drive *env, Navigation *navi
     return error != NULL ? error : navi_validate_goals(env, navigation);
 }
 
-// Loads and validates map_XXX.navi against the loaded map; aborts on any error. Goals stay unshifted.
-Navigation *load_navigation_binary(Drive *env) {
+// Loads and validates map_XXX.navi against the loaded map. When `required`, aborts on a missing or invalid sidecar;
+// otherwise returns NULL for a missing one and warns about an invalid one. Goals stay unshifted.
+Navigation *load_navigation_binary(Drive *env, int required) {
     size_t map_name_length = strlen(env->map_name);
     size_t bin_suffix_length = strlen(".bin");
     if (map_name_length < bin_suffix_length ||
         strcmp(env->map_name + map_name_length - bin_suffix_length, ".bin") != 0) {
+        if (!required)
+            return NULL;
         raise_error_with_message(ERROR_INVALID_ARGUMENT, "navigation needs a .bin map path, got %s", env->map_name);
     }
     size_t stem_length = map_name_length - bin_suffix_length;
@@ -1227,6 +1257,10 @@ Navigation *load_navigation_binary(Drive *env) {
     }
     snprintf(path, path_length, "%.*s%s", (int)stem_length, env->map_name, NAVI_FILE_SUFFIX);
     FILE *file = fopen(path, "rb");
+    if (file == NULL && !required) {
+        free(path);
+        return NULL;
+    }
     if (file == NULL) {
         raise_error_with_message(ERROR_FILE_NOT_FOUND,
                                  "navigation=1 but sidecar %s is missing (python -m pufferlib.ocean.drive.drive "
@@ -1244,6 +1278,11 @@ Navigation *load_navigation_binary(Drive *env) {
     fclose(file);
     if (error != NULL) {
         free_navigation(navigation);
+        if (!required) {
+            fprintf(stderr, "Warning: ignoring invalid navigation sidecar %s: %s\n", path, error);
+            free(path);
+            return NULL;
+        }
         raise_error_with_message(ERROR_INITIALIZATION_FAILED, "invalid navigation sidecar %s: %s", path, error);
     }
     free(path);
@@ -1562,6 +1601,10 @@ int get_neighbor_cache_entities(Drive *env, int cell_idx, GridMapEntity *entitie
 }
 
 void set_means(Drive *env) {
+    if (env->map_format == MAP_FORMAT_ZBIN) {
+        zbin_set_means(env);
+        return;
+    }
     float mean_x = 0.0f;
     float mean_y = 0.0f;
     int64_t point_count = 0;
@@ -1997,7 +2040,7 @@ float navigation_feasibility_ahead_m(float lane_start_feasibility_m, float lane_
 
 void reset_navigation_state(Drive *env, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
-    agent->navi_goal_idx = env->navigation->object_goal_idx[agent_idx];
+    agent->navi_goal_idx = env->navigation != NULL ? env->navigation->object_goal_idx[agent_idx] : -1;
     agent->navi_off_route = 0;
     agent->navi_off_route_sticky = 0;
     agent->navi_lane_idx = -1;
@@ -2010,6 +2053,9 @@ void reset_navigation_state(Drive *env, int agent_idx) {
     agent->navi_feasibility_left_m = 0.0f;
     agent->navi_feasibility_center_m = 0.0f;
     agent->navi_feasibility_right_m = 0.0f;
+    if (env->znavigation != NULL) {
+        znavi_reset_navigation_state(env, agent_idx);
+    }
 }
 
 // Closest ROAD_LANE entity within NAVI_LANE_MAX_DISTANCE_M, penalising lanes whose heading differs by more than
@@ -2130,6 +2176,10 @@ static int navigation_sibling_lanes(const Navigation *navigation, int lane, int 
 
 // Refreshes goal distance and lane feasibility from the resolved anchor; off-lane keeps the last known state.
 void update_navigation_state(Drive *env, int agent_idx) {
+    if (env->znavigation != NULL) {
+        znavi_update_navigation_state(env, agent_idx);
+        return;
+    }
     Entity *agent = &env->entities[agent_idx];
     update_current_lane(env, agent_idx);
     if (agent->current_lane_idx == -1) {
@@ -2578,12 +2628,31 @@ void init(Drive *env) {
         env->async_resets = 1; // Default to async resets
     }
     env->navigation = NULL;
-    if (env->navigation_enabled) {
-        env->navigation = load_navigation_binary(env);
-        for (int goal_idx = 0; goal_idx < env->navigation->num_goals; goal_idx++) {
-            env->navigation->goal_x[goal_idx] -= env->world_mean_x;
-            env->navigation->goal_y[goal_idx] -= env->world_mean_y;
+    env->znavigation = NULL;
+    if (env->map_format == MAP_FORMAT_ZBIN) {
+        if (env->navigation_lookahead_distance <= 0.0f)
+            env->navigation_lookahead_distance = ZNAVI_DEFAULT_LOOKAHEAD_DISTANCE;
+        if (env->navigation_lookahead_norm <= 0.0f)
+            env->navigation_lookahead_norm = ZNAVI_DEFAULT_LOOKAHEAD_NORM;
+        if (env->navigation_enabled &&
+            (env->navigation_waypoints < 1 || env->navigation_waypoints > ZNAVI_LOOKAHEAD_WAYPOINTS_MAX ||
+             env->navigation_lookahead_distance > env->navigation_lookahead_norm)) {
+            raise_error_with_message(ERROR_INVALID_ARGUMENT,
+                                     "zpufferdrive navigation needs navigation_waypoints in [1, %d] and "
+                                     "0 < navigation_lookahead_distance <= navigation_lookahead_norm",
+                                     ZNAVI_LOOKAHEAD_WAYPOINTS_MAX);
         }
+        env->znavigation = load_znavigation(env);
+    } else {
+        env->navigation = load_navigation_binary(env, env->navigation_enabled);
+        if (env->navigation != NULL) {
+            for (int goal_idx = 0; goal_idx < env->navigation->num_goals; goal_idx++) {
+                env->navigation->goal_x[goal_idx] -= env->world_mean_x;
+                env->navigation->goal_y[goal_idx] -= env->world_mean_y;
+            }
+        }
+    }
+    if (navigation_loaded(env)) {
         for (int i = 0; i < env->active_agent_count; i++) {
             reset_navigation_state(env, env->active_agent_indices[i]);
         }
@@ -2626,6 +2695,8 @@ void c_close(Drive *env) {
     env->tracks_to_predict_indices = NULL;
     free_navigation(env->navigation);
     env->navigation = NULL;
+    free_znavigation(env->znavigation);
+    env->znavigation = NULL;
 }
 
 int ego_feature_count(const Drive *env) {
@@ -2634,7 +2705,10 @@ int ego_feature_count(const Drive *env) {
 }
 
 int waypoint_feature_count(const Drive *env) {
-    return env->navigation_enabled ? env->navigation_waypoints * NAVIGATION_WAYPOINT_FEATURES : 0;
+    if (!env->navigation_enabled)
+        return 0;
+    int features = env->map_format == MAP_FORMAT_ZBIN ? ZNAVI_WAYPOINT_FEATURES : NAVIGATION_WAYPOINT_FEATURES;
+    return env->navigation_waypoints * features;
 }
 
 // Layout: [ego | partners | road segments | navigation waypoints (navigation only)]
@@ -3089,8 +3163,8 @@ void compute_observations(Drive *env) {
         obs[REWARD_GOAL_IDX] = ego_entity->reward_goal_cond;
 
         // Other ego features
-        obs[4] = (!ego_entity->mask_goal) ? rel_goal_x * 0.005f: 0.0f;
-        obs[5] = (!ego_entity->mask_goal) ? rel_goal_y * 0.005f: 0.0f;
+        obs[4] = (!ego_entity->mask_goal) ? rel_goal_x * 0.005f : 0.0f;
+        obs[5] = (!ego_entity->mask_goal) ? rel_goal_y * 0.005f : 0.0f;
         obs[6] = signed_speed / MAX_SPEED;
         obs[7] = ego_entity->width / MAX_VEH_WIDTH;
         obs[8] = ego_entity->length / MAX_VEH_LEN;
@@ -3110,7 +3184,10 @@ void compute_observations(Drive *env) {
             obs[11] = ego_entity->type / 3.0f;
         }
 
-        if (env->navigation != NULL && ego_entity->navi_goal_idx != -1) {
+        if (env->navigation_enabled && env->znavigation != NULL) {
+            znavi_write_observations(env, ego_entity, &obs[ego_dim - NAVIGATION_EGO_FEATURES],
+                                     &obs[waypoint_obs_start]);
+        } else if (env->navigation_enabled && env->navigation != NULL && ego_entity->navi_goal_idx != -1) {
             float *navi_obs = &obs[ego_dim - NAVIGATION_EGO_FEATURES];
             navi_obs[0] = fminf(ego_entity->navi_feasibility_left_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
             navi_obs[1] = fminf(ego_entity->navi_feasibility_center_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
@@ -3256,7 +3333,7 @@ void compute_observations(Drive *env) {
 void sample_new_goal(Drive *env, int agent_idx) {
     // Samples a new goal position based on the existing road lane points
     Entity *agent = &env->entities[agent_idx];
-    if (env->navigation != NULL) {
+    if (env->navigation_enabled && env->navigation != NULL) {
         agent->navi_goal_idx = closest_navigation_goal(env, agent_idx);
         agent->navi_lane_idx = -1;
         update_navigation_state(env, agent_idx);
@@ -3372,7 +3449,7 @@ void c_reset(Drive *env) {
             env->entities[agent_idx].reward_goal_cond = env->reward_goal;
         }
         compute_agent_metrics(env, agent_idx);
-        if (env->navigation != NULL) {
+        if (navigation_loaded(env)) {
             reset_navigation_state(env, agent_idx);
             update_navigation_state(env, agent_idx);
         }
@@ -3582,7 +3659,7 @@ void c_step(Drive *env) {
             env->entities[agent_idx].failure_before_goal = 1;
         }
 
-        if (env->navigation != NULL && !env->entities[agent_idx].removed) {
+        if (navigation_loaded(env) && !env->entities[agent_idx].removed) {
             Entity *agent = &env->entities[agent_idx];
             update_navigation_state(env, agent_idx);
             env->logs[i].navi_goal_active_rate += agent->navi_goal_idx != -1;
@@ -3590,7 +3667,8 @@ void c_step(Drive *env) {
             if (agent->navi_goal_idx != -1 && agent->current_lane_idx != -1 && !agent->failure_before_goal &&
                 !agent->current_goal_reached && !agent->navi_off_route_sticky) {
                 if (agent->navi_distance_to_goal_m < agent->closest_navi_distance_to_goal_m) {
-                    if (agent->prev_navi_distance_to_goal_m > agent->navi_distance_to_goal_m) {
+                    if (env->navigation_enabled &&
+                        agent->prev_navi_distance_to_goal_m > agent->navi_distance_to_goal_m) {
                         float r_navi = env->reward_progress_navi * agent->reward_goal_cond;
                         env->rewards[i] += r_navi;
                         env->logs[i].episode_return += r_navi;

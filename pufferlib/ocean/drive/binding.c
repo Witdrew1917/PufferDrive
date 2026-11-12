@@ -8,7 +8,7 @@ static PyObject *py_gui_take_map_request(PyObject *self, PyObject *args) {
     return PyLong_FromLong(gui_take_map_request());
 }
 #define MY_METHODS                                                                                                     \
-    {"gui_take_map_request", py_gui_take_map_request, METH_NOARGS,                                                    \
+    {"gui_take_map_request", py_gui_take_map_request, METH_NOARGS,                                                     \
      "Pop the interactive viewer's pending map change (-1 previous, +1 next, 0 none)"}
 #include "../env_binding.h"
 
@@ -209,6 +209,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env_init_config conf = {0};
     conf.navigation_waypoints = NAVI_DEFAULT_WAYPOINTS;
     conf.navigation_waypoint_spacing = NAVI_DEFAULT_WAYPOINT_SPACING_M;
+    conf.navigation_lookahead_distance = ZNAVI_DEFAULT_LOOKAHEAD_DISTANCE;
+    conf.navigation_lookahead_norm = ZNAVI_DEFAULT_LOOKAHEAD_NORM;
     if (ini_parse(env->ini_file, handler, &conf) < 0) {
         printf("Error while loading %s\n", env->ini_file);
     }
@@ -262,6 +264,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_INT(navigation);
     OVERRIDE_INT(navigation_waypoints);
     OVERRIDE_FLOAT(navigation_waypoint_spacing);
+    OVERRIDE_FLOAT(navigation_lookahead_distance);
+    OVERRIDE_FLOAT(navigation_lookahead_norm);
     OVERRIDE_FLOAT(goal_obs_dropout_prob);
 
 #undef OVERRIDE_INT
@@ -294,13 +298,28 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->goal_radius = (float)unpack(kwargs, "goal_radius");
     env->goal_speed = (float)unpack(kwargs, "goal_speed");
     env->render_mode = (int)unpack(kwargs, "render_mode");
-    if (conf.navigation && (conf.navigation_waypoints < 1 || conf.navigation_waypoints > NAVI_MAX_WAYPOINTS)) {
-        PyErr_Format(PyExc_ValueError, "navigation_waypoints must be in [1, %d], got %d", NAVI_MAX_WAYPOINTS,
-                     conf.navigation_waypoints);
+    char *map_dir = unpack_str(kwargs, "map_dir");
+    int map_id = unpack(kwargs, "map_id");
+    char map_file[512];
+    snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
+    int zbin = drive_map_format(map_file) == MAP_FORMAT_ZBIN;
+    int max_waypoints = zbin ? ZNAVI_LOOKAHEAD_WAYPOINTS_MAX : NAVI_MAX_WAYPOINTS;
+    if (conf.navigation && (conf.navigation_waypoints < 1 || conf.navigation_waypoints > max_waypoints)) {
+        PyErr_Format(PyExc_ValueError, "navigation_waypoints must be in [1, %d] for %s maps, got %d", max_waypoints,
+                     zbin ? "zpufferdrive" : "legacy", conf.navigation_waypoints);
         return -1;
     }
-    if (conf.navigation && !(conf.navigation_waypoint_spacing > 0.0f)) {
+    if (conf.navigation && !zbin && !(conf.navigation_waypoint_spacing > 0.0f)) {
         PyErr_SetString(PyExc_ValueError, "navigation_waypoint_spacing must be > 0");
+        return -1;
+    }
+    if (conf.navigation && zbin &&
+        !(conf.navigation_lookahead_distance > 0.0f &&
+          conf.navigation_lookahead_distance <= conf.navigation_lookahead_norm)) {
+        PyErr_Format(PyExc_ValueError,
+                     "zpufferdrive navigation needs 0 < navigation_lookahead_distance <= navigation_lookahead_norm, "
+                     "got %g and %g",
+                     conf.navigation_lookahead_distance, conf.navigation_lookahead_norm);
         return -1;
     }
     if (!(conf.goal_obs_dropout_prob >= 0.0f && conf.goal_obs_dropout_prob <= 1.0f)) {
@@ -310,13 +329,11 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->navigation_enabled = conf.navigation;
     env->navigation_waypoints = conf.navigation_waypoints;
     env->navigation_waypoint_spacing = conf.navigation_waypoint_spacing;
+    env->navigation_lookahead_distance = conf.navigation_lookahead_distance;
+    env->navigation_lookahead_norm = conf.navigation_lookahead_norm;
     env->goal_obs_dropout_prob = conf.goal_obs_dropout_prob;
-    char *map_dir = unpack_str(kwargs, "map_dir");
-    int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");
     int init_steps = unpack(kwargs, "init_steps");
-    char map_file[512];
-    snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
     env->num_agents = max_agents;
     env->map_name = strdup(map_file);
     env->init_steps = init_steps;

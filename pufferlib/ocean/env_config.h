@@ -38,6 +38,8 @@ typedef struct {
     int navigation;
     int navigation_waypoints;
     float navigation_waypoint_spacing;
+    float navigation_lookahead_distance;
+    float navigation_lookahead_norm;
     float goal_obs_dropout_prob;
     char map_dir[256];
     char anchor_policy_path[256];
@@ -82,6 +84,10 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->navigation_waypoints = atoi(value);
     } else if (MATCH("env", "navigation_waypoint_spacing")) {
         env_config->navigation_waypoint_spacing = atof(value);
+    } else if (MATCH("env", "navigation_lookahead_distance")) {
+        env_config->navigation_lookahead_distance = atof(value);
+    } else if (MATCH("env", "navigation_lookahead_norm")) {
+        env_config->navigation_lookahead_norm = atof(value);
     } else if (MATCH("env", "goal_obs_dropout_prob")) {
         env_config->goal_obs_dropout_prob = atof(value);
     } else if (MATCH("env", "reward_vehicle_collision")) {
@@ -95,7 +101,7 @@ static int handler(void *config, const char *section, const char *name, const ch
     } else if (MATCH("env", "reward_goal")) {
         env_config->reward_goal = atof(value);
     } else if (MATCH("env", "reward_progress_navi")) {
-        env_config->reward_progress_navi= atof(value);
+        env_config->reward_progress_navi = atof(value);
     } else if (MATCH("env", "goal_radius")) {
         env_config->goal_radius = atof(value);
     } else if (MATCH("env", "goal_speed")) {

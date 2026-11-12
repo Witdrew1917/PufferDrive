@@ -27,6 +27,31 @@ class RenderView(IntEnum):
     SENSOR_NOISE = 3  # Agent view, including perception noise
 
 
+MAP_FORMAT_LEGACY = 0
+MAP_FORMAT_ZBIN = 1
+ZBIN_VERSION = 14
+ZBIN_NUM_SECTIONS = 4
+
+
+def detect_map_format(path):
+    """MAP_FORMAT_ZBIN for zpufferdrive v14 binaries, MAP_FORMAT_LEGACY otherwise (mirrors zbin.h drive_map_format)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            header = f.read(8 + 4 * ZBIN_NUM_SECTIONS)
+    except OSError:
+        return MAP_FORMAT_LEGACY
+    if len(header) < 8 + 4 * ZBIN_NUM_SECTIONS:
+        return MAP_FORMAT_LEGACY
+    version, num_sections = struct.unpack_from("<II", header)
+    if version != ZBIN_VERSION or not ZBIN_NUM_SECTIONS <= num_sections <= 64:
+        return MAP_FORMAT_LEGACY
+    offsets = struct.unpack_from(f"<{ZBIN_NUM_SECTIONS}I", header, 8)
+    if offsets[0] != 8 + 4 * num_sections or any(b < a for a, b in zip(offsets, offsets[1:])):
+        return MAP_FORMAT_LEGACY
+    return MAP_FORMAT_ZBIN if offsets[-1] <= size else MAP_FORMAT_LEGACY
+
+
 class RegMode(IntEnum):
     NONE = 0
     LOG_PROB_DIRECT = 1
@@ -92,6 +117,8 @@ class Drive(pufferlib.PufferEnv):
         navigation=0,
         navigation_waypoints=16,
         navigation_waypoint_spacing=5.0,
+        navigation_lookahead_distance=120.0,
+        navigation_lookahead_norm=150.0,
         goal_obs_dropout_prob=0.0,
         reward_progress_navi=0.0,
     ):
@@ -139,12 +166,25 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(f"navigation must be 0 or 1. Got: {navigation}")
         self.navigation_waypoints = int(navigation_waypoints)
         self.navigation_waypoint_spacing = float(navigation_waypoint_spacing)
+        self.navigation_lookahead_distance = float(navigation_lookahead_distance)
+        self.navigation_lookahead_norm = float(navigation_lookahead_norm)
+        # A map directory holds a single format, detected from its first map.
+        self.map_format = detect_map_format(f"{map_dir}/map_000.bin")
         if self.navigation:
-            if not 1 <= self.navigation_waypoints <= binding.NAVI_MAX_WAYPOINTS:
-                raise ValueError(
-                    f"navigation_waypoints must be in [1, {binding.NAVI_MAX_WAYPOINTS}]. Got: {navigation_waypoints}"
-                )
-            if not self.navigation_waypoint_spacing > 0.0:
+            max_waypoints = (
+                binding.NAVI_LOOKAHEAD_WAYPOINTS_MAX
+                if self.map_format == MAP_FORMAT_ZBIN
+                else binding.NAVI_MAX_WAYPOINTS
+            )
+            if not 1 <= self.navigation_waypoints <= max_waypoints:
+                raise ValueError(f"navigation_waypoints must be in [1, {max_waypoints}]. Got: {navigation_waypoints}")
+            if self.map_format == MAP_FORMAT_ZBIN:
+                if not 0.0 < self.navigation_lookahead_distance <= self.navigation_lookahead_norm:
+                    raise ValueError(
+                        "navigation_lookahead_distance must be in (0, navigation_lookahead_norm]. Got: "
+                        f"{navigation_lookahead_distance}, {navigation_lookahead_norm}"
+                    )
+            elif not self.navigation_waypoint_spacing > 0.0:
                 raise ValueError(f"navigation_waypoint_spacing must be > 0. Got: {navigation_waypoint_spacing}")
             self.ego_features += binding.NAVIGATION_EGO_FEATURES
 
@@ -154,9 +194,14 @@ class Drive(pufferlib.PufferEnv):
         self.max_partner_objects = binding.MAX_AGENTS - 1
         self.partner_features = binding.PARTNER_FEATURES
         self.road_features = binding.ROAD_FEATURES
-        # Navigation waypoints are appended after the road block: (ego-frame x, y, valid) per waypoint
+        # Navigation waypoints are appended after the road block: ego-frame (x, y, valid) per waypoint for legacy
+        # maps, ego-frame (x, y) for zpufferdrive maps
         self.max_waypoints = self.navigation_waypoints if self.navigation else 0
-        self.waypoint_features = binding.NAVIGATION_WAYPOINT_FEATURES
+        self.waypoint_features = (
+            binding.ZNAVI_WAYPOINT_FEATURES
+            if self.map_format == MAP_FORMAT_ZBIN
+            else binding.NAVIGATION_WAYPOINT_FEATURES
+        )
 
         self.num_obs = (
             self.ego_features
@@ -263,7 +308,7 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(
                 f"num_maps ({num_maps}) exceeds available maps in directory ({available_maps}). Please reduce num_maps or add more maps to resources/drive/binaries."
             )
-        if self.navigation:
+        if self.navigation and self.map_format == MAP_FORMAT_LEGACY:
             missing = [i for i in range(num_maps) if not os.path.exists(f"{map_dir}/map_{i:03d}.navi")]
             if missing:
                 raise FileNotFoundError(
@@ -342,6 +387,8 @@ class Drive(pufferlib.PufferEnv):
                 navigation=self.navigation,
                 navigation_waypoints=self.navigation_waypoints,
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
+                navigation_lookahead_distance=self.navigation_lookahead_distance,
+                navigation_lookahead_norm=self.navigation_lookahead_norm,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
             )
             self.env_ids.append(env_id)
@@ -465,6 +512,8 @@ class Drive(pufferlib.PufferEnv):
                 navigation=self.navigation,
                 navigation_waypoints=self.navigation_waypoints,
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
+                navigation_lookahead_distance=self.navigation_lookahead_distance,
+                navigation_lookahead_norm=self.navigation_lookahead_norm,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
             )
             self.env_ids.append(env_id)

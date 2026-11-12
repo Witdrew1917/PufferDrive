@@ -42,6 +42,7 @@ static void run_reward_steps(Drive *env, GridMap *grid, const char *scenario) {
     env->goal_radius = 0.2f;
     env->goal_speed = 1.0f;
     env->reward_progress_navi = 0.25f;
+    env->navigation_enabled = 1;
     agent->reward_goal_cond = 2.0f;
     agent->controller = CONTROLLER_STATIC;
     agent->heading_x = 1.0f;
@@ -123,7 +124,7 @@ int main(int argc, char **argv) {
     env.entities = load_map_binary(env.map_name, &env);
     if (env.entities == NULL)
         return 3;
-    env.navigation = load_navigation_binary(&env);
+    env.navigation = load_navigation_binary(&env, 1);
     Entity *agent = &env.entities[0];
     reset_navigation_state(&env, 0);
     agent->x = strtof(argv[2], NULL);

@@ -132,7 +132,7 @@ Three modes determine what happens when an agent reaches its goal:
 
 Where partners = `MAX_AGENTS - 1` agents × 7 features, roads = 232 segments × 7 features
 
-With `navigation = 1` the ego block grows by 3 and `navigation_waypoints` × 3 waypoint floats are appended after the roads: `[ego | partners | roads | waypoints]`. Policies are tied to these settings. See [Lane navigation](navigation.md).
+With `navigation = 1` the ego block grows by 3 and `navigation_waypoints` × 3 waypoint floats (× 2 for zpufferdrive maps) are appended after the roads: `[ego | partners | roads | waypoints]`. Policies are tied to these settings. See [Lane navigation](navigation.md).
 
 > [!IMPORTANT]
 > All observations are in the **ego vehicle's reference frame** (agent-centric) and are normalized. Positions rotate with the agent's heading.
@@ -143,7 +143,7 @@ With `navigation = 1` the ego block grows by 3 and `navigation_waypoints` × 3 w
 
 **Jerk adds (3):** steering_angle, long_accel, lat_accel
 
-**Navigation adds (3, opt-in with `navigation = 1`):** left/center/right lane feasibility (metres the agent can stay on that lane and still reach its goal, divided by 200 and capped at 1; all zero without a navigation goal). Requires [navigation sidecars](data.md#navigation-sidecars-optional). With goal behavior 1, new goals are snapped to sidecar goal lanes.
+**Navigation adds (3, opt-in with `navigation = 1`):** left/center/right lane feasibility (how far the agent can stay on that lane and still reach its goal; all zero without a navigation goal). Legacy maps encode metres divided by 200, capped at 1, and require [navigation sidecars](data.md#navigation-sidecars-optional); with goal behavior 1, new goals are snapped to sidecar goal lanes. [zpufferdrive maps](data.md#zpufferdrive-binaries) encode seconds at the lane speed limit divided by 30, capped at 1, and never move goals.
 
 
 ### Partner features (up to `MAX_AGENTS - 1` agents, 7 each)
@@ -167,7 +167,7 @@ mid_x, mid_y, length, width, dir_cos, dir_sin, type
 > Road observations use a spatial grid with 5m cells. The 21×21 vision range gives ~105m visibility in all directions.
 
 ### Navigation waypoints (opt-in with `navigation = 1`, `navigation_waypoints` × 3)
-rel_x, rel_y, valid
+rel_x, rel_y, valid (legacy maps). zpufferdrive maps use 2 features per waypoint instead: `x_forward, y_left` divided by `navigation_lookahead_norm`, spread evenly over `navigation_lookahead_distance` metres of route, `(0, 0)` past the route end. See [Lane navigation](navigation.md#zpufferdrive-maps).
 
 - `navigation_waypoints` (default 16, max 64) points every `navigation_waypoint_spacing` metres (default 5) along the route to the navigation goal, starting from the agent's projection onto its current (or last known) lane; positions scaled by 0.02 like road/partner features
 - The route follows `next_lane`; where the goal is only reachable through a lane change it switches to the left/right lane closer to the goal
@@ -242,6 +242,7 @@ rel_x, rel_y, valid
 
 ### C core
 - `drive.h`: Main simulator (stepping, observations, collisions)
+- `zbin.h`: zpufferdrive v14 map loader and navigation runtime
 - `drive.c`: Demo and testing
 - `binding.c`: Python interface
 - `drivenet.h`: C inference network
