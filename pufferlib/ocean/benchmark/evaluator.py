@@ -858,6 +858,9 @@ class Evaluator:
         )
         self.sp_eval_config = copy.deepcopy(eval_config)
         self.sp_eval_config["env"]["control_mode"] = "control_agents"
+        self.sp_eval_config["env"]["goal_obs_dropout_prob"] = (
+            1.0 if self.configs["eval"].get("sp_mask_goal", False) else 0.0
+        )
         self.render_select_mode = self.configs["eval"]["render_select_mode"]
         self.render_sp_rollout = self.configs["eval"]["render_self_play_eval"]
         self.render_hr_rollout = self.configs["eval"]["render_human_replay_eval"]
