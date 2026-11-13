@@ -45,7 +45,7 @@ The C extension needs no rebuild when switching `navigation` on or off; all sett
 | Key | Default | Description |
 |-----|---------|-------------|
 | `navigation` | `0` | `1` lets agents use navigation. Legacy maps then need a `.navi` sidecar for every map in `map_dir`. |
-| `snap_goal_to_navi_endpoint` | `0` | For zpufferdrive maps, snap initial logged goals to the nearest usable terminal on each agent's existing route. Independent of `navigation`; generated goals are unchanged. |
+| `snap_goal_to_navi_endpoint` | `0` | Snap initial logged goals: project onto the goal lane for legacy maps, or use the nearest route terminal for zpufferdrive maps. Independent of `navigation`; legacy maps require sidecars, and generated goals are unchanged. |
 | `navigation_waypoints` | `16` | Route waypoints observed per agent: `[1, 64]` (`NAVI_MAX_WAYPOINTS`) for legacy maps, `[1, 50]` (`NAVI_LOOKAHEAD_WAYPOINTS_MAX`) for zpufferdrive maps. |
 | `navigation_waypoint_spacing` | `5.0` | Legacy maps: metres between consecutive waypoints along the route (> 0). |
 | `navigation_lookahead_distance` | `120.0` | zpufferdrive maps: route arclength covered by the waypoints, in metres. Must satisfy `0 < distance <= navigation_lookahead_norm`. |
@@ -71,7 +71,7 @@ python -m pufferlib.ocean.drive.drive navigation --map-dir <map_dir> [--workers 
 
 Each sidecar stores a CRC-32 and the byte size of its `.bin`. If a map is regenerated, its sidecar becomes stale and
 environment creation aborts with a fingerprint mismatch. Rebuild with `--overwrite`. Creating an env with
-`navigation = 1` also fails early, with the command to run, if any map lacks a sidecar. Sidecars that exist are
+`navigation = 1` or `snap_goal_to_navi_endpoint = 1` also fails early, with the command to run, if any map lacks a sidecar. Sidecars that exist are
 also loaded (and validated) with `navigation = 0`, for metrics and rendering.
 
 Split-aware navigation and overlapping goal terminals require version 4 sidecars. Regenerate older sidecars with
@@ -162,7 +162,10 @@ Every step, for each controlled agent:
    Side feasibility uses projection onto the selected anchor's neighbouring lane.
    The progress reward requires a new closest navigation distance for the current goal; retracing a route does not
    earn the same progress again. The closest distance is initialized again when a new goal is sampled.
-4. **Goals**: at reset each agent gets its logged goal (`object_goal_idx`). When a new goal is sampled
+4. **Goals**: each agent retains its logged goal and associated `object_goal_idx` by default. With
+   `snap_goal_to_navi_endpoint = 1`, the initial goal is projected onto its associated goal lane after agent
+   selection; agents without a navigation goal retain their logged goal. Sidecar routes and their distance tables
+   still lead to the lane's original terminal, which may be beyond the projected goal. When a new goal is sampled
    (`sample_new_goal`, e.g. goal behavior 1), it is snapped to the reachable sidecar goal whose route distance is
    closest to `goal_target_distance`, resolving ambiguous branches for each prospective goal without changing
    agent state during comparison. If no sidecar goal is reachable, the normal lane-point sampling is used and
@@ -256,7 +259,7 @@ Route walk (`navigation_route_waypoints`):
 - If the current lane has no `next_lane` toward the goal (a lane change is needed), hop to the left or right
   neighbour with the smaller `distance_to_goal_m`, then keep walking from the projected position. Distance strictly
   decreases, so the walk always terminates.
-- Stop at the goal's projected position on any terminal lane, even if the lane continues beyond the goal,
+- Stop at the sidecar goal's projected position on any terminal lane, even if the lane continues beyond it,
   or when no hop is possible.
 
 Unused slots, and all slots for agents without a goal or off route, are zero (`valid = 0`).
@@ -291,7 +294,7 @@ When navigation data is loaded the renderer draws, for the selected agent:
 - its observed route waypoints (small spheres),
 - its goal.
 
-Only the original goal marker is drawn. Routes and observed waypoints can reach any hidden copy and stop there;
+Only the selected goal marker is drawn. Routes and observed waypoints can reach any hidden copy and stop there;
 they do not continue to the end of a longer overlapping lane.
 
 The observation-only view also decodes the waypoint block. `scripts/render_navigation.sh [MAP_DIR] [MODEL|latest|none]

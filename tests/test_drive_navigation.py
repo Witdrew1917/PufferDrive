@@ -81,7 +81,7 @@ def write_split_map(path, reverse_lanes=False, turn_goal=False):
     Path(path).write_bytes(out)
 
 
-def write_overlapping_goal_map(path, reverse_lanes=False):
+def write_overlapping_goal_map(path, reverse_lanes=False, goal_y=0.1):
     straight = (np.array([0, 100]), np.zeros(2))
     incoming = (np.array([20, 35, 35, 45.3]), np.array([-20, -20, 0.1, 0.1]))
     roads = [straight, incoming, _polyline(-20, 0, 0)]
@@ -90,7 +90,7 @@ def write_overlapping_goal_map(path, reverse_lanes=False):
     out = bytearray(b"synthetic_navi00")
     out += struct.pack("<4i", 0, 0, 1, len(roads))
     xs = np.arange(TRAJECTORY_STEPS, dtype=np.float32) * SPEED_MPS * DT_SECONDS
-    _write_entity(out, nav.VEHICLE, xs, np.zeros_like(xs), goal_x=45.3, goal_y=0.1)
+    _write_entity(out, nav.VEHICLE, xs, np.zeros_like(xs), goal_x=45.3, goal_y=goal_y)
     for x, y in roads:
         _write_entity(out, nav.ROAD_LANE, x, y)
     Path(path).write_bytes(out)
@@ -480,15 +480,21 @@ ENV_SCRIPT = textwrap.dedent(
     from pufferlib.ocean.drive import binding
     from pufferlib.ocean.drive.drive import Drive
     from pufferlib.ocean.torch import Drive as DrivePolicy
+    config = json.loads(sys.argv[7])
+    resample_map = config.pop("resample_map", False)
     env = Drive(num_agents=1, num_maps=1, map_dir=sys.argv[1], navigation=int(sys.argv[2]),
                 navigation_waypoints=int(sys.argv[3]), navigation_waypoint_spacing=float(sys.argv[4]),
                 control_mode="control_vehicles", episode_length=91, resample_frequency=0,
-                goal_obs_dropout_prob=float(sys.argv[5]))
+                goal_obs_dropout_prob=float(sys.argv[5]), **config)
     obs, _ = env.reset()
+    initial_obs = obs[0].tolist()
     goal_samples = []
     for seed in range(int(sys.argv[6])):
         obs, _ = env.reset(seed=seed + 1)
         goal_samples.append(obs[0, 4:6].tolist())
+    if resample_map:
+        env.resample_maps()
+        goal_samples.append(env.observations[0, 4:6].tolist())
     # classic dynamics: action = accel_idx * NUM_STEER_BINS + steer_idx; middle bins are zero accel/steer
     neutral_action = (binding.NUM_ACCEL_BINS // 2) * binding.NUM_STEER_BINS + binding.NUM_STEER_BINS // 2
     for _ in range(5):
@@ -500,6 +506,7 @@ ENV_SCRIPT = textwrap.dedent(
         "ego": env.ego_features,
         "obs": obs.shape[1],
         "goal": obs[0, 4:6].tolist(),
+        "initial_obs": initial_obs,
         "goal_samples": goal_samples,
         "feasibility": obs[0, env.ego_features - 3 : env.ego_features].tolist() if env.navigation else [],
         "waypoints": obs[0, obs.shape[1] - waypoint_dim :].reshape(-1, 3).tolist() if waypoint_dim else [],
@@ -520,7 +527,7 @@ class TestNavigationEnv(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run_env(self, navigation, waypoints=16, spacing=5.0, goal_dropout_prob=0.0, reset_count=0):
+    def _run_env(self, navigation, waypoints=16, spacing=5.0, goal_dropout_prob=0.0, reset_count=0, **config):
         return subprocess.run(
             [
                 sys.executable,
@@ -532,6 +539,7 @@ class TestNavigationEnv(unittest.TestCase):
                 str(spacing),
                 str(goal_dropout_prob),
                 str(reset_count),
+                json.dumps(config),
             ],
             cwd=REPO_ROOT,
             check=False,
@@ -571,6 +579,82 @@ class TestNavigationEnv(unittest.TestCase):
         waypoints = np.array(custom["waypoints"])
         self.assertEqual(waypoints.shape, (4, 3))
         np.testing.assert_allclose(np.diff(waypoints[:, 0]), 10.0 * 0.02, atol=1e-4)
+
+    def test_snap_initial_goal_on_legacy_maps(self):
+        xs = np.arange(TRAJECTORY_STEPS, dtype=np.float32) * SPEED_MPS * DT_SECONDS
+        out = bytearray(b"synthetic_navi00")
+        out += struct.pack("<4i", 0, 0, 1, 2)
+        _write_entity(out, nav.VEHICLE, xs, np.zeros_like(xs), goal_x=95.3, goal_y=1.0)
+        for y in (0.0, LANE_WIDTH_M):
+            lane_x, lane_y = _polyline(0, 500, y, step_m=10.0)
+            _write_entity(out, nav.ROAD_LANE, lane_x, lane_y)
+        self.map_path.write_bytes(out)
+        nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        for navigation in (0, 1):
+            off = self._result(self._run_env(navigation, snap_goal_to_navi_endpoint=0))
+            on = self._result(
+                self._run_env(
+                    navigation, snap_goal_to_navi_endpoint=1, goal_behavior=1, reset_count=2, resample_map=True
+                )
+            )
+            np.testing.assert_allclose(off["initial_obs"][4:6], [95.3 * 0.005, 1.0 * 0.005], atol=1e-6)
+            np.testing.assert_allclose(on["initial_obs"][4:6], [95.3 * 0.005, 0.0], atol=1e-6)
+            np.testing.assert_allclose(on["goal_samples"], [[95.3 * 0.005, 0.0]] * 3, atol=1e-6)
+            np.testing.assert_array_equal(np.delete(off["initial_obs"], [4, 5]), np.delete(on["initial_obs"], [4, 5]))
+
+    def test_snap_projects_onto_associated_lane_not_hidden_copy(self):
+        write_overlapping_goal_map(self.map_path, goal_y=0.03)
+        navi = nav.process_map_navigation(self.map_path, max_goals=3, seed=0)
+        navi["object_goal_idx"][0] = np.flatnonzero(navi["goal_lane"] == 1)[0]
+        nav.write_navigation(navi, nav.navigation_path_for(self.map_path))
+        off = self._result(self._run_env(0))
+        on = self._result(self._run_env(0, snap_goal_to_navi_endpoint=1))
+        np.testing.assert_allclose(off["initial_obs"][4:6], [45.3 * 0.005, 0.03 * 0.005], atol=1e-6)
+        np.testing.assert_allclose(on["initial_obs"][4:6], [45.3 * 0.005, 0.1 * 0.005], atol=1e-6)
+
+    def test_snap_does_not_change_legacy_agent_selection(self):
+        xs = np.arange(TRAJECTORY_STEPS, dtype=np.float32) * SPEED_MPS * DT_SECONDS
+        out = bytearray(b"synthetic_navi00")
+        out += struct.pack("<4i", -1, 0, 2, 3)
+        _write_entity(out, nav.VEHICLE, xs, np.full_like(xs, 3.0), goal_x=1.0, goal_y=3.0)
+        _write_entity(out, nav.VEHICLE, xs + 99.0, np.zeros_like(xs), goal_x=95.0, goal_y=1.0)
+        for start, end in ((0, 50), (50, 100)):
+            lane_x, lane_y = _polyline(start, end, 0)
+            _write_entity(out, nav.ROAD_LANE, lane_x, lane_y)
+        lane_x, lane_y = _polyline(0, 100, LANE_WIDTH_M)
+        _write_entity(out, nav.ROAD_LANE, lane_x, lane_y)
+        self.map_path.write_bytes(out)
+        navi = nav.process_map_navigation(self.map_path, max_goals=3, seed=0)
+        navi["object_goal_idx"][0] = np.flatnonzero(navi["goal_lane"] == 0)[0]
+        nav.write_navigation(navi, nav.navigation_path_for(self.map_path))
+        off = self._result(self._run_env(0))
+        on = self._result(self._run_env(0, snap_goal_to_navi_endpoint=1))
+        np.testing.assert_allclose(off["initial_obs"][4:6], [-4.0 * 0.005, 1.0 * 0.005], atol=1e-6)
+        np.testing.assert_allclose(on["initial_obs"][4:6], [-4.0 * 0.005, 0.0], atol=1e-6)
+        np.testing.assert_array_equal(np.delete(off["initial_obs"], [4, 5]), np.delete(on["initial_obs"], [4, 5]))
+
+    def test_snap_requires_legacy_sidecar(self):
+        result = self._run_env(0, snap_goal_to_navi_endpoint=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".navi", result.stderr)
+        self.assertIn("goal snapping", result.stderr)
+
+    def test_snap_does_not_change_generated_legacy_goals(self):
+        write_synthetic_map(self.map_path, goal_y=1.0)
+        nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        config = {"goal_behavior": 1, "goal_radius": 1000.0}
+        off = self._result(self._run_env(0, **config))
+        on = self._result(self._run_env(0, snap_goal_to_navi_endpoint=1, **config))
+        self.assertNotEqual(off["initial_obs"][5], on["initial_obs"][5])
+        np.testing.assert_array_equal(off["goal"], on["goal"])
+
+    def test_snap_keeps_goal_without_a_matching_route(self):
+        navi = nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        navi["object_goal_idx"][0] = -1
+        nav.write_navigation(navi, nav.navigation_path_for(self.map_path))
+        off = self._result(self._run_env(0))
+        on = self._result(self._run_env(0, snap_goal_to_navi_endpoint=1))
+        np.testing.assert_array_equal(off["initial_obs"], on["initial_obs"])
 
     def test_waypoints_reach_hidden_goal_copy_on_overlapping_straight_lane(self):
         write_overlapping_goal_map(self.map_path)
@@ -617,9 +701,10 @@ class TestNavigationEnv(unittest.TestCase):
         map_bytes = bytearray(self.map_path.read_bytes())
         map_bytes[-5] ^= 0x01
         self.map_path.write_bytes(bytes(map_bytes))
-        result = self._run_env(1)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("fingerprint mismatch", result.stdout + result.stderr)
+        for navigation, config in ((1, {}), (0, {"snap_goal_to_navi_endpoint": 1})):
+            result = self._run_env(navigation, **config)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fingerprint mismatch", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

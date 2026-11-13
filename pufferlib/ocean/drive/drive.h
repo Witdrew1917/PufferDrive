@@ -1263,10 +1263,11 @@ Navigation *load_navigation_binary(Drive *env, int required) {
         return NULL;
     }
     if (file == NULL) {
-        raise_error_with_message(ERROR_FILE_NOT_FOUND,
-                                 "navigation=1 but sidecar %s is missing (python -m pufferlib.ocean.drive.drive "
-                                 "navigation --map-dir <map_dir>)",
-                                 path);
+        raise_error_with_message(
+            ERROR_FILE_NOT_FOUND,
+            "navigation or goal snapping requires sidecar %s (python -m pufferlib.ocean.drive.drive "
+            "navigation --map-dir <map_dir>)",
+            path);
     }
     Navigation *navigation = (Navigation *)calloc(1, sizeof(Navigation));
     const char *error = navigation == NULL ? "out of memory" : NULL;
@@ -2031,6 +2032,23 @@ float lane_project(const Entity *lane, float x, float y, int *segment_out, float
 // Arc length (m) along a lane polyline of the point closest to (x, y).
 float lane_progress_m(const Entity *lane, float x, float y) { return lane_project(lane, x, y, NULL, NULL, NULL); }
 
+static void navigation_snap_initial_goals(Drive *env) {
+    const Navigation *navigation = env->navigation;
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        Entity *agent = &env->entities[agent_idx];
+        int goal = navigation->object_goal_idx[agent_idx];
+        if (goal < 0)
+            continue;
+        const Entity *lane = &env->entities[navigation->lane_entity_idx[navigation->goal_lane[goal]]];
+        int segment;
+        float x, y;
+        lane_project(lane, agent->goal_position_x, agent->goal_position_y, &segment, &x, &y);
+        agent->goal_position_x = x;
+        agent->goal_position_y = y;
+    }
+}
+
 // Lane-start feasibility minus progress along the lane; forbidden (0) and capped values pass through.
 float navigation_feasibility_ahead_m(float lane_start_feasibility_m, float lane_progress) {
     if (lane_start_feasibility_m <= 0.0f || lane_start_feasibility_m >= NAVI_FEASIBILITY_CAP_M) {
@@ -2639,7 +2657,7 @@ void init(Drive *env) {
         }
         env->znavigation = load_znavigation(env);
     } else {
-        env->navigation = load_navigation_binary(env, env->navigation_enabled);
+        env->navigation = load_navigation_binary(env, env->navigation_enabled || env->snap_goal_to_navi_endpoint);
         if (env->navigation != NULL) {
             for (int goal_idx = 0; goal_idx < env->navigation->num_goals; goal_idx++) {
                 env->navigation->goal_x[goal_idx] -= env->world_mean_x;
@@ -2652,8 +2670,12 @@ void init(Drive *env) {
             reset_navigation_state(env, env->active_agent_indices[i]);
         }
     }
-    if (env->snap_goal_to_navi_endpoint && env->znavigation != NULL)
-        znavi_snap_initial_goals(env, env->znavigation);
+    if (env->snap_goal_to_navi_endpoint) {
+        if (env->znavigation != NULL)
+            znavi_snap_initial_goals(env, env->znavigation);
+        else if (env->navigation != NULL)
+            navigation_snap_initial_goals(env);
+    }
     for (int x = 0; x < env->active_agent_count; x++) {
         int agent_idx = env->active_agent_indices[x];
         env->entities[agent_idx].init_goal_x = env->entities[agent_idx].goal_position_x;

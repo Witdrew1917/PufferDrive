@@ -312,11 +312,12 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(
                 f"num_maps ({num_maps}) exceeds available maps in directory ({available_maps}). Please reduce num_maps or add more maps to resources/drive/binaries."
             )
-        if self.navigation and self.map_format == MAP_FORMAT_LEGACY:
+        if (self.navigation or self.snap_goal_to_navi_endpoint) and self.map_format == MAP_FORMAT_LEGACY:
             missing = [i for i in range(num_maps) if not os.path.exists(f"{map_dir}/map_{i:03d}.navi")]
             if missing:
                 raise FileNotFoundError(
-                    f"navigation=1 but {len(missing)} of {num_maps} maps in {map_dir} lack a .navi sidecar "
+                    f"navigation or goal snapping requires .navi sidecars, but {len(missing)} of {num_maps} maps in "
+                    f"{map_dir} lack one "
                     f"(first: map_{missing[0]:03d}.navi). Generate them with: "
                     f"python -m pufferlib.ocean.drive.drive navigation --map-dir {map_dir}"
                 )
