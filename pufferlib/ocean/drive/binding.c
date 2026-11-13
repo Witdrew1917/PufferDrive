@@ -262,6 +262,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_FLOAT(lambda_value);
     OVERRIDE_INT(async_resets);
     OVERRIDE_INT(navigation);
+    OVERRIDE_INT(snap_goal_to_navi_endpoint);
     OVERRIDE_INT(navigation_waypoints);
     OVERRIDE_FLOAT(navigation_waypoint_spacing);
     OVERRIDE_FLOAT(navigation_lookahead_distance);
@@ -326,7 +327,12 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyErr_SetString(PyExc_ValueError, "goal_obs_dropout_prob must be in [0, 1]");
         return -1;
     }
+    if (conf.snap_goal_to_navi_endpoint != 0 && conf.snap_goal_to_navi_endpoint != 1) {
+        PyErr_SetString(PyExc_ValueError, "snap_goal_to_navi_endpoint must be 0 or 1");
+        return -1;
+    }
     env->navigation_enabled = conf.navigation;
+    env->snap_goal_to_navi_endpoint = conf.snap_goal_to_navi_endpoint;
     env->navigation_waypoints = conf.navigation_waypoints;
     env->navigation_waypoint_spacing = conf.navigation_waypoint_spacing;
     env->navigation_lookahead_distance = conf.navigation_lookahead_distance;

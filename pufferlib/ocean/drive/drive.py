@@ -121,6 +121,7 @@ class Drive(pufferlib.PufferEnv):
         navigation_lookahead_norm=150.0,
         goal_obs_dropout_prob=0.0,
         reward_progress_navi=0.0,
+        snap_goal_to_navi_endpoint=0,
     ):
         # env
         self.dt = dt
@@ -164,6 +165,9 @@ class Drive(pufferlib.PufferEnv):
         self.navigation = int(navigation)
         if self.navigation not in (0, 1):
             raise ValueError(f"navigation must be 0 or 1. Got: {navigation}")
+        if snap_goal_to_navi_endpoint not in (0, 1):
+            raise ValueError(f"snap_goal_to_navi_endpoint must be 0 or 1. Got: {snap_goal_to_navi_endpoint}")
+        self.snap_goal_to_navi_endpoint = int(snap_goal_to_navi_endpoint)
         self.navigation_waypoints = int(navigation_waypoints)
         self.navigation_waypoint_spacing = float(navigation_waypoint_spacing)
         self.navigation_lookahead_distance = float(navigation_lookahead_distance)
@@ -385,6 +389,7 @@ class Drive(pufferlib.PufferEnv):
                 async_resets=self.async_resets,
                 dynamics_model=self._dynamics_model_flag,
                 navigation=self.navigation,
+                snap_goal_to_navi_endpoint=self.snap_goal_to_navi_endpoint,
                 navigation_waypoints=self.navigation_waypoints,
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
                 navigation_lookahead_distance=self.navigation_lookahead_distance,
@@ -510,6 +515,7 @@ class Drive(pufferlib.PufferEnv):
                 obs_partner_noise_speed=self.obs_partner_noise_speed,
                 async_resets=int(self.async_resets),
                 navigation=self.navigation,
+                snap_goal_to_navi_endpoint=self.snap_goal_to_navi_endpoint,
                 navigation_waypoints=self.navigation_waypoints,
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
                 navigation_lookahead_distance=self.navigation_lookahead_distance,

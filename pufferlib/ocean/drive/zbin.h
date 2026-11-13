@@ -59,6 +59,7 @@ struct ZNavigation {
     int num_lines; // navi entities per goal; navi entity e = goal * num_lines + line
     int total;     // num_goals * num_lines
     int samples_per_goal;
+    int *line_road;          // [num_lines] road index, or -1 for a missing lane
     int *line_num_points;    // [num_lines] num_sub_lines + 1
     int *line_sample_offset; // [num_lines] offset of the line's samples within one goal
     float *line_x_start;     // [num_lines] navi segment endpoints, centred like the entities
@@ -403,6 +404,7 @@ void zbin_set_means(Drive *env) {
 void free_znavigation(ZNavigation *zn) {
     if (zn == NULL)
         return;
+    free(zn->line_road);
     free(zn->line_num_points);
     free(zn->line_sample_offset);
     free(zn->line_x_start);
@@ -672,6 +674,69 @@ static int znavi_cell_candidates(const Drive *env, ZNavigation *zn, int cell, co
 
 // Sections 3-4 of zdrive_load.c (navi topology and routes) for the already loaded and centred zbin scene, plus
 // zdrive's road grid. Aborts on malformed data like zdrive.
+static inline void znavi_point(const ZNavigation *zn, int navi_idx, int point, float *out_x, float *out_y);
+
+static void znavi_snap_initial_goals(Drive *env, const ZNavigation *zn) {
+    float best_distance[ZBIN_MAX_OBJECTS], best_x[ZBIN_MAX_OBJECTS], best_y[ZBIN_MAX_OBJECTS];
+    for (int i = 0; i < env->active_agent_count; i++)
+        best_distance[i] = INFINITY;
+
+    for (int goal = 0; goal < zn->num_goals; goal++) {
+        int has_agent = 0;
+        for (int i = 0; i < env->active_agent_count; i++)
+            has_agent |= env->entities[env->active_agent_indices[i]].zdrive_goal_index == goal;
+        if (!has_agent)
+            continue;
+        for (int line = 0; line < zn->num_lines; line++) {
+            if (zn->line_road[line] < 0)
+                continue;
+            int entity = goal * zn->num_lines + line;
+            size_t base = (size_t)goal * zn->samples_per_goal + zn->line_sample_offset[line];
+            for (int point = 0; point < zn->line_num_points[line] - 1; point++) {
+                size_t sample = base + point;
+                if (!(zn->distance_to_goal[sample] >= 0.0f &&
+                      zn->distance_to_goal[sample] < ZNAVI_UNREACHABLE_DISTANCE - 0.01f))
+                    continue;
+                int next = zn->next_entity[sample], next_point = zn->next_point[sample];
+                int terminal_entity = entity, terminal_point = point;
+                if (next != -1) {
+                    if (next < goal * zn->num_lines || next >= (goal + 1) * zn->num_lines)
+                        continue;
+                    int next_line = next % zn->num_lines;
+                    if (zn->line_road[next_line] < 0 || next_point != zn->line_num_points[next_line] - 1)
+                        continue;
+                    terminal_entity = next;
+                    terminal_point = next_point;
+                }
+                float x, y;
+                znavi_point(zn, terminal_entity, terminal_point, &x, &y);
+                for (int i = 0; i < env->active_agent_count; i++) {
+                    Entity *agent = &env->entities[env->active_agent_indices[i]];
+                    if (agent->zdrive_goal_index != goal)
+                        continue;
+                    float dx = x - agent->goal_position_x, dy = y - agent->goal_position_y;
+                    float distance = dx * dx + dy * dy;
+                    if (distance < best_distance[i]) {
+                        best_distance[i] = distance;
+                        best_x[i] = x;
+                        best_y[i] = y;
+                    }
+                }
+            }
+        }
+    }
+    for (int i = 0; i < env->active_agent_count; i++) {
+        Entity *agent = &env->entities[env->active_agent_indices[i]];
+        if (best_distance[i] < INFINITY) {
+            agent->goal_position_x = best_x[i];
+            agent->goal_position_y = best_y[i];
+        } else if (agent->zdrive_goal_index >= 0 && agent->zdrive_goal_index < zn->num_goals) {
+            fprintf(stderr, "Warning: no usable navigation terminal for agent %d in %s; keeping logged goal\n",
+                    agent->id, env->map_name);
+        }
+    }
+}
+
 ZNavigation *load_znavigation(Drive *env) {
     const char *filename = env->map_name;
     FILE *file = fopen(filename, "rb");
@@ -711,7 +776,7 @@ ZNavigation *load_znavigation(Drive *env) {
     zn->line_y_start = (float *)zbin_alloc(num_lines, sizeof(float));
     zn->line_x_end = (float *)zbin_alloc(num_lines, sizeof(float));
     zn->line_y_end = (float *)zbin_alloc(num_lines, sizeof(float));
-    int *line_road = (int *)zbin_alloc(num_lines, sizeof(int));
+    zn->line_road = (int *)zbin_alloc(num_lines, sizeof(int));
     int *line_index = (int *)zbin_alloc(num_lines, sizeof(int));
     int samples_per_goal = 0;
     for (int j = 0; j < num_lines; j++) {
@@ -723,7 +788,7 @@ ZNavigation *load_znavigation(Drive *env) {
         // A lane with <= 1 waypoint carries no navi table, like zdrive.
         if (road >= 0 && env->entities[env->num_objects + road].array_size < 2)
             road = -1;
-        line_road[j] = road;
+        zn->line_road[j] = road;
         if (road >= 0) {
             zbin_check_range(filename, "line_index", line_index[j], 0,
                              env->entities[env->num_objects + road].array_size - 2);
@@ -785,14 +850,13 @@ ZNavigation *load_znavigation(Drive *env) {
                 zn->feasibility_center[base + s] = fmin(ZNAVI_MAX_LANE_FEASIBILITY, zn->feasibility_center[base + s]);
                 zn->feasibility_right[base + s] = fmin(ZNAVI_MAX_LANE_FEASIBILITY, zn->feasibility_right[base + s]);
             }
-            int road = line_road[j];
+            int road = zn->line_road[j];
             if (road >= 0) {
                 int num_segments = env->entities[env->num_objects + road].array_size - 1;
                 zn->road_navi_entity_idx[road][(size_t)line_index[j] + (size_t)goal * num_segments] = navi_idx;
             }
         }
     }
-    free(line_road);
     free(line_index);
     free(data);
     znavi_build_grid(env, zn);

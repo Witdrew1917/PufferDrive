@@ -727,7 +727,8 @@ struct Drive {
     bool async_resets;
     IDMMap *idm_map;
     IDMAgentState *idm_agent_states;
-    int navigation_enabled;            // ini/kwarg `navigation`; legacy maps require map_XXX.navi sidecars
+    int navigation_enabled; // ini/kwarg `navigation`; legacy maps require map_XXX.navi sidecars
+    int snap_goal_to_navi_endpoint;
     int navigation_waypoints;          // route waypoints in the observation when navigation_enabled
     float navigation_waypoint_spacing; // metres between consecutive route waypoints
     Navigation *navigation;            // legacy map_XXX.navi sidecar, NULL when absent
@@ -2614,12 +2615,6 @@ void init(Drive *env) {
     remove_bad_trajectories(env);
     set_start_position(env);
 
-    for (int x = 0; x < env->active_agent_count; x++) {
-        int agent_idx = env->active_agent_indices[x];
-        env->entities[agent_idx].init_goal_x = env->entities[agent_idx].goal_position_x;
-        env->entities[agent_idx].init_goal_y = env->entities[agent_idx].goal_position_y;
-    }
-
     env->logs = (Log *)calloc(env->active_agent_count, sizeof(Log));
     env->dynamics_noise_pos = 0.0f; // 0.0125f; Gigaflow
     env->dynamics_noise_heading = 0.0f;
@@ -2656,6 +2651,13 @@ void init(Drive *env) {
         for (int i = 0; i < env->active_agent_count; i++) {
             reset_navigation_state(env, env->active_agent_indices[i]);
         }
+    }
+    if (env->snap_goal_to_navi_endpoint && env->znavigation != NULL)
+        znavi_snap_initial_goals(env, env->znavigation);
+    for (int x = 0; x < env->active_agent_count; x++) {
+        int agent_idx = env->active_agent_indices[x];
+        env->entities[agent_idx].init_goal_x = env->entities[agent_idx].goal_position_x;
+        env->entities[agent_idx].init_goal_y = env->entities[agent_idx].goal_position_y;
     }
 }
 

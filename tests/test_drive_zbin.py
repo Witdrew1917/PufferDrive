@@ -40,7 +40,15 @@ SPEED_MPS = 5.0
 GOAL_X_M = 195.0
 
 
-def write_zbin(path, num_goals=1):
+def write_zbin(
+    path,
+    num_goals=1,
+    goal_index=0,
+    extra_terminals=None,
+    terminal_at_endpoint=False,
+    unreachable=False,
+    trajectories=None,
+):
     """v14 zbin: one vehicle driving east on a straight 200 m lane, routed to the lane end (goal index 0).
 
     Each 10 m lane segment is one navi line split into two 5 m sub-lines; the route chains every sample to the next
@@ -49,14 +57,18 @@ def write_zbin(path, num_goals=1):
     steps = np.arange(TRAJECTORY_STEPS, dtype=np.float32)
     zeros = np.zeros(TRAJECTORY_STEPS, "<f4")
     section1 = bytearray(b"synthetic_zbin".ljust(512, b"\0") + bytes(128 + 48))
-    section1 += struct.pack("<4i", 0, 0, 1, 0)  # static-expert goals, sdc index, tracks_to_predict = [0]
-    section1 += struct.pack("<i", 1)  # num_objects
-    section1 += struct.pack("<2i3fi", 1, 7, 2.0, 4.5, 1.5, TRAJECTORY_STEPS)  # vehicle id 7
-    for values in (START_X_M + steps * SPEED_MPS * 0.1, zeros, zeros, np.full(TRAJECTORY_STEPS, SPEED_MPS), zeros):
-        section1 += np.asarray(values, "<f4").tobytes()
-    section1 += zeros.tobytes() + zeros.tobytes() + np.ones(TRAJECTORY_STEPS, "<i4").tobytes()  # vz, heading, valid
-    section1 += struct.pack("<i4f2i", 0, 0.0, 1.0, GOAL_X_M, 0.0, 0, 0)  # policy agent, goal_index 0, not a zombie
-    section1 += zeros.tobytes() + zeros.tobytes() + np.zeros(TRAJECTORY_STEPS, "<i4").tobytes()
+    sdc = 0 if trajectories is None else -1
+    trajectories = trajectories if trajectories is not None else [(START_X_M, START_X_M + 45.0)]
+    section1 += struct.pack("<4i", 0, sdc, 1, 0)  # static-expert goals, sdc index, tracks_to_predict = [0]
+    section1 += struct.pack("<i", len(trajectories))
+    for i, (start, end) in enumerate(trajectories):
+        speed = (end - start) / ((TRAJECTORY_STEPS - 1) * 0.1)
+        section1 += struct.pack("<2i3fi", 1, 7 + i, 2.0, 4.5, 1.5, TRAJECTORY_STEPS)
+        for values in (start + steps * speed * 0.1, zeros, zeros, np.full(TRAJECTORY_STEPS, speed), zeros):
+            section1 += np.asarray(values, "<f4").tobytes()
+        section1 += zeros.tobytes() + zeros.tobytes() + np.ones(TRAJECTORY_STEPS, "<i4").tobytes()
+        section1 += struct.pack("<i4f2i", 0, 0.0, 1.0, GOAL_X_M, 0.0, goal_index, 0)
+        section1 += zeros.tobytes() + zeros.tobytes() + np.zeros(TRAJECTORY_STEPS, "<i4").tobytes()
 
     xs = np.arange(0.0, LANE_LENGTH_M + 1e-6, SEGMENT_M, dtype=np.float32)
     section2 = bytearray(struct.pack("<i", 2))
@@ -77,7 +89,15 @@ def write_zbin(path, num_goals=1):
             last = line == num_lines - 1
             next_entity = [goal * num_lines + line] * (SUB_LINES - 1) + [-1 if last else goal * num_lines + line + 1]
             next_point = list(range(1, SUB_LINES)) + [0]
+            for terminal_goal, terminal_line, terminal_point in extra_terminals or ():
+                if goal == terminal_goal and line == terminal_line:
+                    next_entity[terminal_point] = -1
+            if last and terminal_at_endpoint:
+                next_entity[-1] = goal * num_lines + line
+                next_point[-1] = SUB_LINES
             remaining = (LANE_LENGTH_M - sample_x).astype("<f4")
+            if unreachable:
+                remaining[:] = 2000.0
             section4 += np.asarray(next_entity, "<i4").tobytes() + np.asarray(next_point, "<i4").tobytes()
             section4 += bytes(4 * SUB_LINES) + remaining.tobytes() + bytes(4 * SUB_LINES) + remaining.tobytes()
 
@@ -120,6 +140,7 @@ ENV_SCRIPT = textwrap.dedent(
     import numpy as np
     from pufferlib.ocean.drive.drive import Drive
     config = json.loads(sys.argv[2])
+    resample_map = config.pop("resample_map", False)
     env = Drive(num_agents=1, num_maps=1, map_dir=sys.argv[1], control_mode="control_vehicles",
                 episode_length=91, resample_frequency=0, **config)
     obs, _ = env.reset(seed=0)
@@ -128,12 +149,17 @@ ENV_SCRIPT = textwrap.dedent(
         obs, reward, *_ = env.step(np.zeros_like(env.actions))
         observations.append(obs[0].tolist())
         rewards.append(float(reward[0]))
+    reset_obs, _ = env.reset(seed=0)
+    if resample_map:
+        env.resample_maps()
+        reset_obs = env.observations
     print("RESULT " + json.dumps({
         "ego": env.ego_features,
         "waypoint_features": env.waypoint_features,
         "max_waypoints": env.max_waypoints,
         "observations": observations,
         "rewards": rewards,
+        "reset_goal": reset_obs[0, 4:6].tolist(),
     }))
     env.close()
     """
@@ -227,6 +253,70 @@ class TestZbinEnv(unittest.TestCase):
         last_logged_x = START_X_M + (TRAJECTORY_STEPS - 1) * SPEED_MPS * 0.1
         first = self._result(navigation=1)["observations"][0]
         np.testing.assert_allclose(first[4:6] / 0.005, [last_logged_x - START_X_M, 0.0], atol=1e-3)
+
+    def test_snap_initial_goal_to_closest_terminal_on_existing_route(self):
+        write_zbin(
+            self.map_dir / "map_000.bin",
+            num_goals=2,
+            extra_terminals=[(0, 8, 0), (0, 10, 0), (1, 7, 0)],
+        )
+        for navigation in (0, 1):
+            result = self._result(navigation=navigation, snap_goal_to_navi_endpoint=1)
+            expected = [(80.0 - START_X_M) * 0.005, 0.0]
+            np.testing.assert_allclose(result["observations"][0, 4:6], expected, atol=1e-6)
+            np.testing.assert_allclose(result["reset_goal"], expected, atol=1e-6)
+
+    def test_snap_preserves_agent_selection_and_initial_state(self):
+        # Agent 7's logged goal is too close to be controlled, while agent 8's is eligible.
+        # Snapping reverses those distances, so selection must happen using the logged goals.
+        write_zbin(
+            self.map_dir / "map_000.bin",
+            trajectories=[(20.0, 21.0), (30.0, 80.0)],
+            extra_terminals=[(0, 3, 0)],
+        )
+        for navigation in (0, 1):
+            off = self._result(navigation=navigation, snap_goal_to_navi_endpoint=0)
+            on = self._result(navigation=navigation, snap_goal_to_navi_endpoint=1)
+            off_first = off["observations"][0]
+            on_first = on["observations"][0]
+            np.testing.assert_allclose(off_first[4:6], [0.25, 0.0], atol=1e-6)
+            np.testing.assert_allclose(on_first[4:6], [0.0, 0.0], atol=1e-6)
+            np.testing.assert_array_equal(np.delete(off_first, [4, 5]), np.delete(on_first, [4, 5]))
+
+    def test_snap_to_terminal_at_end_of_segment_after_resampling(self):
+        write_zbin(self.map_dir / "map_000.bin", terminal_at_endpoint=True)
+        result = self._result(snap_goal_to_navi_endpoint=1, goal_behavior=1, resample_map=True)
+        expected = [(LANE_LENGTH_M - START_X_M) * 0.005, 0.0]
+        np.testing.assert_allclose(result["observations"][0, 4:6], expected, atol=1e-6)
+        np.testing.assert_allclose(result["reset_goal"], expected, atol=1e-6)
+
+    def test_snap_does_not_change_generated_goals(self):
+        config = {"goal_behavior": 1, "goal_radius": 1000.0}
+        off = self._result(**config, snap_goal_to_navi_endpoint=0)
+        on = self._result(**config, snap_goal_to_navi_endpoint=1)
+        self.assertNotEqual(off["observations"][0, 4], on["observations"][0, 4])
+        np.testing.assert_array_equal(off["observations"][1:, 4:6], on["observations"][1:, 4:6])
+
+    def test_snap_keeps_logged_goal_without_a_route(self):
+        write_zbin(self.map_dir / "map_000.bin", num_goals=0, goal_index=-1)
+        off = self._result(snap_goal_to_navi_endpoint=0)
+        on = self._result(snap_goal_to_navi_endpoint=1)
+        np.testing.assert_array_equal(off["observations"][:, 4:6], on["observations"][:, 4:6])
+
+    def test_snap_warns_when_route_has_no_usable_terminal(self):
+        write_zbin(self.map_dir / "map_000.bin", unreachable=True)
+        off = self._result(snap_goal_to_navi_endpoint=0)
+        completed = self._run_env(snap_goal_to_navi_endpoint=1)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("no usable navigation terminal", completed.stderr)
+        line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT "))
+        on = json.loads(line[len("RESULT ") :])
+        np.testing.assert_allclose(off["observations"][:, 4:6], np.array(on["observations"])[:, 4:6])
+
+    def test_snap_rejects_invalid_setting(self):
+        completed = self._run_env(snap_goal_to_navi_endpoint=2)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("snap_goal_to_navi_endpoint", completed.stderr)
 
     def test_invalid_lookahead_config_is_rejected(self):
         for config, message in (

@@ -72,6 +72,7 @@ int demo(const char *map_name, const char *policy_name, int show_grid, int obs_o
         .goal_target_distance = conf.goal_target_distance,
         .goal_speed = conf.goal_speed,
         .goal_obs_dropout_prob = conf.goal_obs_dropout_prob,
+        .snap_goal_to_navi_endpoint = conf.snap_goal_to_navi_endpoint,
         .dt = conf.dt,
         .episode_length = conf.episode_length,
         .termination_mode = conf.termination_mode,

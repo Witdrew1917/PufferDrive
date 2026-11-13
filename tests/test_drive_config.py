@@ -95,6 +95,11 @@ class TestDriveConfig(unittest.TestCase):
         args = load_config("puffer_drive")
         self.assertEqual(args["train"]["learning_rate"], 0.5)
 
+    @patch("sys.argv", ["pufferl.py", "--env.snap-goal-to-navi-endpoint=1"])
+    def test_snap_goal_cli_override(self):
+        args = load_config("puffer_drive")
+        self.assertEqual(args["env"]["snap_goal_to_navi_endpoint"], 1)
+
     def test_full_line_comment_handling(self):
         """Test that full-line comments in INI files are ignored."""
         config_dir = Path(pufferlib.__file__).parent / "config"

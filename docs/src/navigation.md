@@ -8,7 +8,8 @@ Lane navigation gives agents a lane-level route to their goal. There are two bac
 
 Navigation data is **loaded whenever it is present** (sidecar or built-in sections). It then drives the
 `navi_*` metrics and the render overlay. Agents only **use** it when `navigation = 1`. With `navigation = 0`
-(default), observations, rewards, goals and the policy are identical to a run without navigation data.
+(default), observations, rewards, goals and the policy are identical to a run without navigation data unless
+`snap_goal_to_navi_endpoint` is enabled.
 
 With `navigation = 1` the environment:
 
@@ -17,8 +18,7 @@ With `navigation = 1` the environment:
 - appends a **route-waypoint stream** to the observation (`navigation_waypoints` × 3 floats for legacy maps,
   × 2 for zpufferdrive maps),
 - enables the `reward_progress_navi` reward,
-- for legacy maps only, snaps newly sampled goals to sidecar goal lanes. zpufferdrive goals are never moved by
-  navigation.
+- for legacy maps only, snaps newly sampled goals to sidecar goal lanes.
 
 ## Quick start
 
@@ -45,6 +45,7 @@ The C extension needs no rebuild when switching `navigation` on or off; all sett
 | Key | Default | Description |
 |-----|---------|-------------|
 | `navigation` | `0` | `1` lets agents use navigation. Legacy maps then need a `.navi` sidecar for every map in `map_dir`. |
+| `snap_goal_to_navi_endpoint` | `0` | For zpufferdrive maps, snap initial logged goals to the nearest usable terminal on each agent's existing route. Independent of `navigation`; generated goals are unchanged. |
 | `navigation_waypoints` | `16` | Route waypoints observed per agent: `[1, 64]` (`NAVI_MAX_WAYPOINTS`) for legacy maps, `[1, 50]` (`NAVI_LOOKAHEAD_WAYPOINTS_MAX`) for zpufferdrive maps. |
 | `navigation_waypoint_spacing` | `5.0` | Legacy maps: metres between consecutive waypoints along the route (> 0). |
 | `navigation_lookahead_distance` | `120.0` | zpufferdrive maps: route arclength covered by the waypoints, in metres. Must satisfy `0 < distance <= navigation_lookahead_norm`. |
@@ -183,8 +184,12 @@ Sections 1 and 2 populate the agents and roads:
   shifted down by one to PufferDrive's numbering. Each road keeps its `speed_limit`, which only navigation uses.
 - Each object's goal is its last valid logged position, as in legacy PufferDrive maps (the scenario JSON
   `goalPosition`). zdrive's route-snapped `goal_x`, `goal_y` is ignored, so a route (`goal_index`, which is kept) can
-  end a few metres from the goal. Objects with a non-zero `expert_type`, and zombies, are marked as experts and replay
-  their logs. Expert-action arrays are filled with -1.
+  end a few metres from the goal. With `snap_goal_to_navi_endpoint = 1`, initial controlled-agent goals instead
+  use the nearest usable terminal of that route; agents without one keep their logged goal (with a warning when a
+  route exists). Snapping occurs after agent selection and initialization, so eligibility is determined by the
+  logged goals.
+  Objects with a non-zero `expert_type`, and zombies, are marked as experts and replay their logs.
+  Expert-action arrays are filled with -1.
 - Up to 128 objects are loaded. `scenario_id` is truncated to 16 characters. Hybrid-action and turn-indicator data
   are ignored.
 
