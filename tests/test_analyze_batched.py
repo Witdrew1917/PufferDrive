@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from examples import analyze_batched as batched
+from scripts.analyze import analyze_batched as batched
 
 
 RUN = "laveno-chalmers-university-of-technology/pufferlib/ssuuqvs3"
@@ -141,6 +141,7 @@ class TestAnalyzeBatched(unittest.TestCase):
         args = batched.parse_args([RUN, other, "--dynamics", RUN, "classic", "--dynamics", other, "jerk"])
         self.assertEqual(args.runs, [RUN, other])
         self.assertEqual(args.dynamics, {RUN: "classic", other: "jerk"})
+        self.assertEqual(args.output_csv, Path(batched.OUTPUT_CSV))
         self.assertFalse(args.no_cached)
         self.assertTrue(batched.parse_args([RUN, "--no-cached"]).no_cached)
         for arguments in (
@@ -151,6 +152,88 @@ class TestAnalyzeBatched(unittest.TestCase):
         ):
             with self.subTest(arguments=arguments), patch("sys.stderr"), self.assertRaises(SystemExit):
                 batched.parse_args(arguments)
+
+    def test_batch_file_parses_comments_and_per_run_overrides(self):
+        batch = self.directory / "batch.txt"
+        other = "entity/project/other"
+        batch.write_text(
+            f"# group\n{RUN} --env.goal-obs-dropout-prob=0.0 --env.navigation 1 # inline\n"
+            f"\n{other} --env.map-dir='a # b'\n{RUN} --env.navigation=0\n",
+            encoding="utf-8",
+        )
+        args = batched.parse_args([str(batch), "--dynamics", other, "jerk"])
+        self.assertEqual(
+            args.entries,
+            [
+                (RUN, {"env.goal_obs_dropout_prob": 0.0, "env.navigation": 1}),
+                (other, {"env.map_dir": "a # b"}),
+                (RUN, {"env.navigation": 0}),
+            ],
+        )
+        self.assertEqual(args.dynamics, {other: "jerk"})
+        self.assertEqual(args.output_csv, Path("results/batch.csv"))
+        custom_output = self.directory / "custom.csv"
+        self.assertEqual(batched.parse_args([str(batch), "--output-csv", str(custom_output)]).output_csv, custom_output)
+
+    def test_batch_file_reports_invalid_entries(self):
+        batch = self.directory / "batch.txt"
+        for contents in (
+            "# no runs\n",
+            "invalid\n",
+            f"{RUN} --env.navigation\n",
+            f"{RUN} --env.navigation=1 --env.navigation=0\n",
+            f"{RUN} unexpected\n",
+            f"{RUN} --env.navigation='unterminated\n",
+        ):
+            with self.subTest(contents=contents):
+                batch.write_text(contents, encoding="utf-8")
+                with patch("sys.stderr"), self.assertRaises(SystemExit):
+                    batched.parse_args([str(batch)])
+
+    def test_batch_overrides_apply_to_policy_and_rollouts(self):
+        self.base["env"].update(goal_obs_dropout_prob=0.8, episode_length=91)
+        self.save_config({"dynamics_model": "classic", "navigation": 0, "goal_obs_dropout_prob": 0.7})
+        batch = self.directory / "batch.txt"
+        batch.write_text(
+            f"{RUN} --env.goal-obs-dropout-prob=0.0 --env.episode-length=123\nentity/project/other\n",
+            encoding="utf-8",
+        )
+        with (
+            patch.object(batched, "load_config", return_value=self.base),
+            patch.object(batched.wandb, "Api"),
+            patch.object(batched, "download_checkpoint", return_value=self.checkpoint),
+            patch.object(batched, "load_env") as load_env,
+            patch.object(batched, "load_policy"),
+            patch.object(batched, "CheckpointEvaluator"),
+            patch.object(batched, "run_mode", return_value=[]) as run_mode,
+        ):
+            batched.main([str(batch), "--output-csv", str(self.directory / "out.csv")])
+        first_policy_config = load_env.call_args_list[0].args[1]["env"]
+        second_policy_config = load_env.call_args_list[1].args[1]["env"]
+        self.assertEqual(
+            (first_policy_config["goal_obs_dropout_prob"], first_policy_config["episode_length"]), (0.0, 123)
+        )
+        self.assertEqual(
+            (second_policy_config["goal_obs_dropout_prob"], second_policy_config["episode_length"]), (0.7, 200)
+        )
+        first_call = run_mode.call_args_list[0]
+        eval_config = batched.make_eval_config(
+            first_call.args[2], "maps", "control_vehicles", 10, overrides=first_call.kwargs["overrides"]
+        )
+        self.assertEqual(
+            (eval_config["env"]["goal_obs_dropout_prob"], eval_config["env"]["episode_length"]), (0.0, 123)
+        )
+        self.assertEqual(run_mode.call_args_list[4].kwargs["overrides"], {})
+        self.assertEqual(self.base["env"]["goal_obs_dropout_prob"], 0.8)
+
+    def test_unknown_override_is_rejected(self):
+        self.save_config({"dynamics_model": "classic", "navigation": 0, "legacy_setting": 1})
+        config = batched.prepare_checkpoint_config(self.checkpoint, self.base, RUN, overrides={"env.legacy_setting": 2})
+        self.assertEqual(config["env"]["legacy_setting"], 2)
+        with self.assertRaisesRegex(ValueError, "Unknown config override"):
+            batched.prepare_checkpoint_config(self.checkpoint, self.base, RUN, overrides={"env.goal_obs_dropout": 0.0})
+        with self.assertRaisesRegex(ValueError, "managed by the evaluator"):
+            batched.prepare_checkpoint_config(self.checkpoint, self.base, RUN, overrides={"load_id": "other"})
 
     def test_rollout_resampling_preserves_checkpoint_settings(self):
         config = {"env": {"dynamics_model": "jerk", "navigation": 1, "episode_length": 100}}

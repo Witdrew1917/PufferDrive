@@ -1,0 +1,15 @@
+#navi
+laveno-chalmers-university-of-technology/pufferlib/shosze11 --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/f8suvis3 --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/u0p1u0vs --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/x6ch5jaj --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/95485a44 --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/ssuuqvs3 --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+
+#baseline
+laveno-chalmers-university-of-technology/pufferlib/5bf8dyqe --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/26qvlt7z --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/uf2lfsvh --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/15ss6v9u --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/1bquuqzu --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1
+laveno-chalmers-university-of-technology/pufferlib/ue6875oi --env.goal-obs-dropout-prob=0.0 --env.snap-goal-to-navi-endpoint=1

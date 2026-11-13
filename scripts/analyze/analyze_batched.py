@@ -1,10 +1,15 @@
 r"""Evaluate W&B model artifacts without checkpoint filename conventions.
 
 Usage:
-    python examples/analyze_batched.py ENTITY/PROJECT/RUN_ID [ENTITY/PROJECT/RUN_ID ...]
-    python examples/analyze_batched.py ENTITY/PROJECT/RUN_ID \
+    python scripts/analyze/analyze_batched.py scripts/analyze/batch_descriptions/goal_dropout.txt
+    python scripts/analyze/analyze_batched.py ENTITY/PROJECT/RUN_ID [ENTITY/PROJECT/RUN_ID ...]
+    python scripts/analyze/analyze_batched.py ENTITY/PROJECT/RUN_ID \
         --dynamics ENTITY/PROJECT/RUN_ID delta_local --output-csv results/batched.csv
 
+The batch file contains one run per line, followed by optional config overrides,
+such as --env.goal-obs-dropout-prob=0.0. Blank lines and # comments are ignored.
+Overrides use config section and key names and take precedence over evaluation defaults.
+By default, batch results are saved to results/<batch-file-stem>.csv.
 Each run resolves to its model artifact at RUN_PATH:v0. Dynamics come from the
 checkpoint's full_args; --dynamics supplies them only when absent. In that case,
 full_args must explicitly set env.navigation to 0 or 1.
@@ -12,7 +17,9 @@ Verified local artifacts are reused unless --no-cached is supplied.
 """
 
 import argparse
+import ast
 import copy
+import shlex
 import shutil
 import sys
 import tempfile
@@ -74,7 +81,26 @@ def load_checkpoint_config(checkpoint_path, fallback_config):
     return copy.deepcopy(fallback_config), False
 
 
-def make_eval_config(cpt_config, map_dir, control_mode, num_maps, episode_length=200, controller_overrides=None):
+def apply_overrides(config, overrides, reference_config):
+    for key, value in overrides.items():
+        if key in ("load_model_path", "load_id"):
+            raise ValueError(f"Config override --{key.replace('_', '-')} is managed by the evaluator")
+        parts = key.split(".")
+        target = config
+        reference = reference_config
+        for part in parts[:-1]:
+            if part not in target or not isinstance(target[part], dict):
+                raise ValueError(f"Config section {part!r} is missing or not a mapping")
+            target = target[part]
+            reference = reference.get(part, {}) if isinstance(reference, dict) else {}
+        if parts[-1] not in target and (not isinstance(reference, dict) or parts[-1] not in reference):
+            raise ValueError(f"Unknown config override --{key.replace('_', '-')}")
+        target[parts[-1]] = value
+
+
+def make_eval_config(
+    cpt_config, map_dir, control_mode, num_maps, episode_length=200, controller_overrides=None, overrides=None
+):
     config = copy.deepcopy(cpt_config)
     config["env"].update(
         map_dir=map_dir,
@@ -95,6 +121,8 @@ def make_eval_config(cpt_config, map_dir, control_mode, num_maps, episode_length
     if controller_overrides is not None:
         config["env"].update(controller_overrides)
     config["vec"] = {"backend": "PufferEnv", "num_envs": 1}
+    if overrides:
+        apply_overrides(config, overrides, cpt_config)
     return config
 
 
@@ -124,8 +152,11 @@ def run_mode(
     num_maps,
     controller_overrides=None,
     total_eval_agents=NUM_TOTAL_EVAL_AGENTS,
+    overrides=None,
 ):
-    config = make_eval_config(cpt_config, map_dir, control_mode, num_maps, controller_overrides=controller_overrides)
+    config = make_eval_config(
+        cpt_config, map_dir, control_mode, num_maps, controller_overrides=controller_overrides, overrides=overrides
+    )
     env = load_env(ENV_NAME, config)
     rows = []
     n_rounds = max(1, (total_eval_agents + NUM_AGENTS_PER_VECENV - 1) // NUM_AGENTS_PER_VECENV)
@@ -174,9 +205,49 @@ def run_path(value):
     return value
 
 
+def load_batch_descriptions(filename):
+    entries = []
+    with filename.open(encoding="utf-8") as file:
+        for line_number, line in enumerate(file, 1):
+            try:
+                tokens = shlex.split(line, comments=True)
+                if not tokens:
+                    continue
+                path = run_path(tokens[0])
+                overrides = {}
+                index = 1
+                while index < len(tokens):
+                    token = tokens[index]
+                    if not token.startswith("--"):
+                        raise ValueError(f"Expected a config override, got {token!r}")
+                    key, separator, value = token[2:].partition("=")
+                    if not separator:
+                        index += 1
+                        if index >= len(tokens) or tokens[index].startswith("--"):
+                            raise ValueError(f"Missing value for --{key}")
+                        value = tokens[index]
+                    key = key.replace("-", "_")
+                    if not key or any(not part for part in key.split(".")):
+                        raise ValueError(f"Invalid config override {token!r}")
+                    if key in overrides:
+                        raise ValueError(f"Duplicate config override --{key.replace('_', '-')}")
+                    try:
+                        value = ast.literal_eval(value)
+                    except (ValueError, SyntaxError):
+                        pass
+                    overrides[key] = value
+                    index += 1
+                entries.append((path, overrides))
+            except (ValueError, argparse.ArgumentTypeError) as error:
+                raise ValueError(f"{filename}:{line_number}: {error}") from error
+    if not entries:
+        raise ValueError(f"{filename}: no runs found")
+    return entries
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("runs", nargs="+", type=run_path, help="W&B run paths (model artifact version v0)")
+    parser.add_argument("runs", nargs="+", help="W&B run paths or a batch description .txt file")
     parser.add_argument(
         "--dynamics",
         nargs=2,
@@ -185,11 +256,28 @@ def parse_args(argv=None):
         metavar=("RUN_PATH", "MODEL"),
         help=f"Pair a run missing checkpoint dynamics with one of: {', '.join(DYNAMICS_MODELS)}; repeat as needed",
     )
-    parser.add_argument("--output-csv", type=Path, default=Path(OUTPUT_CSV))
+    parser.add_argument("--output-csv", type=Path, help="Override the default results CSV path")
     parser.add_argument(
         "--no-cached", action="store_true", help="Force a fresh download, bypassing local and W&B caches"
     )
     args = parser.parse_args(argv)
+    if len(args.runs) == 1 and args.runs[0].endswith(".txt"):
+        batch_file = Path(args.runs[0])
+        try:
+            args.entries = load_batch_descriptions(batch_file)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        args.runs = [path for path, _ in args.entries]
+        if args.output_csv is None:
+            args.output_csv = Path(OUTPUT_CSV).parent / f"{batch_file.stem}.csv"
+    else:
+        try:
+            args.runs = [run_path(path) for path in args.runs]
+        except argparse.ArgumentTypeError as error:
+            parser.error(str(error))
+        args.entries = [(path, {}) for path in args.runs]
+        if args.output_csv is None:
+            args.output_csv = Path(OUTPUT_CSV)
     dynamics = {}
     for path, model in args.dynamics:
         if path not in args.runs:
@@ -237,8 +325,10 @@ def download_checkpoint(api, path, no_cached=False):
     return find_checkpoint(directory, path)
 
 
-def prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics=None):
+def prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics=None, overrides=None):
     config, stored = load_checkpoint_config(checkpoint_path, base_config)
+    if overrides:
+        apply_overrides(config, overrides, base_config)
     checkpoint_env = config.get("env", {}) if stored else {}
     configured_dynamics = checkpoint_env.get("dynamics_model")
     if not configured_dynamics:
@@ -259,14 +349,16 @@ def prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics=None)
     return config
 
 
-def evaluate_runs(api, paths, base_config, dynamics, no_cached=False):
+def evaluate_runs(api, entries, base_config, dynamics, no_cached=False):
     all_rows = []
-    for path in paths:
+    for path, overrides in entries:
         print(f"\nEvaluating {path}")
         checkpoint_path = download_checkpoint(api, path, no_cached=no_cached)
-        config = prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics.get(path))
+        config = prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics.get(path), overrides)
 
-        policy_config = make_eval_config(config, TRAIN_MAP_DIR, control_mode="control_vehicles", num_maps=50_000)
+        policy_config = make_eval_config(
+            config, TRAIN_MAP_DIR, control_mode="control_vehicles", num_maps=50_000, overrides=overrides
+        )
         env = load_env(ENV_NAME, policy_config)
         try:
             policy = load_policy(config, env, ENV_NAME)
@@ -300,6 +392,7 @@ def evaluate_runs(api, paths, base_config, dynamics, no_cached=False):
                 num_maps,
                 controller_overrides=controllers,
                 total_eval_agents=total_agents,
+                overrides=overrides,
             )
             for row in rows:
                 row["run_path"] = path
@@ -318,7 +411,7 @@ def main(argv=None):
     finally:
         sys.argv = original_argv
 
-    rows = evaluate_runs(wandb.Api(), args.runs, base_config, args.dynamics, no_cached=args.no_cached)
+    rows = evaluate_runs(wandb.Api(), args.entries, base_config, args.dynamics, no_cached=args.no_cached)
     df = pd.DataFrame(rows)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output_csv, index=False)
