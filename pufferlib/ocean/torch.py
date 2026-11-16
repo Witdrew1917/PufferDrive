@@ -12,14 +12,31 @@ from pufferlib.models import Convolutional as Conv  # noqa: F401
 
 Recurrent = pufferlib.models.LSTMWrapper
 
+class BootstrappedDrive(nn.Module):
 
-class MockBCPolicy(nn.Module):
+    def __init__(self, env, input_size=128, hidden_size=128, **kwargs) -> None:
+        super().__init__()
+
+        self.policy = Drive(env, input_size, hidden_size, **kwargs)
+        self.anchor = BCPolicy(env, input_size, hidden_size, **kwargs)
+
+    def forward(self, observations, state=None):
+        return self.policy(observations)
+
+    def forward_train(self, x, state=None):
+        return self.policy.forward_train(x, state)
+
+    def forward_eval(self, observations, state=None):
+        return self.policy.forward_eval(observations)
+
+
+class BCPolicy(nn.Module):
     """BC policy supporting both joint (single head) and independent (multi-head) action spaces."""
 
     def __init__(self, env, input_size=128, hidden_size=128, **kwargs):
         super().__init__()
 
-        output_sizes = [51, 51, 127]
+        output_sizes = env.single_action_space.nvec.tolist()
         self.num_heads = len(output_sizes)
         self.hidden_size = hidden_size
         self.obs_dim = env.single_observation_space.shape[0]
