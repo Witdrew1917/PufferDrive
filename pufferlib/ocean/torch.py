@@ -1,6 +1,7 @@
 from torch import nn
 import torch
 import torch.nn.functional as F
+from torch.distributions.categorical import Categorical
 
 import pufferlib
 import pufferlib.models
@@ -10,6 +11,103 @@ from pufferlib.models import Convolutional as Conv  # noqa: F401
 
 
 Recurrent = pufferlib.models.LSTMWrapper
+
+
+class MockBCPolicy(nn.Module):
+    """BC policy supporting both joint (single head) and independent (multi-head) action spaces."""
+
+    def __init__(self, env, input_size=128, hidden_size=128, **kwargs):
+        super().__init__()
+
+        output_sizes = [51, 51, 127]
+        self.num_heads = len(output_sizes)
+        self.hidden_size = hidden_size
+        self.obs_dim = env.single_observation_space.shape[0]
+        self.max_partner_objects = env.max_partner_objects
+        self.partner_features = env.partner_features
+        self.max_road_objects = env.max_road_objects
+        self.road_features = env.road_features
+        self.road_features_after_onehot = env.road_features + 6  # 6 is the number of one-hot encoded categories
+        self.ego_dim = env.ego_features
+        self.is_continuous = False
+
+        self.ego_encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size)),
+            nn.ReLU(),
+            nn.LayerNorm(input_size),
+            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+        )
+        self.road_encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(self.road_features_after_onehot, input_size)),
+            nn.ReLU(),
+            nn.LayerNorm(input_size),
+            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+        )
+        self.partner_encoder = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(self.partner_features, input_size)),
+            nn.ReLU(),
+            nn.LayerNorm(input_size),
+            pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+        )
+        self.shared_embedding = nn.Sequential(
+            pufferlib.pytorch.layer_init(nn.Linear(3 * input_size, 512)),
+            nn.ReLU(),
+            pufferlib.pytorch.layer_init(nn.Linear(512, hidden_size)),
+        )
+        self.heads = nn.ModuleList([nn.Linear(hidden_size, s) for s in output_sizes])
+
+    def encode_observations(self, observations, state=None):
+        ego_dim = self.ego_dim
+        partner_dim = self.max_partner_objects * self.partner_features
+        ego_obs = observations[:, :ego_dim]
+        partner_obs = observations[:, ego_dim : ego_dim + partner_dim]
+        road_obs = observations[:, ego_dim + partner_dim :]
+
+        partner_objects = partner_obs.view(-1, self.max_partner_objects, self.partner_features)
+        road_objects = road_obs.view(-1, self.max_road_objects, self.road_features)
+        road_continuous = road_objects[:, :, : self.road_features - 1]
+        road_categorical = road_objects[:, :, self.road_features - 1]
+        road_onehot = F.one_hot(road_categorical.long(), num_classes=7)
+        road_objects = torch.cat([road_continuous, road_onehot], dim=2)
+
+        ego_features = self.ego_encoder(ego_obs)
+        partner_features, _ = self.partner_encoder(partner_objects).max(dim=1)
+        road_features, _ = self.road_encoder(road_objects).max(dim=1)
+
+        concat_features = torch.cat([ego_features, road_features, partner_features], dim=1)
+        return F.relu(self.shared_embedding(concat_features))
+
+    def dist(self, obs):
+        hidden = self.encode_observations(obs.float())
+        return [Categorical(logits=head(hidden)) for head in self.heads]
+
+    def forward(self, obs, deterministic=False):
+        dists = self.dist(obs)
+        actions = [d.logits.argmax(dim=-1) if deterministic else d.sample() for d in dists]
+        actions = actions[0].float() if self.num_heads == 1 else [a.float() for a in actions]
+        return actions
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations.float())
+        actions = [head(hidden) for head in self.heads]
+        return actions, torch.zeros(size=hidden.shape[:-1] + (1,), device=hidden.device)
+
+    def get_action_dist_logits(self, obs):
+        """Get logits from all heads. Returns list of tensors."""
+        return [d.logits for d in self.dist(obs)]
+
+    def _log_prob(self, obs, expert_actions):
+        dists = self.dist(obs)
+        if self.num_heads == 1:
+            return dists[0].log_prob(expert_actions.squeeze(-1).long()).mean()
+        log_prob = sum(d.log_prob(expert_actions[:, i].long()).mean() for i, d in enumerate(dists))
+        return log_prob / self.num_heads
+
+    def _entropy(self, obs):
+        dists = self.dist(obs)
+        if self.num_heads == 1:
+            return dists[0].entropy().mean().item()
+        return {f"entropy_head_{i}": d.entropy().mean().item() for i, d in enumerate(dists)}
 
 
 class Drive(nn.Module):
