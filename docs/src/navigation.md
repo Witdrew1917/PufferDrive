@@ -51,6 +51,27 @@ The C extension needs no rebuild when switching `navigation` on or off; all sett
 | `navigation_lookahead_distance` | `120.0` | zpufferdrive maps: route arclength covered by the waypoints, in metres. Must satisfy `0 < distance <= navigation_lookahead_norm`. |
 | `navigation_lookahead_norm` | `150.0` | zpufferdrive maps: metres that waypoint coordinates are divided by. |
 
+## Navigation PID controller
+
+Select `navi_pid` with `--env.sdc-controller navi_pid` or `--env.non-sdc-controller navi_pid`. It follows
+navigation routes even when policy navigation observations are disabled. Zpufferdrive maps use the localized lane
+speed limit multiplied by `navi_pid_speed_limit_fraction`; legacy maps do not expose lane speed limits to this
+controller and use `navi_pid_default_speed` instead. The target is also capped by
+`sqrt(4.0 / |curvature|)` (m/s), limiting lateral acceleration to 4 m/s²; the lower of this and the configured
+speed target is used.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `navi_pid_speed_gain` | `1.0` | Gain on desired-speed error. |
+| `navi_pid_gap_position_gain` | `1.0` | Gain on following-distance error. |
+| `navi_pid_gap_velocity_gain` | `1.0` | Gain on lead-versus-ego speed error. |
+| `navi_pid_lateral_offset_gain` | `0.01` | Gain on lateral route-offset error (m). |
+| `navi_pid_heading_gain` | `0.25` | Gain on heading error (rad). |
+| `navi_pid_speed_limit_fraction` | `1.0` | Fraction of the localized lane speed limit used as the target, in `[0, 1]`. |
+| `navi_pid_default_speed` | `9.0` | Fallback target speed in m/s when no usable lane limit is available. |
+
+All gains must be finite and non-negative, and the fallback speed must be positive.
+
 > [!IMPORTANT]
 > `navigation`, `navigation_waypoints` and the map format change the observation size. A policy trained with one
 > setting cannot be loaded with another. `navigation_waypoint_spacing`, `navigation_lookahead_distance` and
@@ -277,6 +298,22 @@ The ego encoder picks up the 3 extra features automatically through `env.ego_fea
 model and its checkpoints are unchanged.
 
 The C demo policy (`drivenet.h`, used by `drive.c`) has no waypoint branch and refuses to run with `navigation = 1`.
+
+## Navigation controller
+
+Set `sdc_controller`, `non_sdc_controller`, or `non_vehicle_controller` to `navi_pid` to follow the navigation
+route with a kinematic bicycle controller. It uses proportional speed and route-tracking feedback and a
+proportional/derivative following-gap controller; it does not use a learned policy or the IDM extension. It works
+with either map format and also works with `navigation = 0`, without changing policy observation sizes.
+Legacy maps still require sidecars for every map. With `non_sdc_controller = "navi_pid"`, the default
+`non_vehicle_controller = "auto"` replays non-vehicles. Explicitly selected non-expert background agents also use
+`navi_pid` when the active-agent limit is reached.
+
+The controller uses zbin lane speed limits, or 9 m/s when no usable limit is available. It brakes for vehicles
+ahead and near the end of the available route. If localization fails or the agent has no reachable navigation
+goal, it warns and brakes rather than continuing without guidance. The controller follows the navigation
+terminal, which can differ from the visible logged goal; zbin retains its original route after a goal resample.
+Lateral tracking uses 2D route waypoints, so it does not model road elevation changes.
 
 ## Metrics
 

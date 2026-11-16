@@ -48,6 +48,8 @@ def write_zbin(
     terminal_at_endpoint=False,
     unreachable=False,
     trajectories=None,
+    sdc_track_index=None,
+    trajectory_y=0.0,
 ):
     """v14 zbin: one vehicle driving east on a straight 200 m lane, routed to the lane end (goal index 0).
 
@@ -56,15 +58,16 @@ def write_zbin(
     """
     steps = np.arange(TRAJECTORY_STEPS, dtype=np.float32)
     zeros = np.zeros(TRAJECTORY_STEPS, "<f4")
+    ys = np.full(TRAJECTORY_STEPS, trajectory_y, "<f4")
     section1 = bytearray(b"synthetic_zbin".ljust(512, b"\0") + bytes(128 + 48))
-    sdc = 0 if trajectories is None else -1
+    sdc = (0 if trajectories is None else -1) if sdc_track_index is None else sdc_track_index
     trajectories = trajectories if trajectories is not None else [(START_X_M, START_X_M + 45.0)]
     section1 += struct.pack("<4i", 0, sdc, 1, 0)  # static-expert goals, sdc index, tracks_to_predict = [0]
     section1 += struct.pack("<i", len(trajectories))
     for i, (start, end) in enumerate(trajectories):
         speed = (end - start) / ((TRAJECTORY_STEPS - 1) * 0.1)
         section1 += struct.pack("<2i3fi", 1, 7 + i, 2.0, 4.5, 1.5, TRAJECTORY_STEPS)
-        for values in (start + steps * speed * 0.1, zeros, zeros, np.full(TRAJECTORY_STEPS, speed), zeros):
+        for values in (start + steps * speed * 0.1, ys, zeros, np.full(TRAJECTORY_STEPS, speed), zeros):
             section1 += np.asarray(values, "<f4").tobytes()
         section1 += zeros.tobytes() + zeros.tobytes() + np.ones(TRAJECTORY_STEPS, "<i4").tobytes()
         section1 += struct.pack("<i4f2i", 0, 0.0, 1.0, GOAL_X_M, 0.0, goal_index, 0)
@@ -149,6 +152,8 @@ ENV_SCRIPT = textwrap.dedent(
         obs, reward, *_ = env.step(np.zeros_like(env.actions))
         observations.append(obs[0].tolist())
         rewards.append(float(reward[0]))
+    state = env.get_global_agent_state()
+    final_state = {key: float(state[key][0]) for key in ("x", "y", "heading")}
     reset_obs, _ = env.reset(seed=0)
     if resample_map:
         env.resample_maps()
@@ -159,6 +164,7 @@ ENV_SCRIPT = textwrap.dedent(
         "max_waypoints": env.max_waypoints,
         "observations": observations,
         "rewards": rewards,
+        "final_state": final_state,
         "reset_goal": reset_obs[0, 4:6].tolist(),
     }))
     env.close()
@@ -241,6 +247,89 @@ class TestZbinEnv(unittest.TestCase):
         without_routes = self._result(map_dir=no_routes, **config)
         np.testing.assert_array_equal(with_routes["observations"], without_routes["observations"])
         self.assertEqual(with_routes["rewards"], without_routes["rewards"])
+
+    def test_navi_pid_uses_route_without_policy_navigation(self):
+        off = self._result(navigation=0, sdc_controller="navi_pid")
+        on = self._result(navigation=1, sdc_controller="navi_pid")
+        self.assertGreater(off["observations"][-1, 6], off["observations"][0, 6])
+        np.testing.assert_allclose(off["observations"][:, :12], on["observations"][:, :12], atol=1e-6)
+
+    def test_navi_pid_speed_gain_and_speed_limit_fraction(self):
+        full_speed = self._result(navigation=0, sdc_controller="navi_pid")
+        no_speed_gain = self._result(navigation=0, sdc_controller="navi_pid", navi_pid_speed_gain=0.0)
+        half_speed_limit = self._result(navigation=0, sdc_controller="navi_pid", navi_pid_speed_limit_fraction=0.5)
+        self.assertGreater(full_speed["observations"][-1, 6], no_speed_gain["observations"][-1, 6])
+        self.assertLess(half_speed_limit["observations"][-1, 6], full_speed["observations"][-1, 6])
+
+    def test_navi_pid_brakes_without_reachable_route(self):
+        write_zbin(self.map_dir / "map_000.bin", unreachable=True)
+        completed = self._run_env(navigation=0, sdc_controller="navi_pid")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("no reachable navigation route", completed.stderr)
+        line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT "))
+        observations = np.asarray(json.loads(line[len("RESULT ") :])["observations"])
+        self.assertLess(observations[-1, 6], observations[0, 6])
+
+    def test_navi_pid_brakes_for_lead_vehicle(self):
+        write_zbin(self.map_dir / "map_000.bin", trajectories=[(22.0, 67.0), (32.0, 32.0)])
+        result = self._result(navigation=0, non_sdc_controller="navi_pid")
+        self.assertLess(result["observations"][-1, 6], result["observations"][0, 6])
+
+    def test_navi_pid_following_gains_are_configurable(self):
+        write_zbin(self.map_dir / "map_000.bin", trajectories=[(22.0, 67.0), (32.0, 32.0)])
+        following = self._result(navigation=0, non_sdc_controller="navi_pid")
+        no_gap_feedback = self._result(
+            navigation=0,
+            non_sdc_controller="navi_pid",
+            navi_pid_gap_position_gain=0.0,
+            navi_pid_gap_velocity_gain=0.0,
+        )
+        self.assertLess(following["observations"][-1, 6], no_gap_feedback["observations"][-1, 6])
+
+    def test_navi_pid_corrects_lateral_route_offset(self):
+        write_zbin(self.map_dir / "map_000.bin", trajectory_y=1.5)
+        result = self._result(navigation=0, sdc_controller="navi_pid")
+        self.assertLess(result["final_state"]["y"], 1.5)
+        self.assertLess(result["final_state"]["heading"], 0.0)
+
+    def test_navi_pid_background_agent_moves_and_resets(self):
+        write_zbin(
+            self.map_dir / "map_000.bin",
+            trajectories=[(22.0, 67.0), (40.0, 40.0), (120.0, 165.0)],
+            sdc_track_index=0,
+        )
+        script = textwrap.dedent(
+            """
+            import json, sys
+            import numpy as np
+            from pufferlib.ocean.drive.drive import Drive
+            env = Drive(num_agents=2, num_maps=1, map_dir=sys.argv[1], control_mode="control_sdc_only",
+                        non_sdc_controller="navi_pid", navigation=0, episode_length=91, resample_frequency=0)
+            samples = []
+            for _ in range(2):
+                obs, _ = env.reset(seed=0)
+                background_speed = env.ego_features + 6
+                initial = float(obs[0, background_speed])
+                for _ in range(5):
+                    obs, *_ = env.step(np.zeros_like(env.actions))
+                samples.append([initial, float(obs[0, background_speed])])
+            print("RESULT " + json.dumps(samples))
+            env.close()
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(self.map_dir)],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT "))
+        samples = np.asarray(json.loads(line[len("RESULT ") :]))
+        self.assertGreater(samples[0, 1], samples[0, 0])
+        np.testing.assert_allclose(samples[0], samples[1])
 
     def test_navigation_does_not_move_the_goal(self):
         off = self._result(navigation=0)

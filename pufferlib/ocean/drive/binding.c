@@ -211,6 +211,13 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     conf.navigation_waypoint_spacing = NAVI_DEFAULT_WAYPOINT_SPACING_M;
     conf.navigation_lookahead_distance = ZNAVI_DEFAULT_LOOKAHEAD_DISTANCE;
     conf.navigation_lookahead_norm = ZNAVI_DEFAULT_LOOKAHEAD_NORM;
+    conf.navi_pid_speed_gain = 1.0f;
+    conf.navi_pid_gap_position_gain = 1.0f;
+    conf.navi_pid_gap_velocity_gain = 1.0f;
+    conf.navi_pid_lateral_offset_gain = 0.01f;
+    conf.navi_pid_heading_gain = 0.25f;
+    conf.navi_pid_speed_limit_fraction = 1.0f;
+    conf.navi_pid_default_speed = 9.0f;
     if (ini_parse(env->ini_file, handler, &conf) < 0) {
         printf("Error while loading %s\n", env->ini_file);
     }
@@ -267,6 +274,13 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_FLOAT(navigation_waypoint_spacing);
     OVERRIDE_FLOAT(navigation_lookahead_distance);
     OVERRIDE_FLOAT(navigation_lookahead_norm);
+    OVERRIDE_FLOAT(navi_pid_speed_gain);
+    OVERRIDE_FLOAT(navi_pid_gap_position_gain);
+    OVERRIDE_FLOAT(navi_pid_gap_velocity_gain);
+    OVERRIDE_FLOAT(navi_pid_lateral_offset_gain);
+    OVERRIDE_FLOAT(navi_pid_heading_gain);
+    OVERRIDE_FLOAT(navi_pid_speed_limit_fraction);
+    OVERRIDE_FLOAT(navi_pid_default_speed);
     OVERRIDE_FLOAT(goal_obs_dropout_prob);
 
 #undef OVERRIDE_INT
@@ -331,12 +345,36 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyErr_SetString(PyExc_ValueError, "snap_goal_to_navi_endpoint must be 0 or 1");
         return -1;
     }
+    if (!(isfinite(conf.navi_pid_speed_gain) && conf.navi_pid_speed_gain >= 0.0f &&
+          isfinite(conf.navi_pid_gap_position_gain) && conf.navi_pid_gap_position_gain >= 0.0f &&
+          isfinite(conf.navi_pid_gap_velocity_gain) && conf.navi_pid_gap_velocity_gain >= 0.0f &&
+          isfinite(conf.navi_pid_lateral_offset_gain) && conf.navi_pid_lateral_offset_gain >= 0.0f &&
+          isfinite(conf.navi_pid_heading_gain) && conf.navi_pid_heading_gain >= 0.0f)) {
+        PyErr_SetString(PyExc_ValueError, "navi_pid gains must be finite and >= 0");
+        return -1;
+    }
+    if (!(isfinite(conf.navi_pid_speed_limit_fraction) && conf.navi_pid_speed_limit_fraction >= 0.0f &&
+          conf.navi_pid_speed_limit_fraction <= 1.0f)) {
+        PyErr_SetString(PyExc_ValueError, "navi_pid_speed_limit_fraction must be in [0, 1]");
+        return -1;
+    }
+    if (!(isfinite(conf.navi_pid_default_speed) && conf.navi_pid_default_speed > 0.0f)) {
+        PyErr_SetString(PyExc_ValueError, "navi_pid_default_speed must be finite and > 0");
+        return -1;
+    }
     env->navigation_enabled = conf.navigation;
     env->snap_goal_to_navi_endpoint = conf.snap_goal_to_navi_endpoint;
     env->navigation_waypoints = conf.navigation_waypoints;
     env->navigation_waypoint_spacing = conf.navigation_waypoint_spacing;
     env->navigation_lookahead_distance = conf.navigation_lookahead_distance;
     env->navigation_lookahead_norm = conf.navigation_lookahead_norm;
+    env->navi_pid_speed_gain = conf.navi_pid_speed_gain;
+    env->navi_pid_gap_position_gain = conf.navi_pid_gap_position_gain;
+    env->navi_pid_gap_velocity_gain = conf.navi_pid_gap_velocity_gain;
+    env->navi_pid_lateral_offset_gain = conf.navi_pid_lateral_offset_gain;
+    env->navi_pid_heading_gain = conf.navi_pid_heading_gain;
+    env->navi_pid_speed_limit_fraction = conf.navi_pid_speed_limit_fraction;
+    env->navi_pid_default_speed = conf.navi_pid_default_speed;
     env->goal_obs_dropout_prob = conf.goal_obs_dropout_prob;
     int max_agents = unpack(kwargs, "max_agents");
     int init_steps = unpack(kwargs, "init_steps");

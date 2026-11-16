@@ -200,3 +200,4 @@ weights/
 *.mp4
 pufferlib/resources/drive/binaries/*
 models/
+reports/

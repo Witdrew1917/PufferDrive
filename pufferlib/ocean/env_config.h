@@ -41,6 +41,13 @@ typedef struct {
     float navigation_waypoint_spacing;
     float navigation_lookahead_distance;
     float navigation_lookahead_norm;
+    float navi_pid_speed_gain;
+    float navi_pid_gap_position_gain;
+    float navi_pid_gap_velocity_gain;
+    float navi_pid_lateral_offset_gain;
+    float navi_pid_heading_gain;
+    float navi_pid_speed_limit_fraction;
+    float navi_pid_default_speed;
     float goal_obs_dropout_prob;
     char map_dir[256];
     char anchor_policy_path[256];
@@ -91,6 +98,20 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->navigation_lookahead_distance = atof(value);
     } else if (MATCH("env", "navigation_lookahead_norm")) {
         env_config->navigation_lookahead_norm = atof(value);
+    } else if (MATCH("env", "navi_pid_speed_gain")) {
+        env_config->navi_pid_speed_gain = atof(value);
+    } else if (MATCH("env", "navi_pid_gap_position_gain")) {
+        env_config->navi_pid_gap_position_gain = atof(value);
+    } else if (MATCH("env", "navi_pid_gap_velocity_gain")) {
+        env_config->navi_pid_gap_velocity_gain = atof(value);
+    } else if (MATCH("env", "navi_pid_lateral_offset_gain")) {
+        env_config->navi_pid_lateral_offset_gain = atof(value);
+    } else if (MATCH("env", "navi_pid_heading_gain")) {
+        env_config->navi_pid_heading_gain = atof(value);
+    } else if (MATCH("env", "navi_pid_speed_limit_fraction")) {
+        env_config->navi_pid_speed_limit_fraction = atof(value);
+    } else if (MATCH("env", "navi_pid_default_speed")) {
+        env_config->navi_pid_default_speed = atof(value);
     } else if (MATCH("env", "goal_obs_dropout_prob")) {
         env_config->goal_obs_dropout_prob = atof(value);
     } else if (MATCH("env", "reward_vehicle_collision")) {
@@ -158,6 +179,8 @@ static int handler(void *config, const char *section, const char *name, const ch
             env_config->sdc_controller = 3;
         } else if (strcmp(value, "\"corridor_idm\"") == 0 || strcmp(value, "corridor_idm") == 0) {
             env_config->sdc_controller = 4;
+        } else if (strcmp(value, "\"navi_pid\"") == 0 || strcmp(value, "navi_pid") == 0) {
+            env_config->sdc_controller = 5;
         } else {
             printf("Warning: Unknown sdc_controller value '%s', defaulting to POLICY\n", value);
             env_config->sdc_controller = 1;
@@ -173,13 +196,16 @@ static int handler(void *config, const char *section, const char *name, const ch
             env_config->non_sdc_controller = 3;
         } else if (strcmp(value, "\"corridor_idm\"") == 0 || strcmp(value, "corridor_idm") == 0) {
             env_config->non_sdc_controller = 4;
+        } else if (strcmp(value, "\"navi_pid\"") == 0 || strcmp(value, "navi_pid") == 0) {
+            env_config->non_sdc_controller = 5;
         } else {
             printf("Warning: Unknown non_sdc_controller value '%s', defaulting to POLICY\n", value);
             env_config->non_sdc_controller = 1;
         }
     } else if (MATCH("env", "non_vehicle_controller")) {
         if (strcmp(value, "\"auto\"") == 0 || strcmp(value, "auto") == 0) {
-            if (env_config->non_sdc_controller == 3 || env_config->non_sdc_controller == 4) {
+            if (env_config->non_sdc_controller == 3 || env_config->non_sdc_controller == 4 ||
+                env_config->non_sdc_controller == 5) {
                 env_config->non_vehicle_controller = 2;
             } else {
                 env_config->non_vehicle_controller =
@@ -195,6 +221,8 @@ static int handler(void *config, const char *section, const char *name, const ch
             env_config->non_vehicle_controller = 3;
         } else if (strcmp(value, "\"corridor_idm\"") == 0 || strcmp(value, "corridor_idm") == 0) {
             env_config->non_vehicle_controller = 4;
+        } else if (strcmp(value, "\"navi_pid\"") == 0 || strcmp(value, "navi_pid") == 0) {
+            env_config->non_vehicle_controller = 5;
         } else {
             printf("Warning: Unknown non_vehicle_controller value '%s', defaulting to REPLAY\n", value);
             env_config->non_vehicle_controller = 2;

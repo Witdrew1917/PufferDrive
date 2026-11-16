@@ -65,6 +65,7 @@ CONTROLLER_MAP = {
     "replay": 2,
     "idm": 3,
     "corridor_idm": 4,
+    "navi_pid": 5,
 }
 
 
@@ -119,6 +120,13 @@ class Drive(pufferlib.PufferEnv):
         navigation_waypoint_spacing=5.0,
         navigation_lookahead_distance=120.0,
         navigation_lookahead_norm=150.0,
+        navi_pid_speed_gain=1.0,
+        navi_pid_gap_position_gain=1.0,
+        navi_pid_gap_velocity_gain=1.0,
+        navi_pid_lateral_offset_gain=0.01,
+        navi_pid_heading_gain=0.25,
+        navi_pid_speed_limit_fraction=1.0,
+        navi_pid_default_speed=9.0,
         goal_obs_dropout_prob=0.0,
         reward_progress_navi=0.0,
         snap_goal_to_navi_endpoint=0,
@@ -172,6 +180,32 @@ class Drive(pufferlib.PufferEnv):
         self.navigation_waypoint_spacing = float(navigation_waypoint_spacing)
         self.navigation_lookahead_distance = float(navigation_lookahead_distance)
         self.navigation_lookahead_norm = float(navigation_lookahead_norm)
+        self.navi_pid_speed_gain = float(navi_pid_speed_gain)
+        self.navi_pid_gap_position_gain = float(navi_pid_gap_position_gain)
+        self.navi_pid_gap_velocity_gain = float(navi_pid_gap_velocity_gain)
+        self.navi_pid_lateral_offset_gain = float(navi_pid_lateral_offset_gain)
+        self.navi_pid_heading_gain = float(navi_pid_heading_gain)
+        self.navi_pid_speed_limit_fraction = float(navi_pid_speed_limit_fraction)
+        self.navi_pid_default_speed = float(navi_pid_default_speed)
+        for name in (
+            "navi_pid_speed_gain",
+            "navi_pid_gap_position_gain",
+            "navi_pid_gap_velocity_gain",
+            "navi_pid_lateral_offset_gain",
+            "navi_pid_heading_gain",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and >= 0. Got: {value}")
+        if (
+            not math.isfinite(self.navi_pid_speed_limit_fraction)
+            or not 0.0 <= self.navi_pid_speed_limit_fraction <= 1.0
+        ):
+            raise ValueError(
+                f"navi_pid_speed_limit_fraction must be in [0, 1]. Got: {self.navi_pid_speed_limit_fraction}"
+            )
+        if not math.isfinite(self.navi_pid_default_speed) or self.navi_pid_default_speed <= 0.0:
+            raise ValueError(f"navi_pid_default_speed must be finite and > 0. Got: {self.navi_pid_default_speed}")
         # A map directory holds a single format, detected from its first map.
         self.map_format = detect_map_format(f"{map_dir}/map_000.bin")
         if self.navigation:
@@ -256,7 +290,7 @@ class Drive(pufferlib.PufferEnv):
                 f"init_mode must be one of 'create_all_valid' or 'create_only_controlled'. Got: {self.init_mode_str}"
             )
 
-        controller_options = "'static', 'policy', 'replay', 'idm', or 'corridor_idm'"
+        controller_options = "'static', 'policy', 'replay', 'idm', 'corridor_idm', or 'navi_pid'"
         if self.sdc_controller_str not in CONTROLLER_MAP:
             raise ValueError(f"sdc_controller must be one of {controller_options}. Got: {self.sdc_controller_str}")
         if self.non_sdc_controller_str not in CONTROLLER_MAP:
@@ -270,7 +304,7 @@ class Drive(pufferlib.PufferEnv):
         self.sdc_controller = CONTROLLER_MAP[self.sdc_controller_str]
         self.non_sdc_controller = CONTROLLER_MAP[self.non_sdc_controller_str]
         if self.non_vehicle_controller_str == "auto":
-            if self.non_sdc_controller_str in ("idm", "corridor_idm"):
+            if self.non_sdc_controller_str in ("idm", "corridor_idm", "navi_pid"):
                 self.non_vehicle_controller_str = "replay"
             else:
                 self.non_vehicle_controller_str = self.non_sdc_controller_str
@@ -312,11 +346,18 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(
                 f"num_maps ({num_maps}) exceeds available maps in directory ({available_maps}). Please reduce num_maps or add more maps to resources/drive/binaries."
             )
-        if (self.navigation or self.snap_goal_to_navi_endpoint) and self.map_format == MAP_FORMAT_LEGACY:
+        needs_pid_navigation = "navi_pid" in (
+            self.sdc_controller_str,
+            self.non_sdc_controller_str,
+            self.non_vehicle_controller_str,
+        )
+        if (
+            self.navigation or self.snap_goal_to_navi_endpoint or needs_pid_navigation
+        ) and self.map_format == MAP_FORMAT_LEGACY:
             missing = [i for i in range(num_maps) if not os.path.exists(f"{map_dir}/map_{i:03d}.navi")]
             if missing:
                 raise FileNotFoundError(
-                    f"navigation or goal snapping requires .navi sidecars, but {len(missing)} of {num_maps} maps in "
+                    f"navigation, goal snapping, or navi_pid requires .navi sidecars, but {len(missing)} of {num_maps} maps in "
                     f"{map_dir} lack one "
                     f"(first: map_{missing[0]:03d}.navi). Generate them with: "
                     f"python -m pufferlib.ocean.drive.drive navigation --map-dir {map_dir}"
@@ -395,6 +436,13 @@ class Drive(pufferlib.PufferEnv):
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
                 navigation_lookahead_distance=self.navigation_lookahead_distance,
                 navigation_lookahead_norm=self.navigation_lookahead_norm,
+                navi_pid_speed_gain=self.navi_pid_speed_gain,
+                navi_pid_gap_position_gain=self.navi_pid_gap_position_gain,
+                navi_pid_gap_velocity_gain=self.navi_pid_gap_velocity_gain,
+                navi_pid_lateral_offset_gain=self.navi_pid_lateral_offset_gain,
+                navi_pid_heading_gain=self.navi_pid_heading_gain,
+                navi_pid_speed_limit_fraction=self.navi_pid_speed_limit_fraction,
+                navi_pid_default_speed=self.navi_pid_default_speed,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
             )
             self.env_ids.append(env_id)
@@ -521,6 +569,13 @@ class Drive(pufferlib.PufferEnv):
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
                 navigation_lookahead_distance=self.navigation_lookahead_distance,
                 navigation_lookahead_norm=self.navigation_lookahead_norm,
+                navi_pid_speed_gain=self.navi_pid_speed_gain,
+                navi_pid_gap_position_gain=self.navi_pid_gap_position_gain,
+                navi_pid_gap_velocity_gain=self.navi_pid_gap_velocity_gain,
+                navi_pid_lateral_offset_gain=self.navi_pid_lateral_offset_gain,
+                navi_pid_heading_gain=self.navi_pid_heading_gain,
+                navi_pid_speed_limit_fraction=self.navi_pid_speed_limit_fraction,
+                navi_pid_default_speed=self.navi_pid_default_speed,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
             )
             self.env_ids.append(env_id)

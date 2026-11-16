@@ -87,6 +87,7 @@
 #define CONTROLLER_REPLAY 2
 #define CONTROLLER_IDM 3
 #define CONTROLLER_CORRIDOR_IDM 4
+#define CONTROLLER_NAVI_PID 5
 
 // Minimum distance to goal position
 #define MIN_DISTANCE_TO_GOAL 2.0f
@@ -354,6 +355,7 @@ struct Entity {
     int controller;
     int stopped;
     int removed;
+    int navi_pid_route_warning;
 
     // Navigation (env->navigation loaded)
     int navi_goal_idx;         // -1 when the agent has no navigation goal
@@ -737,6 +739,13 @@ struct Drive {
     ZNavigation *znavigation;            // zbin navigation sections, NULL for legacy maps
     float navigation_lookahead_distance; // zbin: route arclength covered by the waypoints (m)
     float navigation_lookahead_norm;     // zbin: waypoint coordinate normalisation (m)
+    float navi_pid_speed_gain;
+    float navi_pid_gap_position_gain;
+    float navi_pid_gap_velocity_gain;
+    float navi_pid_lateral_offset_gain;
+    float navi_pid_heading_gain;
+    float navi_pid_speed_limit_fraction;
+    float navi_pid_default_speed;
 };
 
 #include "zbin.h"
@@ -1334,6 +1343,7 @@ void set_start_position(Drive *env) {
         e->offroad_state = 0;
         e->stopped = 0;
         e->removed = 0;
+        e->navi_pid_route_warning = 0;
         e->collision_delta_v = 0.0f;
         e->collision_delta_v_max = 0.0f;
         e->collision_delta_v_sum = 0.0f;
@@ -2529,8 +2539,10 @@ void set_active_agents(Drive *env) {
             env->entities[i].active_agent = 0;
             int requested_controller =
                 env->entities[i].type == VEHICLE ? env->non_sdc_controller : env->non_vehicle_controller;
-            int replay_by_default = env->entities[i].mark_as_expert != 0 || env->active_agent_count >= control_limit ||
-                                    (sdc_only_mode && requested_controller == CONTROLLER_POLICY);
+            int replay_by_default =
+                env->entities[i].mark_as_expert != 0 ||
+                (env->active_agent_count >= control_limit && requested_controller != CONTROLLER_NAVI_PID) ||
+                (sdc_only_mode && requested_controller == CONTROLLER_POLICY);
             env->entities[i].controller = resolve_agent_controller(env, i, 0, replay_by_default);
             // Replay-controlled backgrounds move through the expert list so
             // move_expert teleports them along their logged trajectories.
@@ -2657,7 +2669,11 @@ void init(Drive *env) {
         }
         env->znavigation = load_znavigation(env);
     } else {
-        env->navigation = load_navigation_binary(env, env->navigation_enabled || env->snap_goal_to_navi_endpoint);
+        int pid_requested = env->sdc_controller == CONTROLLER_NAVI_PID ||
+                            env->non_sdc_controller == CONTROLLER_NAVI_PID ||
+                            env->non_vehicle_controller == CONTROLLER_NAVI_PID;
+        env->navigation =
+            load_navigation_binary(env, env->navigation_enabled || env->snap_goal_to_navi_endpoint || pid_requested);
         if (env->navigation != NULL) {
             for (int goal_idx = 0; goal_idx < env->navigation->num_goals; goal_idx++) {
                 env->navigation->goal_x[goal_idx] -= env->world_mean_x;
@@ -2668,6 +2684,11 @@ void init(Drive *env) {
     if (navigation_loaded(env)) {
         for (int i = 0; i < env->active_agent_count; i++) {
             reset_navigation_state(env, env->active_agent_indices[i]);
+        }
+        for (int i = 0; i < env->static_agent_count; i++) {
+            int idx = env->static_agent_indices[i];
+            if (env->entities[idx].controller == CONTROLLER_NAVI_PID)
+                reset_navigation_state(env, idx);
         }
     }
     if (env->snap_goal_to_navi_endpoint) {
@@ -3357,7 +3378,7 @@ void compute_observations(Drive *env) {
 void sample_new_goal(Drive *env, int agent_idx) {
     // Samples a new goal position based on the existing road lane points
     Entity *agent = &env->entities[agent_idx];
-    if (env->navigation_enabled && env->navigation != NULL) {
+    if ((env->navigation_enabled || agent->controller == CONTROLLER_NAVI_PID) && env->navigation != NULL) {
         agent->navi_goal_idx = closest_navigation_goal(env, agent_idx);
         agent->navi_lane_idx = -1;
         update_navigation_state(env, agent_idx);
@@ -3422,6 +3443,13 @@ void c_reset(Drive *env) {
     env->timestep = env->init_steps;
     set_start_position(env);
     idm_reset_agent_states(env);
+    if (navigation_loaded(env)) {
+        for (int i = 0; i < env->static_agent_count; i++) {
+            int idx = env->static_agent_indices[i];
+            if (env->entities[idx].controller == CONTROLLER_NAVI_PID)
+                reset_navigation_state(env, idx);
+        }
+    }
     for (int x = 0; x < env->active_agent_count; x++) {
         env->logs[x] = (Log){0};
         int agent_idx = env->active_agent_indices[x];
@@ -3553,6 +3581,7 @@ static void override_action_with_expert(Drive *env, int action_idx, int agent_id
 }
 
 #include "idm.h"
+#include "navi_pid.h"
 
 static void move_agent_with_controller(Drive *env, int action_idx, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
@@ -3573,6 +3602,11 @@ static void move_agent_with_controller(Drive *env, int action_idx, int agent_idx
 
     if (agent->controller == CONTROLLER_IDM) {
         move_idm(env, agent_idx);
+        return;
+    }
+
+    if (agent->controller == CONTROLLER_NAVI_PID) {
+        move_navi_pid(env, agent_idx);
         return;
     }
 

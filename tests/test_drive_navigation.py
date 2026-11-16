@@ -81,6 +81,32 @@ def write_split_map(path, reverse_lanes=False, turn_goal=False):
     Path(path).write_bytes(out)
 
 
+def write_curve_map(path, radius):
+    goal_angle = 3.0
+    road_angles = np.linspace(0.0, goal_angle, 121, dtype=np.float32)
+    if radius is None:
+        road_xs, road_ys = road_angles * 10.0, np.zeros_like(road_angles)
+        goal_x, goal_y = float(road_xs[-1]), 0.0
+        vehicle_xs = np.arange(TRAJECTORY_STEPS, dtype=np.float32) * SPEED_MPS * DT_SECONDS
+        vehicle_ys = np.zeros_like(vehicle_xs)
+    else:
+        road_xs = radius * np.sin(road_angles)
+        road_ys = radius * (1.0 - np.cos(road_angles))
+        goal_x, goal_y = float(road_xs[-1]), float(road_ys[-1])
+        vehicle_angles = np.arange(TRAJECTORY_STEPS, dtype=np.float32) * SPEED_MPS * DT_SECONDS / radius
+        vehicle_xs = radius * np.sin(vehicle_angles)
+        vehicle_ys = radius * (1.0 - np.cos(vehicle_angles))
+
+    out = bytearray(b"synthetic_navi00")
+    out += struct.pack("<ii", 0, 0) + struct.pack("<ii", 1, 3)
+    _write_entity(out, nav.VEHICLE, vehicle_xs, vehicle_ys, goal_x=goal_x, goal_y=goal_y)
+    _write_entity(out, nav.ROAD_LANE, road_xs, road_ys)
+    side_xs = np.array([0.0, goal_x], dtype=np.float32)
+    _write_entity(out, nav.ROAD_LANE, side_xs, np.full_like(side_xs, 3.7))
+    _write_entity(out, nav.ROAD_LANE, side_xs, np.full_like(side_xs, -3.7))
+    Path(path).write_bytes(out)
+
+
 def write_overlapping_goal_map(path, reverse_lanes=False, goal_y=0.1):
     straight = (np.array([0, 100]), np.zeros(2))
     incoming = (np.array([20, 35, 35, 45.3]), np.array([-20, -20, 0.1, 0.1]))
@@ -507,6 +533,7 @@ ENV_SCRIPT = textwrap.dedent(
         "obs": obs.shape[1],
         "goal": obs[0, 4:6].tolist(),
         "initial_obs": initial_obs,
+        "final_speed": float(obs[0, 6]),
         "goal_samples": goal_samples,
         "feasibility": obs[0, env.ego_features - 3 : env.ego_features].tolist() if env.navigation else [],
         "waypoints": obs[0, obs.shape[1] - waypoint_dim :].reshape(-1, 3).tolist() if waypoint_dim else [],
@@ -552,6 +579,31 @@ class TestNavigationEnv(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT "))
         return json.loads(line[len("RESULT ") :])
+
+    def test_navi_pid_requires_sidecar_even_without_policy_navigation(self):
+        completed = self._run_env(0, sdc_controller="navi_pid")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(".navi", completed.stderr)
+
+    def test_navi_pid_follows_sidecar_without_policy_navigation(self):
+        nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        result = self._result(self._run_env(0, sdc_controller="navi_pid"))
+        self.assertGreater(result["final_speed"], result["initial_obs"][6])
+
+    def test_navi_pid_uses_configurable_fallback_speed_without_lane_limit(self):
+        nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        default = self._result(self._run_env(0, sdc_controller="navi_pid"))
+        lower_target = self._result(self._run_env(0, sdc_controller="navi_pid", navi_pid_default_speed=4.0))
+        self.assertLess(lower_target["final_speed"], default["final_speed"])
+
+    def test_navi_pid_reduces_target_speed_for_curvature(self):
+        write_curve_map(self.map_path, radius=None)
+        nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        straight = self._result(self._run_env(0, sdc_controller="navi_pid"))
+        write_curve_map(self.map_path, radius=10.0)
+        nav.process_map_navigation(self.map_path, max_goals=4, seed=0)
+        curved = self._result(self._run_env(0, sdc_controller="navi_pid"))
+        self.assertLess(curved["final_speed"], straight["final_speed"])
 
     def test_navigation_flag_adds_feasibility_and_waypoints(self):
         off = self._result(self._run_env(0))
