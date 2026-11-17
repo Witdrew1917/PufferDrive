@@ -375,7 +375,7 @@ def evaluate_runs(api, entries, base_config, dynamics, dataset_root, no_cached=F
             ("hr_val", f"{dataset_root}/{VAL_MAP_DIR}", "control_sdc_only", 10_000, None, NUM_TOTAL_EVAL_AGENTS),
             (
                 "hr_interactive",
-                INTERACTIVE_MAP_DIR,
+                f"{dataset_root}/{INTERACTIVE_MAP_DIR}",
                 "control_sdc_only",
                 INTERACTIVE_MAP_DIR_MAPS,
                 None,
