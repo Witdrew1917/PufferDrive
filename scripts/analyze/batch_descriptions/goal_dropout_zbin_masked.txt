@@ -1,0 +1,7 @@
+#navi
+laveno-chalmers-university-of-technology/pufferlib/oogqlami --env.goal-obs-dropout-prob=1.0
+laveno-chalmers-university-of-technology/pufferlib/n5wxuxcy --env.goal-obs-dropout-prob=1.0 
+laveno-chalmers-university-of-technology/pufferlib/ixh6n2qf --env.goal-obs-dropout-prob=1.0
+laveno-chalmers-university-of-technology/pufferlib/ibfxa21n --env.goal-obs-dropout-prob=1.0
+laveno-chalmers-university-of-technology/pufferlib/3gdas8wx --env.goal-obs-dropout-prob=1.0
+laveno-chalmers-university-of-technology/pufferlib/42bg4fe0 --env.goal-obs-dropout-prob=1.0

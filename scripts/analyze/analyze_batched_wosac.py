@@ -33,7 +33,7 @@ from pufferlib.pufferl import load_config, load_env, load_policy
 
 
 ENV_NAME = "puffer_drive"
-WOSAC_MAP_DIR = "resources/drive/binaries/validation"
+WOSAC_MAP_DIR = "validation"
 WOSAC_BATCH_SIZE = 256
 WOSAC_SCENARIO_POOL_SIZE = 10000
 WOSAC_MAX_BATCHES = 100
@@ -91,10 +91,10 @@ def apply_overrides(config, overrides, reference_config):
         target[parts[-1]] = value
 
 
-def make_wosac_config(cpt_config, overrides=None):
+def make_wosac_config(cpt_config, dataset_root: str,  overrides=None):
     config = copy.deepcopy(cpt_config)
     config["env"].update(
-        map_dir=WOSAC_MAP_DIR,
+        map_dir=f"{dataset_root}/[WOSAC_MAP_DIR},
         num_maps=WOSAC_SCENARIO_POOL_SIZE,
         num_agents=WOSAC_BATCH_SIZE * 10,
         termination_mode=0,
@@ -124,7 +124,7 @@ def make_wosac_config(cpt_config, overrides=None):
         wosac_sanity_check=False,
         wosac_eval_mode="policy",
         backend="PufferEnv",
-        map_dir=WOSAC_MAP_DIR,
+        map_dir=f"{dataset_root}/{WOSAC_MAP_DIR},
     )
     if overrides:
         apply_overrides(config, overrides, cpt_config)
@@ -192,6 +192,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--no-cached", action="store_true", help="Force a fresh download, bypassing local and W&B caches"
     )
+    parser.add_argument("--dataset-root", type=Path, help="Dataset to use during eval")
+
     args = parser.parse_args(argv)
     if len(args.runs) == 1 and args.runs[0].endswith(".txt"):
         batch_file = Path(args.runs[0])
@@ -281,7 +283,7 @@ def prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics=None,
     return config
 
 
-def evaluate_runs(api, entries, base_config, dynamics, no_cached=False):
+def evaluate_runs(api, entries, base_config, dynamics, dataset_root, no_cached=False):
     from pufferlib.ocean.benchmark.evaluator import WOSACEvaluator
 
     all_rows = []
@@ -289,7 +291,7 @@ def evaluate_runs(api, entries, base_config, dynamics, no_cached=False):
         print(f"\nEvaluating {path}")
         checkpoint_path = download_checkpoint(api, path, no_cached=no_cached)
         config = prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics.get(path), overrides)
-        wosac_config = make_wosac_config(config, overrides)
+        wosac_config = make_wosac_config(config, str(dataset_root), overrides)
         env = load_env(ENV_NAME, wosac_config)
         try:
             policy = load_policy(wosac_config, env, ENV_NAME)
@@ -325,7 +327,7 @@ def main(argv=None):
     finally:
         sys.argv = original_argv
 
-    rows = evaluate_runs(wandb.Api(), args.entries, base_config, args.dynamics, no_cached=args.no_cached)
+    rows = evaluate_runs(wandb.Api(), args.entries, base_config, args.dynamics, args.dataset_root, no_cached=args.no_cached)
     df = pd.DataFrame(rows)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output_csv, index=False)

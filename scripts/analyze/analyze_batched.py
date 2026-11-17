@@ -36,9 +36,9 @@ from pufferlib.pufferl import load_config, load_env, load_policy
 
 ENV_NAME = "puffer_drive"
 DETERMINISTIC = False
-TRAIN_MAP_DIR = "resources/drive/binaries/training"
-VAL_MAP_DIR = "resources/drive/binaries/validation"
-INTERACTIVE_MAP_DIR = "resources/drive/binaries/wosac_val_clean"
+TRAIN_MAP_DIR = "training"
+VAL_MAP_DIR = "validation"
+INTERACTIVE_MAP_DIR = "wosac_val_clean"
 INTERACTIVE_MAP_DIR_MAPS = 200
 NUM_TOTAL_EVAL_AGENTS = 1024 * 10
 NUM_TOTAL_INTERACTIVE_EVAL_AGENTS = 2048
@@ -260,6 +260,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--no-cached", action="store_true", help="Force a fresh download, bypassing local and W&B caches"
     )
+    parser.add_argument("--dataset-root", type=Path, help="Dataset to use during eval")
+
     args = parser.parse_args(argv)
     if len(args.runs) == 1 and args.runs[0].endswith(".txt"):
         batch_file = Path(args.runs[0])
@@ -349,7 +351,7 @@ def prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics=None,
     return config
 
 
-def evaluate_runs(api, entries, base_config, dynamics, no_cached=False):
+def evaluate_runs(api, entries, base_config, dynamics, dataset_root, no_cached=False):
     all_rows = []
     for path, overrides in entries:
         print(f"\nEvaluating {path}")
@@ -357,7 +359,7 @@ def evaluate_runs(api, entries, base_config, dynamics, no_cached=False):
         config = prepare_checkpoint_config(checkpoint_path, base_config, path, dynamics.get(path), overrides)
 
         policy_config = make_eval_config(
-            config, TRAIN_MAP_DIR, control_mode="control_vehicles", num_maps=50_000, overrides=overrides
+            config, f"{dataset_root}/{TRAIN_MAP_DIR}", control_mode="control_vehicles", num_maps=50_000, overrides=overrides
         )
         env = load_env(ENV_NAME, policy_config)
         try:
@@ -368,9 +370,9 @@ def evaluate_runs(api, entries, base_config, dynamics, no_cached=False):
 
         evaluator = CheckpointEvaluator(config)
         modes = [
-            ("sp_train", TRAIN_MAP_DIR, "control_vehicles", 50_000, None, NUM_TOTAL_EVAL_AGENTS),
-            ("sp_val", VAL_MAP_DIR, "control_vehicles", 10_000, None, NUM_TOTAL_EVAL_AGENTS),
-            ("hr_val", VAL_MAP_DIR, "control_sdc_only", 10_000, None, NUM_TOTAL_EVAL_AGENTS),
+            ("sp_train", f"{dataset_root}/{TRAIN_MAP_DIR}", "control_vehicles", 50_000, None, NUM_TOTAL_EVAL_AGENTS),
+            ("sp_val", f"{dataset_root}/{VAL_MAP_DIR}", "control_vehicles", 10_000, None, NUM_TOTAL_EVAL_AGENTS),
+            ("hr_val", f"{dataset_root}/{VAL_MAP_DIR}", "control_sdc_only", 10_000, None, NUM_TOTAL_EVAL_AGENTS),
             (
                 "hr_interactive",
                 INTERACTIVE_MAP_DIR,
@@ -411,7 +413,7 @@ def main(argv=None):
     finally:
         sys.argv = original_argv
 
-    rows = evaluate_runs(wandb.Api(), args.entries, base_config, args.dynamics, no_cached=args.no_cached)
+    rows = evaluate_runs(wandb.Api(), args.entries, base_config, args.dynamics, args.dataset_root, no_cached=args.no_cached)
     df = pd.DataFrame(rows)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output_csv, index=False)

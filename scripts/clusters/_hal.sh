@@ -18,7 +18,6 @@ zpuffer_record_git_state "$output_dir" || exit 1
 
 singularity exec --nv \
   --bind "$ZPUFFER_WORKDIR":/workspace \
-  --bind "$DATASET_ROOT":/workspace/resources/drive/binaries \
   --bind "$ZBIN_DATASET_ROOT":/workspace/resources/drive/zbin \
   --bind "$SPICY_DATASET_ROOT":/workspace/resources/drive/spicy \
   --bind "$ZPUFFER_GIT_STATE_DIR":/git-state:ro \
