@@ -94,7 +94,7 @@ def apply_overrides(config, overrides, reference_config):
 def make_wosac_config(cpt_config, dataset_root: str,  overrides=None):
     config = copy.deepcopy(cpt_config)
     config["env"].update(
-        map_dir=f"{dataset_root}/[WOSAC_MAP_DIR},
+        map_dir=f"{dataset_root}/{WOSAC_MAP_DIR}",
         num_maps=WOSAC_SCENARIO_POOL_SIZE,
         num_agents=WOSAC_BATCH_SIZE * 10,
         termination_mode=0,
@@ -124,7 +124,7 @@ def make_wosac_config(cpt_config, dataset_root: str,  overrides=None):
         wosac_sanity_check=False,
         wosac_eval_mode="policy",
         backend="PufferEnv",
-        map_dir=f"{dataset_root}/{WOSAC_MAP_DIR},
+        map_dir=f"{dataset_root}/{WOSAC_MAP_DIR}",
     )
     if overrides:
         apply_overrides(config, overrides, cpt_config)

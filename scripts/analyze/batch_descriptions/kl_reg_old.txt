@@ -1,5 +1,6 @@
-#baseline
+#baseline (adam, adamw)
 laveno-chalmers-university-of-technology/pufferlib/iwh2tzeu
+laveno-chalmers-university-of-technology/pufferlib/u3em452p
 
 #navi
 laveno-chalmers-university-of-technology/pufferlib/kxc15e7m
