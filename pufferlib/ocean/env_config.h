@@ -49,6 +49,7 @@ typedef struct {
     float navi_pid_speed_limit_fraction;
     float navi_pid_default_speed;
     float goal_obs_dropout_prob;
+    int goal_visible_mode;
     char map_dir[256];
     char anchor_policy_path[256];
     int reg_mode;
@@ -114,6 +115,8 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->navi_pid_default_speed = atof(value);
     } else if (MATCH("env", "goal_obs_dropout_prob")) {
         env_config->goal_obs_dropout_prob = atof(value);
+    } else if (MATCH("env", "goal_visible_mode")) {
+        env_config->goal_visible_mode = atoi(value);
     } else if (MATCH("env", "reward_vehicle_collision")) {
         env_config->reward_vehicle_collision = atof(value);
     } else if (MATCH("env", "obs_partner_noise_speed")) {

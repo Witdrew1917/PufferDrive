@@ -183,6 +183,10 @@
 #define GOAL_GENERATE_NEW 1
 #define GOAL_STOP 2
 
+#define GOAL_VISIBLE_OFF 0
+#define GOAL_VISIBLE_FROZEN 1
+#define GOAL_VISIBLE_MOVING_OBS 2
+
 // Jerk action space (for JERK dynamics model)
 static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
 static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
@@ -735,6 +739,7 @@ struct Drive {
     float navigation_waypoint_spacing; // metres between consecutive route waypoints
     Navigation *navigation;            // legacy map_XXX.navi sidecar, NULL when absent
     float goal_obs_dropout_prob;
+    int goal_visible_mode;
     int map_format;                      // MAP_FORMAT_LEGACY or MAP_FORMAT_ZBIN
     ZNavigation *znavigation;            // zbin navigation sections, NULL for legacy maps
     float navigation_lookahead_distance; // zbin: route arclength covered by the waypoints (m)
@@ -2203,6 +2208,36 @@ static int navigation_sibling_lanes(const Navigation *navigation, int lane, int 
     return 0;
 }
 
+static bool last_visible_goal(
+    const Drive *env, const Entity *agent, float *x, float *y
+) {
+    if (env->znavigation == NULL ||
+        agent->navi_goal_idx < 0 || agent->current_lane_idx < 0 ||
+        agent->znavi_entity_idx < 0 || agent->navi_off_route) {
+        return false;
+    }
+
+    float xs[ZNAVI_LOOKAHEAD_WAYPOINTS_MAX];
+    float ys[ZNAVI_LOOKAHEAD_WAYPOINTS_MAX];
+
+    int count = znavi_lookahead_points(
+        env,
+        agent,
+        env->navigation_waypoints,
+        env->navigation_lookahead_distance,
+        xs,
+        ys
+    );
+
+    if (count == 0) {
+        return false;
+    }
+
+    *x = xs[count - 1];
+    *y = ys[count - 1];
+    return true;
+}
+
 // Refreshes goal distance and lane feasibility from the resolved anchor; off-lane keeps the last known state.
 void update_navigation_state(Drive *env, int agent_idx) {
     if (env->znavigation != NULL) {
@@ -2756,6 +2791,7 @@ int waypoint_feature_count(const Drive *env) {
     return env->navigation_waypoints * features;
 }
 
+
 // Layout: [ego | partners | road segments | navigation waypoints (navigation only)]
 int observation_size(const Drive *env) {
     return ego_feature_count(env) + PARTNER_FEATURES * (MAX_AGENTS - 1) +
@@ -3194,8 +3230,19 @@ void compute_observations(Drive *env) {
         float signed_speed = copysignf(speed_magnitude, v_dot_heading);
 
         // Set goal distances
-        float goal_x = ego_entity->goal_position_x - ego_entity->x;
-        float goal_y = ego_entity->goal_position_y - ego_entity->y;
+        float observed_goal_x = ego_entity->goal_position_x;
+        float observed_goal_y = ego_entity->goal_position_y;
+
+        if (env->goal_visible_mode == GOAL_VISIBLE_MOVING_OBS) {
+            float visible_x, visible_y;
+            if (last_visible_goal(env, ego_entity, &visible_x, &visible_y)) {
+                observed_goal_x = visible_x;
+                observed_goal_y = visible_y;
+            }
+        }
+
+        float goal_x = observed_goal_x - ego_entity->x;
+        float goal_y = observed_goal_y - ego_entity->y;
 
         // Rotate to ego vehicle's frame
         float rel_goal_x = goal_x * cos_heading + goal_y * sin_heading;

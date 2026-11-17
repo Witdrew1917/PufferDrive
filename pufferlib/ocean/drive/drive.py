@@ -128,6 +128,7 @@ class Drive(pufferlib.PufferEnv):
         navi_pid_speed_limit_fraction=1.0,
         navi_pid_default_speed=9.0,
         goal_obs_dropout_prob=0.0,
+        goal_visible_mode=0,
         reward_progress_navi=0.0,
         snap_goal_to_navi_endpoint=0,
     ):
@@ -165,6 +166,10 @@ class Drive(pufferlib.PufferEnv):
         self._dynamics_model_flag = DYNAMICS_MODEL_MAP[dynamics_model]
         self.async_resets = bool(async_resets)
         self.goal_obs_dropout_prob = float(goal_obs_dropout_prob)
+        self.goal_visible_mode = goal_visible_mode
+        if goal_visible_mode not in (0, 1, 2):
+            raise ValueError(f"visible_goal_mode must be 0, 1, or 2. Got: {goal_visible_mode}")
+
         if not 0.0 <= self.goal_obs_dropout_prob <= 1.0:
             raise ValueError(f"goal_obs_dropout_prob must be in [0, 1]. Got: {goal_obs_dropout_prob}")
 
@@ -225,6 +230,18 @@ class Drive(pufferlib.PufferEnv):
             elif not self.navigation_waypoint_spacing > 0.0:
                 raise ValueError(f"navigation_waypoint_spacing must be > 0. Got: {navigation_waypoint_spacing}")
             self.ego_features += binding.NAVIGATION_EGO_FEATURES
+
+        # Goal visibility resamples goals according to zbin navigation and so
+        # it is required to be present
+        if self.goal_visible_mode:
+            if self.map_format != MAP_FORMAT_ZBIN:
+                raise ValueError("goal_visible_mode currently supports zbin maps only")
+
+            # If moving goal observations according to navi, reject goal
+            # resampling (goal_behavior=1)
+            if self.goal_visible_mode == 2 and self.goal_behavior == 1:
+                raise ValueError(f"goal_visible_mode {self.goal_visible_mode} requires fixed mission goals")
+
 
         # Extract observation shapes from constants
         # These need to be defined in C, since they determine the shape of the arrays
@@ -444,6 +461,7 @@ class Drive(pufferlib.PufferEnv):
                 navi_pid_speed_limit_fraction=self.navi_pid_speed_limit_fraction,
                 navi_pid_default_speed=self.navi_pid_default_speed,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
+                goal_visible_mode=self.goal_visible_mode,
             )
             self.env_ids.append(env_id)
 
@@ -577,6 +595,7 @@ class Drive(pufferlib.PufferEnv):
                 navi_pid_speed_limit_fraction=self.navi_pid_speed_limit_fraction,
                 navi_pid_default_speed=self.navi_pid_default_speed,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
+                goal_visible_mode=self.goal_visible_mode,
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)

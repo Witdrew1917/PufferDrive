@@ -282,6 +282,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_FLOAT(navi_pid_speed_limit_fraction);
     OVERRIDE_FLOAT(navi_pid_default_speed);
     OVERRIDE_FLOAT(goal_obs_dropout_prob);
+    OVERRIDE_INT(goal_visible_mode);
 
 #undef OVERRIDE_INT
 #undef OVERRIDE_FLOAT
@@ -341,6 +342,11 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyErr_SetString(PyExc_ValueError, "goal_obs_dropout_prob must be in [0, 1]");
         return -1;
     }
+    if (!(conf.goal_visible_mode == 0 || conf.goal_visible_mode == 1 || conf.goal_visible_mode ==2)) {
+
+        PyErr_SetString(PyExc_ValueError, "goal_visible_mode must be (0, 1, or 2)");
+        return -1;
+    }
     if (conf.snap_goal_to_navi_endpoint != 0 && conf.snap_goal_to_navi_endpoint != 1) {
         PyErr_SetString(PyExc_ValueError, "snap_goal_to_navi_endpoint must be 0 or 1");
         return -1;
@@ -376,6 +382,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->navi_pid_speed_limit_fraction = conf.navi_pid_speed_limit_fraction;
     env->navi_pid_default_speed = conf.navi_pid_default_speed;
     env->goal_obs_dropout_prob = conf.goal_obs_dropout_prob;
+    env->goal_visible_mode = conf.goal_visible_mode;
     int max_agents = unpack(kwargs, "max_agents");
     int init_steps = unpack(kwargs, "init_steps");
     env->num_agents = max_agents;
