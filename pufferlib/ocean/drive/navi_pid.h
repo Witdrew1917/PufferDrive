@@ -221,7 +221,6 @@ static NaviPIDAction navi_pid_action(Drive *env, int agent_idx, bool refresh_nav
     if (route.count < 2) {
         desired_speed = 0.0f;
         if (route.count == 0 && !agent->navi_pid_route_warning) {
-            fprintf(stderr, "[drive/navi_pid] agent %d has no reachable navigation route; braking\n", agent_idx);
             agent->navi_pid_route_warning = 1;
         }
     } else {
