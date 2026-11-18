@@ -1454,6 +1454,7 @@ static void write_gl_frame_flipped(int fd, unsigned char *ptr, int width, int he
 #define GUI_PICK_MARGIN_M 0.5f
 #define GUI_PICK_FALLBACK_M 3.0f
 #define GUI_WAYPOINT_RADIUS_M 0.6f
+#define GUI_UNCONTROLLED_FILL_OPACITY 0.6f
 #define GUI_FONT 20
 #define GUI_LINE 22
 
@@ -1500,6 +1501,7 @@ struct PopupGui {
     // Toggles
     int obs_view;
     int lasers;
+    int ground_truth;
     int nav_mode;
     int goal_mode;
     int feas_mode;
@@ -1543,7 +1545,8 @@ static const GuiBinding GUI_BINDINGS[] = {
     {"TAB / S-TAB", "Next / previous agent", NULL, NULL},
     {"S", "Select agent nearest cursor", NULL, NULL},
     {"CTRL", "Observation view", &g_gui.obs_view, GUI_ONOFF_NAMES},
-    {"O", "Observation lasers", &g_gui.lasers, GUI_ONOFF_NAMES},
+    {"O", "Ground-truth vehicle poses", &g_gui.ground_truth, GUI_ONOFF_NAMES},
+    {"SHIFT+O", "Observation lasers", &g_gui.lasers, GUI_ONOFF_NAMES},
     {"N", "Navigation overlay", &g_gui.nav_mode, GUI_NAV_NAMES},
     {"L", "Lane feasibility (selected)", &g_gui.feas_mode, GUI_FEAS_NAMES},
     {"G", "Goal markers", &g_gui.goal_mode, GUI_GOAL_NAMES},
@@ -1804,8 +1807,12 @@ static void gui_handle_keys(Drive *env, Camera3D camera) {
 
     if (IsKeyPressed(KEY_LEFT_CONTROL) || IsKeyPressed(KEY_RIGHT_CONTROL))
         g_gui.obs_view = !g_gui.obs_view;
-    if (IsKeyPressed(KEY_O))
-        g_gui.lasers = !g_gui.lasers;
+    if (IsKeyPressed(KEY_O)) {
+        if (shift)
+            g_gui.lasers = !g_gui.lasers;
+        else
+            g_gui.ground_truth = !g_gui.ground_truth;
+    }
     if (IsKeyPressed(KEY_N) && navigation_loaded(env))
         g_gui.nav_mode = (g_gui.nav_mode + 1) % 4;
     if (IsKeyPressed(KEY_L) && navigation_loaded(env))
@@ -2203,13 +2210,16 @@ static void gui_draw_goals(Drive *env) {
     }
 }
 
-static void gui_draw_box(const Entity *e, Color fill, Color wire, Color marker) {
+static void gui_draw_box(const Entity *e, Vector2 position, float heading, float padding, Color fill, Color wire,
+                         Color marker) {
     float box_h = e->height > 0.0f ? e->height : 1.5f;
+    float length = e->length + 2.0f * padding;
+    float width = e->width + 2.0f * padding;
     rlPushMatrix();
-    rlTranslatef(e->x, e->y, box_h * 0.5f);
-    rlRotatef(e->heading * RAD2DEG, 0.0f, 0.0f, 1.0f);
-    DrawCube((Vector3){0}, e->length, e->width, box_h, fill);
-    DrawCubeWires((Vector3){0}, e->length, e->width, box_h, wire);
+    rlTranslatef(position.x, position.y, box_h * 0.5f + padding);
+    rlRotatef(heading * RAD2DEG, 0.0f, 0.0f, 1.0f);
+    DrawCube((Vector3){0}, length, width, box_h, fill);
+    DrawCubeWires((Vector3){0}, length, width, box_h, wire);
     if (marker.a > 0) {
         float top = box_h * 0.5f + 0.02f;
         float half_len = e->length * 0.5f;
@@ -2271,7 +2281,8 @@ static void gui_draw_agents(Drive *env) {
         }
         Color marker = active_idx >= 0 ? gui_goal_color(env, active_idx) : BLANK;
         Color wire = selected ? PUFF_CYAN : Fade(DARKGRAY, 0.9f);
-        gui_draw_box(e, Fade(base, active_idx >= 0 ? 0.85f : 0.6f), wire, marker);
+        float opacity = active_idx >= 0 ? 0.85f : GUI_UNCONTROLLED_FILL_OPACITY;
+        gui_draw_box(e, (Vector2){e->x, e->y}, e->heading, 0.0f, Fade(base, opacity), wire, marker);
 
         if (selected) {
             float r = fmaxf(e->length, e->width) * 0.75f;
@@ -2279,6 +2290,24 @@ static void gui_draw_agents(Drive *env) {
                 DrawCircle3D((Vector3){e->x, e->y, 0.1f}, r + 0.15f * k, (Vector3){0, 0, 1}, 0.0f, PUFF_CYAN);
             }
         }
+    }
+}
+
+static void gui_draw_ground_truth(const Drive *env) {
+    const Color turquoise = {64, 224, 208, 255};
+    const float padding = 0.05f; // Separate the ghost roof and sides from a coincident simulated box.
+    int t = env->timestep;
+    if (!g_gui.ground_truth || t < 0)
+        return;
+    Color fill = Fade(turquoise, GUI_UNCONTROLLED_FILL_OPACITY);
+    for (int i = 0; i < env->num_entities; i++) {
+        const Entity *e = &env->entities[i];
+        if (e->type != VEHICLE || t >= e->array_size || !e->traj_valid || !e->traj_valid[t])
+            continue;
+        float x = e->traj_x[t], y = e->traj_y[t];
+        if (x == INVALID_POSITION || y == INVALID_POSITION)
+            continue;
+        gui_draw_box(e, (Vector2){x, y}, e->traj_heading[t], padding, fill, turquoise, Fade(DARKGRAY, 0.55f));
     }
 }
 
@@ -2312,6 +2341,7 @@ static int gui_draw_world(Drive *env, Client *client) {
         gui_draw_trails(env);
     }
     gui_draw_agents(env);
+    gui_draw_ground_truth(env);
     gui_draw_feasibility_arrows(env);
     if (g_gui.obs_view && gui_selected_entity(env) != NULL) {
         draw_agent_obs(env, g_gui.sel, 1, 1, g_gui.lasers);

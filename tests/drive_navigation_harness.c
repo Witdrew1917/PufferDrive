@@ -1,14 +1,35 @@
 #include "drive.h"
+#include <assert.h>
 
 static float line_width, route_min_y, route_max_x;
 static int drawn_goals;
+static int drawn_boxes;
+static float box_x, box_y, box_z, box_angle, box_length, box_width;
+static Color box_fill;
 
+void rlPushMatrix(void) {}
+void rlPopMatrix(void) {}
+void rlTranslatef(float x, float y, float z) {
+    box_x = x;
+    box_y = y;
+    box_z = z;
+}
+void rlRotatef(float angle, float x, float y, float z) { box_angle = angle; }
+void DrawCube(Vector3 position, float width, float height, float length, Color color) {
+    drawn_boxes++;
+    box_length = width;
+    box_width = height;
+    box_fill = color;
+}
+void DrawCubeWires(Vector3 position, float width, float height, float length, Color color) {}
+void DrawTriangle3D(Vector3 v1, Vector3 v2, Vector3 v3, Color color) {}
 void rlSetLineWidth(float width) { line_width = width; }
 void rlDrawRenderBatchActive(void) {}
 Color Fade(Color color, float alpha) {
     color.a = (unsigned char)(255 * alpha);
     return color;
 }
+Color ColorFromHSV(float hue, float saturation, float value) { return WHITE; }
 void DrawLine3D(Vector3 start, Vector3 end, Color color) {
     if (line_width == NAVI_RENDER_ROUTE_WIDTH_PX) {
         route_min_y = fminf(route_min_y, fminf(start.y, end.y));
@@ -21,6 +42,48 @@ void DrawSphere(Vector3 center, float radius, Color color) {
 }
 void DrawCylinderEx(Vector3 start, Vector3 end, float r1, float r2, int sides, Color color) {}
 void DrawCircle3D(Vector3 center, float radius, Vector3 axis, float angle, Color color) {}
+
+static void check_ground_truth(void) {
+    float xs[] = {2.0f, 4.0f, 6.0f}, ys[] = {3.0f, 5.0f, 7.0f}, headings[] = {0.0f, PI / 2.0f, PI};
+    int valid[] = {1, 0, 1};
+    Entity entities[] = {{.type = VEHICLE,
+                          .removed = 1,
+                          .x = INVALID_POSITION,
+                          .length = 4,
+                          .width = 2,
+                          .height = 2,
+                          .array_size = 3,
+                          .traj_x = xs,
+                          .traj_y = ys,
+                          .traj_heading = headings,
+                          .traj_valid = valid},
+                         {.type = VEHICLE},
+                         {.type = ROAD_LANE, .array_size = 3, .traj_valid = valid}};
+    int uncontrolled[] = {1};
+    Drive env = {
+        .entities = entities, .num_entities = 3, .static_agent_indices = uncontrolled, .static_agent_count = 1};
+
+    gui_draw_agents(&env);
+    assert(drawn_boxes == 1);
+    unsigned char uncontrolled_opacity = box_fill.a;
+    drawn_boxes = 0;
+    gui_draw_ground_truth(&env);
+    assert(drawn_boxes == 0);
+    g_gui.ground_truth = 1;
+    gui_draw_ground_truth(&env);
+    assert(drawn_boxes == 1 && box_x == 2.0f && box_y == 3.0f && box_angle == 0.0f);
+    assert(box_fill.a == uncontrolled_opacity && box_fill.a > 0 && box_fill.a < 255);
+    assert(box_z > entities[0].height * 0.5f && box_length > entities[0].length && box_width > entities[0].width);
+    env.timestep = 1;
+    gui_draw_ground_truth(&env);
+    assert(drawn_boxes == 1);
+    env.timestep = 2;
+    gui_draw_ground_truth(&env);
+    assert(drawn_boxes == 2 && box_x == 6.0f && box_y == 7.0f && fabsf(box_angle - 180.0f) < 0.001f);
+    env.timestep = 3;
+    gui_draw_ground_truth(&env);
+    assert(drawn_boxes == 2);
+}
 
 static void run_reward_steps(Drive *env, GridMap *grid, const char *scenario) {
     Entity *agent = &env->entities[0];
@@ -117,6 +180,10 @@ static void run_reward_steps(Drive *env, GridMap *grid, const char *scenario) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "ground-truth") == 0) {
+        check_ground_truth();
+        return 0;
+    }
     if (argc < 5)
         return 2;
     Drive env = {0};

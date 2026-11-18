@@ -74,7 +74,9 @@ Press **H** in the viewer to show the key-binding panel with the current state o
 **Overlays**
 
 - **CTRL** - Toggle observation view (what the selected agent sees)
-- **O** - Toggle observation lasers
+- **O** - Toggle translucent turquoise ghosts showing each vehicle's logged position and heading at the current simulation
+  step. Vehicles without a valid pose at that step are skipped.
+- **SHIFT+O** - Toggle observation lasers
 - **N** - Navigation overlay: off / selected route / route + feasible lanes / all routes (waypoints in orange)
 - **L** - Lane feasibility of the selected agent: off / arrows / text. One indicator per lane (left, current, right)
   shows how many metres the goal stays reachable in that lane; red **X** means the goal is unreachable from it

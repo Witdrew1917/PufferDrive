@@ -310,6 +310,12 @@ class TestNavigationSplits(unittest.TestCase):
         line = next(line for line in completed.stdout.splitlines() if line.startswith("RESULT "))
         return json.loads(line[len("RESULT ") :])
 
+    def test_ground_truth_draws_logged_vehicle_poses_at_current_step(self):
+        completed = subprocess.run(
+            [self.harness, "ground-truth"], check=False, capture_output=True, text=True, timeout=30
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+
     def test_progress_reward_each_forward_step_and_branch_change(self):
         for scenario in ("progress", "branch"):
             with self.subTest(scenario=scenario):
