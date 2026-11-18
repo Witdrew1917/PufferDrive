@@ -131,6 +131,7 @@ class Drive(pufferlib.PufferEnv):
         goal_visible_mode=0,
         reward_progress_navi=0.0,
         snap_goal_to_navi_endpoint=0,
+        append_goal_to_navi_lookahead=0,
     ):
         # env
         self.dt = dt
@@ -181,6 +182,9 @@ class Drive(pufferlib.PufferEnv):
         if snap_goal_to_navi_endpoint not in (0, 1):
             raise ValueError(f"snap_goal_to_navi_endpoint must be 0 or 1. Got: {snap_goal_to_navi_endpoint}")
         self.snap_goal_to_navi_endpoint = int(snap_goal_to_navi_endpoint)
+        if append_goal_to_navi_lookahead not in (0, 1):
+            raise ValueError(f"append_goal_to_navi_lookahead must be 0 or 1. Got: {append_goal_to_navi_lookahead}")
+        self.append_goal_to_navi_lookahead = int(append_goal_to_navi_lookahead)
         self.navigation_waypoints = int(navigation_waypoints)
         self.navigation_waypoint_spacing = float(navigation_waypoint_spacing)
         self.navigation_lookahead_distance = float(navigation_lookahead_distance)
@@ -213,6 +217,8 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(f"navi_pid_default_speed must be finite and > 0. Got: {self.navi_pid_default_speed}")
         # A map directory holds a single format, detected from its first map.
         self.map_format = detect_map_format(f"{map_dir}/map_000.bin")
+        if self.append_goal_to_navi_lookahead and self.map_format != MAP_FORMAT_ZBIN:
+            raise ValueError("append_goal_to_navi_lookahead requires zbin maps")
         if self.navigation:
             max_waypoints = (
                 binding.NAVI_LOOKAHEAD_WAYPOINTS_MAX
@@ -449,6 +455,7 @@ class Drive(pufferlib.PufferEnv):
                 dynamics_model=self._dynamics_model_flag,
                 navigation=self.navigation,
                 snap_goal_to_navi_endpoint=self.snap_goal_to_navi_endpoint,
+                append_goal_to_navi_lookahead=self.append_goal_to_navi_lookahead,
                 navigation_waypoints=self.navigation_waypoints,
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
                 navigation_lookahead_distance=self.navigation_lookahead_distance,
@@ -583,6 +590,7 @@ class Drive(pufferlib.PufferEnv):
                 async_resets=int(self.async_resets),
                 navigation=self.navigation,
                 snap_goal_to_navi_endpoint=self.snap_goal_to_navi_endpoint,
+                append_goal_to_navi_lookahead=self.append_goal_to_navi_lookahead,
                 navigation_waypoints=self.navigation_waypoints,
                 navigation_waypoint_spacing=self.navigation_waypoint_spacing,
                 navigation_lookahead_distance=self.navigation_lookahead_distance,

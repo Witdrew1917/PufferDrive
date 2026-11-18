@@ -35,7 +35,7 @@ static PIDRoute navi_pid_route(Drive *env, int agent_idx) {
         route.x[0] = agent->znavi_proj_x;
         route.y[0] = agent->znavi_proj_y;
         count = znavi_lookahead_points(env, agent, PID_ROUTE_POINTS, PID_ROUTE_POINTS * PID_ROUTE_SPACING, route.x + 1,
-                                       route.y + 1);
+                                       route.y + 1, false);
     } else {
         if (agent->navi_lane_idx < 0)
             return route;

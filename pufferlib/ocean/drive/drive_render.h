@@ -788,7 +788,7 @@ static void znavi_draw_route(const Drive *env, const Entity *agent, float z, Col
                                                                : ZNAVI_DEFAULT_LOOKAHEAD_DISTANCE;
     float xs[ZNAVI_LOOKAHEAD_WAYPOINTS_MAX];
     float ys[ZNAVI_LOOKAHEAD_WAYPOINTS_MAX];
-    int count = znavi_lookahead_points(env, agent, n_waypoints, distance, xs, ys);
+    int count = znavi_lookahead_points(env, agent, n_waypoints, distance, xs, ys, env->append_goal_to_navi_lookahead);
     for (int k = 0; k < count; k++) {
         DrawSphere((Vector3){xs[k], ys[k], Z_AGENT_DETAILS}, point_radius, point_color);
     }

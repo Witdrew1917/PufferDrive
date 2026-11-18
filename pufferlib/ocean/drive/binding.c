@@ -270,6 +270,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_INT(async_resets);
     OVERRIDE_INT(navigation);
     OVERRIDE_INT(snap_goal_to_navi_endpoint);
+    OVERRIDE_INT(append_goal_to_navi_lookahead);
     OVERRIDE_INT(navigation_waypoints);
     OVERRIDE_FLOAT(navigation_waypoint_spacing);
     OVERRIDE_FLOAT(navigation_lookahead_distance);
@@ -319,6 +320,14 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     char map_file[512];
     snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
     int zbin = drive_map_format(map_file) == MAP_FORMAT_ZBIN;
+    if (conf.append_goal_to_navi_lookahead != 0 && conf.append_goal_to_navi_lookahead != 1) {
+        PyErr_SetString(PyExc_ValueError, "append_goal_to_navi_lookahead must be 0 or 1");
+        return -1;
+    }
+    if (conf.append_goal_to_navi_lookahead && !zbin) {
+        PyErr_SetString(PyExc_ValueError, "append_goal_to_navi_lookahead requires zbin maps");
+        return -1;
+    }
     int max_waypoints = zbin ? ZNAVI_LOOKAHEAD_WAYPOINTS_MAX : NAVI_MAX_WAYPOINTS;
     if (conf.navigation && (conf.navigation_waypoints < 1 || conf.navigation_waypoints > max_waypoints)) {
         PyErr_Format(PyExc_ValueError, "navigation_waypoints must be in [1, %d] for %s maps, got %d", max_waypoints,
@@ -370,6 +379,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     }
     env->navigation_enabled = conf.navigation;
     env->snap_goal_to_navi_endpoint = conf.snap_goal_to_navi_endpoint;
+    env->append_goal_to_navi_lookahead = conf.append_goal_to_navi_lookahead;
     env->navigation_waypoints = conf.navigation_waypoints;
     env->navigation_waypoint_spacing = conf.navigation_waypoint_spacing;
     env->navigation_lookahead_distance = conf.navigation_lookahead_distance;

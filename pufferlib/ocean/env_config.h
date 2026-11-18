@@ -37,6 +37,7 @@ typedef struct {
     int max_controlled_agents;
     int navigation;
     int snap_goal_to_navi_endpoint;
+    int append_goal_to_navi_lookahead;
     int navigation_waypoints;
     float navigation_waypoint_spacing;
     float navigation_lookahead_distance;
@@ -91,6 +92,8 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->navigation = atoi(value);
     } else if (MATCH("env", "snap_goal_to_navi_endpoint")) {
         env_config->snap_goal_to_navi_endpoint = atoi(value);
+    } else if (MATCH("env", "append_goal_to_navi_lookahead")) {
+        env_config->append_goal_to_navi_lookahead = atoi(value);
     } else if (MATCH("env", "navigation_waypoints")) {
         env_config->navigation_waypoints = atoi(value);
     } else if (MATCH("env", "navigation_waypoint_spacing")) {

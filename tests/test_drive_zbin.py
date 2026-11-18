@@ -218,7 +218,7 @@ class TestZbinEnv(unittest.TestCase):
         np.testing.assert_allclose(waypoints[:, 0], np.arange(1, 5) * 10.0 / 150.0, atol=1e-6)
         np.testing.assert_allclose(waypoints[:, 1], 0.0, atol=1e-6)
 
-    def test_lookahead_slots_past_route_end_are_zero(self):
+    def test_lookahead_appends_mission_goal_before_zero_padding(self):
         on = self._result(navigation=1, navigation_waypoints=10, navigation_lookahead_distance=150.0)
         # 178 m of route remain from x = 22 m, so lookahead slots at 15..150 m all fit, and the last row
         # (x = 24.5 m) still has 175.5 m.
@@ -227,15 +227,50 @@ class TestZbinEnv(unittest.TestCase):
         short = self.map_dir / "short"
         short.mkdir()
         shutil.copy(self.map_dir / "map_000.bin", short / "map_000.bin")
-        # Lookahead of N waypoints over D = norm from close to the end of the route is truncated with zeros.
-        result = self._result(
+        # Near the end, the original mission goal consumes one slot, followed by padding.
+        config = dict(
             map_dir=short, navigation=1, navigation_waypoints=10, navigation_lookahead_distance=150.0, init_steps=80
         )
+        default = self._result(**config)["observations"][0][-20:].reshape(10, 2)
+        np.testing.assert_array_equal(default[8:], 0.0)
+        result = self._result(**config, append_goal_to_navi_lookahead=1)
         waypoints = result["observations"][0][-20:].reshape(10, 2)
-        remaining = LANE_LENGTH_M - (START_X_M + 80 * SPEED_MPS * 0.1)
-        valid = np.arange(1, 11) * 15.0 <= remaining
-        self.assertTrue(0 < valid.sum() < 10)
-        np.testing.assert_array_equal(waypoints[~valid], 0.0)
+        np.testing.assert_array_equal(waypoints[:8], default[:8])
+        # zbin uses the last valid trajectory pose as the mission goal, not the header goal.
+        mission_goal = result["observations"][0, 4:6] * (200.0 / 150.0)
+        np.testing.assert_allclose(waypoints[8], mission_goal, atol=1e-6)
+        np.testing.assert_array_equal(waypoints[9:], 0.0)
+
+    def test_route_terminal_at_lookahead_limit_uses_mission_goal(self):
+        write_zbin(self.map_dir / "map_000.bin", terminal_at_endpoint=True)
+        result = self._result(
+            navigation=1,
+            navigation_waypoints=1,
+            navigation_lookahead_distance=178.0,
+            navigation_lookahead_norm=200.0,
+            append_goal_to_navi_lookahead=1,
+        )
+        np.testing.assert_allclose(result["observations"][0, -2:], result["observations"][0, 4:6], atol=1e-6)
+
+    def test_moving_goal_uses_mission_goal_at_reachable_route_end_without_navigation_observations(self):
+        # The route ends at x=25, less than one 10 m sample interval from the agent.
+        write_zbin(self.map_dir / "map_000.bin", extra_terminals=[(0, 2, 1)])
+        config = dict(navigation=0, navigation_waypoints=4, navigation_lookahead_distance=40.0)
+        original = self._result(**config, goal_visible_mode=0)
+        default = self._result(**config, goal_visible_mode=2)
+        moving = self._result(**config, goal_visible_mode=2, append_goal_to_navi_lookahead=1, resample_map=True)
+        np.testing.assert_array_equal(default["observations"][0, 4:6], 0.0)
+        np.testing.assert_allclose(moving["observations"][0], original["observations"][0], atol=1e-6)
+        np.testing.assert_allclose(moving["reset_goal"], original["reset_goal"], atol=1e-6)
+
+    def test_moving_goal_is_zero_when_route_is_unreachable(self):
+        write_zbin(self.map_dir / "map_000.bin", unreachable=True)
+        config = dict(navigation=0, navigation_waypoints=4, navigation_lookahead_distance=40.0)
+        original = self._result(**config, goal_visible_mode=0)
+        moving = self._result(**config, goal_visible_mode=2, append_goal_to_navi_lookahead=1)
+        self.assertNotEqual(original["observations"][0, 4], 0.0)
+        np.testing.assert_array_equal(moving["observations"][:, 4:6], 0.0)
+        self.assertEqual(moving["rewards"], original["rewards"])
 
     def test_navigation_off_ignores_loaded_routes(self):
         # Same scene without any routes: with navigation=0 the agent must see and be rewarded identically.

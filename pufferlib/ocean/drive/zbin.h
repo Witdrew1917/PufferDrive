@@ -1110,10 +1110,20 @@ static inline void znavi_walk_interpolate(const ZNaviWalk *walk, float dist, flo
     *out_y = walk->prev_y + t * (walk->y - walk->prev_y);
 }
 
-// World-frame route lookahead points at arclength (w + 1) * distance / n_waypoints from the agent's route
-// projection (zdrive_agent_obs.c navi lookahead). Returns the number written; the route may end earlier.
+static bool znavi_walk_at_terminal(const ZNavigation *zn, const ZNaviWalk *walk) {
+    if (walk->navi_e < 0 || walk->navi_e >= zn->total || walk->navi_p < 0)
+        return false;
+    int last_point = znavi_num_points(zn, walk->navi_e) - 1;
+    if (walk->navi_p >= last_point)
+        return walk->navi_p == last_point;
+    size_t sample = znavi_sample_base(zn, walk->navi_e) + walk->navi_p;
+    return zn->next_entity[sample] == -1 && zn->distance_to_goal[sample] < ZNAVI_UNREACHABLE_DISTANCE - 0.01f;
+}
+
+// World-frame route samples at uniform arclength. The policy interface optionally ends with the original
+// mission goal when a reachable terminal is inside the lookahead, without growing the waypoint buffer.
 int znavi_lookahead_points(const Drive *env, const Entity *agent, int n_waypoints, float distance, float *xs,
-                           float *ys) {
+                           float *ys, bool include_mission_goal) {
     const ZNavigation *zn = env->znavigation;
     if (zn == NULL || n_waypoints <= 0)
         return 0;
@@ -1126,6 +1136,15 @@ int znavi_lookahead_points(const Drive *env, const Entity *agent, int n_waypoint
             znavi_walk_interpolate(&walk, (float)(w + 1) * spacing, &xs[w], &ys[w]);
             w++;
         }
+    }
+    if (include_mission_goal && agent->navi_goal_idx >= 0 && agent->current_lane_idx >= 0 &&
+        !agent->navi_off_route && walk.accum <= distance && znavi_walk_at_terminal(zn, &walk)) {
+        int slot = w;
+        if (w == n_waypoints || (w > 0 && fabsf(walk.accum - w * spacing) <= 1e-4f))
+            slot = w - 1; // Replace a sample at the terminal instead of emitting two endpoints.
+        xs[slot] = agent->init_goal_x;
+        ys[slot] = agent->init_goal_y;
+        w = slot + 1;
     }
     return w;
 }
@@ -1147,7 +1166,8 @@ void znavi_write_observations(const Drive *env, const Entity *agent, float *ego_
     int n_waypoints = env->navigation_waypoints;
     float xs[ZNAVI_LOOKAHEAD_WAYPOINTS_MAX];
     float ys[ZNAVI_LOOKAHEAD_WAYPOINTS_MAX];
-    int count = znavi_lookahead_points(env, agent, n_waypoints, env->navigation_lookahead_distance, xs, ys);
+    int count = znavi_lookahead_points(env, agent, n_waypoints, env->navigation_lookahead_distance, xs, ys,
+                                      env->append_goal_to_navi_lookahead);
     for (int w = 0; w < n_waypoints; w++) {
         float forward = 0.0f, left = 0.0f;
         if (w < count) {

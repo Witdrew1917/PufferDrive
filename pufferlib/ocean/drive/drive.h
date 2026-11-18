@@ -735,6 +735,7 @@ struct Drive {
     IDMAgentState *idm_agent_states;
     int navigation_enabled; // ini/kwarg `navigation`; legacy maps require map_XXX.navi sidecars
     int snap_goal_to_navi_endpoint;
+    int append_goal_to_navi_lookahead;
     int navigation_waypoints;          // route waypoints in the observation when navigation_enabled
     float navigation_waypoint_spacing; // metres between consecutive route waypoints
     Navigation *navigation;            // legacy map_XXX.navi sidecar, NULL when absent
@@ -2226,7 +2227,8 @@ static bool last_visible_goal(
         env->navigation_waypoints,
         env->navigation_lookahead_distance,
         xs,
-        ys
+        ys,
+        env->append_goal_to_navi_lookahead
     );
 
     if (count == 0) {
@@ -3229,20 +3231,20 @@ void compute_observations(Drive *env) {
         float v_dot_heading = ego_entity->vx * ego_entity->heading_x + ego_entity->vy * ego_entity->heading_y;
         float signed_speed = copysignf(speed_magnitude, v_dot_heading);
 
-        // Set goal distances
-        float observed_goal_x = ego_entity->goal_position_x;
-        float observed_goal_y = ego_entity->goal_position_y;
+        // Set goal displacement; a missing moving waypoint is zero in the ego frame.
+        float goal_x = ego_entity->goal_position_x - ego_entity->x;
+        float goal_y = ego_entity->goal_position_y - ego_entity->y;
 
         if (env->goal_visible_mode == GOAL_VISIBLE_MOVING_OBS) {
             float visible_x, visible_y;
             if (last_visible_goal(env, ego_entity, &visible_x, &visible_y)) {
-                observed_goal_x = visible_x;
-                observed_goal_y = visible_y;
+                goal_x = visible_x - ego_entity->x;
+                goal_y = visible_y - ego_entity->y;
+            } else {
+                goal_x = 0.0f;
+                goal_y = 0.0f;
             }
         }
-
-        float goal_x = observed_goal_x - ego_entity->x;
-        float goal_y = observed_goal_y - ego_entity->y;
 
         // Rotate to ego vehicle's frame
         float rel_goal_x = goal_x * cos_heading + goal_y * sin_heading;
