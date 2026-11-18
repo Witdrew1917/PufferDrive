@@ -127,6 +127,7 @@ class Drive(pufferlib.PufferEnv):
         navi_pid_heading_gain=0.25,
         navi_pid_speed_limit_fraction=1.0,
         navi_pid_default_speed=9.0,
+        navi_pid_speed_lookahead_distance=20.0,
         goal_obs_dropout_prob=0.0,
         goal_visible_mode=0,
         reward_progress_navi=0.0,
@@ -200,6 +201,7 @@ class Drive(pufferlib.PufferEnv):
         self.navi_pid_heading_gain = float(navi_pid_heading_gain)
         self.navi_pid_speed_limit_fraction = float(navi_pid_speed_limit_fraction)
         self.navi_pid_default_speed = float(navi_pid_default_speed)
+        self.navi_pid_speed_lookahead_distance = float(navi_pid_speed_lookahead_distance)
         for name in (
             "navi_pid_speed_gain",
             "navi_pid_gap_position_gain",
@@ -219,6 +221,10 @@ class Drive(pufferlib.PufferEnv):
             )
         if not math.isfinite(self.navi_pid_default_speed) or self.navi_pid_default_speed <= 0.0:
             raise ValueError(f"navi_pid_default_speed must be finite and > 0. Got: {self.navi_pid_default_speed}")
+        if not 0.0 <= self.navi_pid_speed_lookahead_distance <= 80.0:
+            raise ValueError(
+                f"navi_pid_speed_lookahead_distance must be in [0, 80]. Got: {self.navi_pid_speed_lookahead_distance}"
+            )
         # A map directory holds a single format, detected from its first map.
         self.map_format = detect_map_format(f"{map_dir}/map_000.bin")
         if self.append_goal_to_navi_lookahead and self.map_format != MAP_FORMAT_ZBIN:
@@ -354,7 +360,8 @@ class Drive(pufferlib.PufferEnv):
             else:
                 raise ValueError(f"dynamics_model must be 'classic', 'delta_local' or 'jerk'. Got: {dynamics_model}")
         elif action_type == "continuous":
-            self.single_action_space = gymnasium.spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
+            action_dim = 3 if dynamics_model == "delta_local" else 2
+            self.single_action_space = gymnasium.spaces.Box(low=-1, high=1, shape=(action_dim,), dtype=np.float32)
         else:
             raise ValueError(f"action_space must be 'discrete' or 'continuous'. Got: {action_type}")
 
@@ -471,6 +478,7 @@ class Drive(pufferlib.PufferEnv):
                 navi_pid_heading_gain=self.navi_pid_heading_gain,
                 navi_pid_speed_limit_fraction=self.navi_pid_speed_limit_fraction,
                 navi_pid_default_speed=self.navi_pid_default_speed,
+                navi_pid_speed_lookahead_distance=self.navi_pid_speed_lookahead_distance,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
                 goal_visible_mode=self.goal_visible_mode,
             )
@@ -606,6 +614,7 @@ class Drive(pufferlib.PufferEnv):
                 navi_pid_heading_gain=self.navi_pid_heading_gain,
                 navi_pid_speed_limit_fraction=self.navi_pid_speed_limit_fraction,
                 navi_pid_default_speed=self.navi_pid_default_speed,
+                navi_pid_speed_lookahead_distance=self.navi_pid_speed_lookahead_distance,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
                 goal_visible_mode=self.goal_visible_mode,
             )

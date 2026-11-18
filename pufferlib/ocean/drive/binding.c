@@ -218,6 +218,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     conf.navi_pid_heading_gain = 0.25f;
     conf.navi_pid_speed_limit_fraction = 1.0f;
     conf.navi_pid_default_speed = 9.0f;
+    conf.navi_pid_speed_lookahead_distance = 20.0f;
     if (ini_parse(env->ini_file, handler, &conf) < 0) {
         printf("Error while loading %s\n", env->ini_file);
     }
@@ -282,6 +283,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_FLOAT(navi_pid_heading_gain);
     OVERRIDE_FLOAT(navi_pid_speed_limit_fraction);
     OVERRIDE_FLOAT(navi_pid_default_speed);
+    OVERRIDE_FLOAT(navi_pid_speed_lookahead_distance);
     OVERRIDE_FLOAT(goal_obs_dropout_prob);
     OVERRIDE_INT(goal_visible_mode);
 
@@ -377,6 +379,10 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyErr_SetString(PyExc_ValueError, "navi_pid_default_speed must be finite and > 0");
         return -1;
     }
+    if (!(conf.navi_pid_speed_lookahead_distance >= 0.0f && conf.navi_pid_speed_lookahead_distance <= PID_ROUTE_DISTANCE)) {
+        PyErr_Format(PyExc_ValueError, "navi_pid_speed_lookahead_distance must be in [0, %d]", (int)PID_ROUTE_DISTANCE);
+        return -1;
+    }
     env->navigation_enabled = conf.navigation;
     env->snap_goal_to_navi_endpoint = conf.snap_goal_to_navi_endpoint;
     env->append_goal_to_navi_lookahead = conf.append_goal_to_navi_lookahead;
@@ -391,6 +397,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->navi_pid_heading_gain = conf.navi_pid_heading_gain;
     env->navi_pid_speed_limit_fraction = conf.navi_pid_speed_limit_fraction;
     env->navi_pid_default_speed = conf.navi_pid_default_speed;
+    env->navi_pid_speed_lookahead_distance = conf.navi_pid_speed_lookahead_distance;
     env->goal_obs_dropout_prob = conf.goal_obs_dropout_prob;
     env->goal_visible_mode = conf.goal_visible_mode;
     int max_agents = unpack(kwargs, "max_agents");

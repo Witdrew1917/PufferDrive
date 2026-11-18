@@ -49,6 +49,7 @@ typedef struct {
     float navi_pid_heading_gain;
     float navi_pid_speed_limit_fraction;
     float navi_pid_default_speed;
+    float navi_pid_speed_lookahead_distance;
     float goal_obs_dropout_prob;
     int goal_visible_mode;
     char map_dir[256];
@@ -116,6 +117,8 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->navi_pid_speed_limit_fraction = atof(value);
     } else if (MATCH("env", "navi_pid_default_speed")) {
         env_config->navi_pid_default_speed = atof(value);
+    } else if (MATCH("env", "navi_pid_speed_lookahead_distance")) {
+        env_config->navi_pid_speed_lookahead_distance = atof(value);
     } else if (MATCH("env", "goal_obs_dropout_prob")) {
         env_config->goal_obs_dropout_prob = atof(value);
     } else if (MATCH("env", "goal_visible_mode")) {

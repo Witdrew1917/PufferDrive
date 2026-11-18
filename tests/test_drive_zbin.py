@@ -50,6 +50,8 @@ def write_zbin(
     trajectories=None,
     sdc_track_index=None,
     trajectory_y=0.0,
+    bend_x=None,
+    downstream_speed_limit=None,
 ):
     """v14 zbin: one vehicle driving east on a straight 200 m lane, routed to the lane end (goal index 0).
 
@@ -74,16 +76,23 @@ def write_zbin(
         section1 += zeros.tobytes() + zeros.tobytes() + np.zeros(TRAJECTORY_STEPS, "<i4").tobytes()
 
     xs = np.arange(0.0, LANE_LENGTH_M + 1e-6, SEGMENT_M, dtype=np.float32)
-    section2 = bytearray(struct.pack("<i", 2))
-    section2 += struct.pack("<3i", 4, 100, len(xs)) + xs.tobytes() + bytes(8 * len(xs))  # ROAD_LANE
-    section2 += struct.pack("<2fi", 3.7, SPEED_LIMIT_MPS, 0)
+    lane_ys = np.zeros_like(xs) if bend_x is None else np.maximum(xs - bend_x, 0.0)
+    split = 4 if downstream_speed_limit is not None else len(xs) - 1
+    lanes = [(100, xs[: split + 1], lane_ys[: split + 1], SPEED_LIMIT_MPS)]
+    if downstream_speed_limit is not None:
+        lanes.append((102, xs[split:], lane_ys[split:], downstream_speed_limit))
+    section2 = bytearray(struct.pack("<i", len(lanes) + 1))
+    for lane_id, lane_x, lane_y, limit in lanes:
+        section2 += struct.pack("<3i", 4, lane_id, len(lane_x)) + lane_x.tobytes() + lane_y.tobytes()
+        section2 += bytes(4 * len(lane_x)) + struct.pack("<2fi", 3.7, limit, 0)
     section2 += struct.pack("<3i", 7, 101, len(xs)) + xs.tobytes() + np.full(len(xs), -2.0, "<f4").tobytes()
     section2 += bytes(4 * len(xs)) + struct.pack("<2fi", 0.0, 0.0, 0)  # ROAD_EDGE
 
     num_lines = len(xs) - 1
     section3 = bytearray(struct.pack("<3i", num_lines, 0, SUB_LINES))
     for line in range(num_lines):
-        section3 += struct.pack("<3i", 100, line, SUB_LINES)
+        road_id, segment = (100, line) if line < split else (102, line - split)
+        section3 += struct.pack("<3i", road_id, segment, SUB_LINES)
 
     section4 = bytearray(struct.pack("<i", num_goals))
     for goal in range(num_goals):
@@ -144,14 +153,18 @@ ENV_SCRIPT = textwrap.dedent(
     from pufferlib.ocean.drive.drive import Drive
     config = json.loads(sys.argv[2])
     resample_map = config.pop("resample_map", False)
+    steps = config.pop("steps", 5)
+    replay_actions = config.pop("replay_actions", None)
     env = Drive(num_agents=1, num_maps=1, map_dir=sys.argv[1], control_mode="control_vehicles",
                 episode_length=91, resample_frequency=0, **config)
     obs, _ = env.reset(seed=0)
-    observations, rewards = [obs[0].tolist()], []
-    for _ in range(5):
-        obs, reward, *_ = env.step(np.zeros_like(env.actions))
+    observations, rewards, actions = [obs[0].tolist()], [], []
+    for step in range(steps):
+        action = np.zeros_like(env.actions) if replay_actions is None else np.asarray(replay_actions[step])
+        obs, reward, *_ = env.step(action)
         observations.append(obs[0].tolist())
         rewards.append(float(reward[0]))
+        actions.append(env.actions.tolist())
     state = env.get_global_agent_state()
     final_state = {key: float(state[key][0]) for key in ("x", "y", "heading")}
     reset_obs, _ = env.reset(seed=0)
@@ -164,6 +177,7 @@ ENV_SCRIPT = textwrap.dedent(
         "max_waypoints": env.max_waypoints,
         "observations": observations,
         "rewards": rewards,
+        "actions": actions,
         "final_state": final_state,
         "reset_goal": reset_obs[0, 4:6].tolist(),
     }))
@@ -289,12 +303,61 @@ class TestZbinEnv(unittest.TestCase):
         self.assertGreater(off["observations"][-1, 6], off["observations"][0, 6])
         np.testing.assert_allclose(off["observations"][:, :12], on["observations"][:, :12], atol=1e-6)
 
+    def test_navi_pid_follows_appended_goal_beyond_route_terminal(self):
+        write_zbin(
+            self.map_dir / "map_000.bin",
+            trajectories=[(195.0, 225.0)],
+            sdc_track_index=0,
+            terminal_at_endpoint=True,
+        )
+        config = {"navigation": 0, "sdc_controller": "navi_pid", "goal_behavior": 2, "steps": 45}
+        off = self._result(**config)
+        on = self._result(**config, append_goal_to_navi_lookahead=1)
+        self.assertLess(off["final_state"]["x"], 205.0)
+        self.assertAlmostEqual(on["final_state"]["x"], 225.0, delta=2.5)
+        self.assertGreater(on["observations"][30, 6], on["observations"][38, 6])
+
+    def test_navi_pid_actions_replay_through_policy_dynamics(self):
+        write_zbin(self.map_dir / "map_000.bin", trajectory_y=1.5)
+        for model in ("classic", "delta_local", "jerk"):
+            for action_type in ("discrete", "continuous"):
+                with self.subTest(model=model, action_type=action_type):
+                    config = {"dynamics_model": model, "action_type": action_type}
+                    pid = self._result(sdc_controller="navi_pid", **config)
+                    replay = self._result(replay_actions=pid["actions"], **config)
+                    self.assertLess(pid["final_state"]["heading"], 0.0)
+                    self.assertEqual(pid["final_state"], replay["final_state"])
+                    np.testing.assert_array_equal(pid["observations"][:, 6], replay["observations"][:, 6])
+
+    def test_navi_pid_discrete_delta_can_accelerate_from_rest(self):
+        write_zbin(self.map_dir / "map_000.bin", trajectories=[(22.0, 22.0)], sdc_track_index=0)
+        result = self._result(sdc_controller="navi_pid", dynamics_model="delta_local", goal_radius=0.0)
+        self.assertGreater(result["observations"][-1, 6], 0.0)
+
     def test_navi_pid_speed_gain_and_speed_limit_fraction(self):
         full_speed = self._result(navigation=0, sdc_controller="navi_pid")
         no_speed_gain = self._result(navigation=0, sdc_controller="navi_pid", navi_pid_speed_gain=0.0)
         half_speed_limit = self._result(navigation=0, sdc_controller="navi_pid", navi_pid_speed_limit_fraction=0.5)
         self.assertGreater(full_speed["observations"][-1, 6], no_speed_gain["observations"][-1, 6])
         self.assertLess(half_speed_limit["observations"][-1, 6], full_speed["observations"][-1, 6])
+
+    def test_navi_pid_previews_curvature_before_the_bend(self):
+        write_zbin(self.map_dir / "map_000.bin", bend_x=40.0)
+        near_only = self._result(sdc_controller="navi_pid", navi_pid_speed_lookahead_distance=0)["observations"]
+        preview = self._result(sdc_controller="navi_pid")["observations"]
+        self.assertGreater(near_only[1, 6], near_only[0, 6])
+        self.assertLess(preview[1, 6], preview[0, 6])
+
+    def test_navi_pid_previews_lower_speed_limit_on_next_lane(self):
+        config = {"sdc_controller": "navi_pid", "navi_pid_speed_limit_fraction": 0.6}
+        write_zbin(self.map_dir / "map_000.bin", downstream_speed_limit=3.0)
+        short = self._result(navi_pid_speed_lookahead_distance=10, **config)["observations"]
+        preview = self._result(**config)["observations"]
+        self.assertGreater(short[1, 6], short[0, 6])
+        self.assertLess(preview[1, 6], preview[0, 6])
+        write_zbin(self.map_dir / "map_000.bin", downstream_speed_limit=20.0)
+        higher = self._result(**config)["observations"]
+        self.assertAlmostEqual(higher[1, 6], short[1, 6], places=6)
 
     def test_navi_pid_brakes_without_reachable_route(self):
         write_zbin(self.map_dir / "map_000.bin", unreachable=True)
@@ -345,8 +408,10 @@ class TestZbinEnv(unittest.TestCase):
                 obs, _ = env.reset(seed=0)
                 background_speed = env.ego_features + 6
                 initial = float(obs[0, background_speed])
+                policy_action = np.zeros_like(env.actions)
                 for _ in range(5):
-                    obs, *_ = env.step(np.zeros_like(env.actions))
+                    obs, *_ = env.step(policy_action)
+                    np.testing.assert_array_equal(env.actions, policy_action)
                 samples.append([initial, float(obs[0, background_speed])])
             print("RESULT " + json.dumps(samples))
             env.close()

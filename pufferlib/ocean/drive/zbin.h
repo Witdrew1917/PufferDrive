@@ -1120,6 +1120,25 @@ static bool znavi_walk_at_terminal(const ZNavigation *zn, const ZNaviWalk *walk)
     return zn->next_entity[sample] == -1 && zn->distance_to_goal[sample] < ZNAVI_UNREACHABLE_DISTANCE - 0.01f;
 }
 
+static int znavi_sample_route(const ZNavigation *zn, ZNaviWalk *walk, int n_waypoints, float distance, float *xs,
+                              float *ys) {
+    float spacing = distance / (float)n_waypoints;
+    int w = 0;
+    for (int step = 0; step < ZNAVI_LOOKAHEAD_MAX_WALK_STEPS && w < n_waypoints && znavi_walk_step(zn, walk); step++) {
+        while (w < n_waypoints && walk->accum >= (float)(w + 1) * spacing) {
+            znavi_walk_interpolate(walk, (float)(w + 1) * spacing, &xs[w], &ys[w]);
+            w++;
+        }
+    }
+    return w;
+}
+
+static bool znavi_can_append_mission_goal(const ZNavigation *zn, const Entity *agent, const ZNaviWalk *walk,
+                                          float distance) {
+    return agent->navi_goal_idx >= 0 && agent->current_lane_idx >= 0 && !agent->navi_off_route &&
+           walk->accum <= distance && znavi_walk_at_terminal(zn, walk);
+}
+
 // World-frame route samples at uniform arclength. The policy interface optionally ends with the original
 // mission goal when a reachable terminal is inside the lookahead, without growing the waypoint buffer.
 int znavi_lookahead_points(const Drive *env, const Entity *agent, int n_waypoints, float distance, float *xs,
@@ -1127,18 +1146,11 @@ int znavi_lookahead_points(const Drive *env, const Entity *agent, int n_waypoint
     const ZNavigation *zn = env->znavigation;
     if (zn == NULL || n_waypoints <= 0)
         return 0;
-    float spacing = distance / (float)n_waypoints;
     ZNaviWalk walk =
         znavi_walk_init(agent->znavi_entity_idx, agent->znavi_point_idx, agent->znavi_proj_x, agent->znavi_proj_y);
-    int w = 0;
-    for (int step = 0; step < ZNAVI_LOOKAHEAD_MAX_WALK_STEPS && w < n_waypoints && znavi_walk_step(zn, &walk); step++) {
-        while (w < n_waypoints && walk.accum >= (float)(w + 1) * spacing) {
-            znavi_walk_interpolate(&walk, (float)(w + 1) * spacing, &xs[w], &ys[w]);
-            w++;
-        }
-    }
-    if (include_mission_goal && agent->navi_goal_idx >= 0 && agent->current_lane_idx >= 0 &&
-        !agent->navi_off_route && walk.accum <= distance && znavi_walk_at_terminal(zn, &walk)) {
+    int w = znavi_sample_route(zn, &walk, n_waypoints, distance, xs, ys);
+    if (include_mission_goal && znavi_can_append_mission_goal(zn, agent, &walk, distance)) {
+        float spacing = distance / (float)n_waypoints;
         int slot = w;
         if (w == n_waypoints || (w > 0 && fabsf(walk.accum - w * spacing) <= 1e-4f))
             slot = w - 1; // Replace a sample at the terminal instead of emitting two endpoints.

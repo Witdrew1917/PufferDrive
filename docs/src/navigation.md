@@ -56,9 +56,16 @@ The C extension needs no rebuild when switching `navigation` on or off; all sett
 Select `navi_pid` with `--env.sdc-controller navi_pid` or `--env.non-sdc-controller navi_pid`. It follows
 navigation routes even when policy navigation observations are disabled. Zpufferdrive maps use the localized lane
 speed limit multiplied by `navi_pid_speed_limit_fraction`; legacy maps do not expose lane speed limits to this
-controller and use `navi_pid_default_speed` instead. The target is also capped by
-`sqrt(4.0 / |curvature|)` (m/s), limiting lateral acceleration to 4 m/s²; the lower of this and the configured
-speed target is used.
+controller and use `navi_pid_default_speed` instead. For speed control, the controller previews the route by
+arclength and can lower the target for upcoming lane limits (zbin only) or for the tightest sampled bend
+(`sqrt(4.0 / |curvature|)` in m/s). Preview never raises the current target. Steering still uses local curvature.
+On zbin maps, `append_goal_to_navi_lookahead = 1` also extends the PID route from its reachable terminal to
+the mission goal. The PID uses that final segment for steering and braking even when policy navigation is disabled.
+
+The PID produces actions for the selected `dynamics_model`, just like a policy: acceleration and steering for
+`classic`, longitudinal and lateral jerk for `jerk`, or ego-frame `(dx, dy, dyaw)` for `delta_local`. Discrete
+actions use the model's bins. The native dynamics update and constrain the motion; for controlled agents, the
+generated actions are visible in `env.actions` after `step()`.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -69,6 +76,7 @@ speed target is used.
 | `navi_pid_heading_gain` | `0.25` | Gain on heading error (rad). |
 | `navi_pid_speed_limit_fraction` | `1.0` | Fraction of the localized lane speed limit used as the target, in `[0, 1]`. |
 | `navi_pid_default_speed` | `9.0` | Fallback target speed in m/s when no usable lane limit is available. |
+| `navi_pid_speed_lookahead_distance` | `20.0` | Route preview distance in metres, in `[0, 80]`. `0` keeps local-only speed control. |
 
 All gains must be finite and non-negative, and the fallback speed must be positive.
 

@@ -360,6 +360,10 @@ struct Entity {
     int stopped;
     int removed;
     int navi_pid_route_warning;
+    bool navi_pid_on_goal_segment;
+    float navi_pid_terminal_x, navi_pid_terminal_y;
+    float navi_pid_steering;
+    float navi_pid_dx_residual;
 
     // Navigation (env->navigation loaded)
     int navi_goal_idx;         // -1 when the agent has no navigation goal
@@ -752,6 +756,7 @@ struct Drive {
     float navi_pid_heading_gain;
     float navi_pid_speed_limit_fraction;
     float navi_pid_default_speed;
+    float navi_pid_speed_lookahead_distance;
 };
 
 #include "zbin.h"
@@ -1350,6 +1355,9 @@ void set_start_position(Drive *env) {
         e->stopped = 0;
         e->removed = 0;
         e->navi_pid_route_warning = 0;
+        e->navi_pid_on_goal_segment = false;
+        e->navi_pid_steering = 0.0f;
+        e->navi_pid_dx_residual = 0.0f;
         e->collision_delta_v = 0.0f;
         e->collision_delta_v_max = 0.0f;
         e->collision_delta_v_sum = 0.0f;
@@ -3655,7 +3663,25 @@ static void move_agent_with_controller(Drive *env, int action_idx, int agent_idx
     }
 
     if (agent->controller == CONTROLLER_NAVI_PID) {
-        move_navi_pid(env, agent_idx);
+        if (agent->removed || agent->x == INVALID_POSITION)
+            return;
+        NaviPIDAction action = navi_pid_action(env, agent_idx);
+        if (action_idx >= 0) {
+            if (env->action_type == 1) {
+                int width = env->dynamics_model == DELTA_LOCAL ? 3 : 2;
+                memcpy(env->actions + action_idx * width, action.continuous, width * sizeof(float));
+            } else {
+                int width = env->dynamics_model == DELTA_LOCAL ? 3 : 1;
+                memcpy((int *)env->actions + action_idx * width, action.discrete, width * sizeof(int));
+            }
+            move_dynamics(env, action_idx, agent_idx);
+        } else {
+            // Background agents have no slot in the policy action buffer.
+            float *saved_actions = env->actions;
+            env->actions = (float *)&action;
+            move_dynamics(env, 0, agent_idx);
+            env->actions = saved_actions;
+        }
         return;
     }
 
