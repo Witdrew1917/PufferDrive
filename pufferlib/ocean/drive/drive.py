@@ -132,6 +132,7 @@ class Drive(pufferlib.PufferEnv):
         reward_progress_navi=0.0,
         snap_goal_to_navi_endpoint=0,
         append_goal_to_navi_lookahead=0,
+        waypoint_encoder_arch="mlp",
     ):
         # env
         self.dt = dt
@@ -186,6 +187,9 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(f"append_goal_to_navi_lookahead must be 0 or 1. Got: {append_goal_to_navi_lookahead}")
         self.append_goal_to_navi_lookahead = int(append_goal_to_navi_lookahead)
         self.navigation_waypoints = int(navigation_waypoints)
+        if waypoint_encoder_arch not in ("mlp", "attention"):
+            raise ValueError(f"waypoint_encoder_arch must be 'mlp' or 'attention'. Got: {waypoint_encoder_arch!r}")
+        self.waypoint_encoder_arch = waypoint_encoder_arch
         self.navigation_waypoint_spacing = float(navigation_waypoint_spacing)
         self.navigation_lookahead_distance = float(navigation_lookahead_distance)
         self.navigation_lookahead_norm = float(navigation_lookahead_norm)

@@ -121,6 +121,7 @@ def make_eval_config(
     if controller_overrides is not None:
         config["env"].update(controller_overrides)
     config["vec"] = {"backend": "PufferEnv", "num_envs": 1}
+    breakpoint()
     if overrides:
         apply_overrides(config, overrides, cpt_config)
     return config

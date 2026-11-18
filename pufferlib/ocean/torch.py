@@ -7,7 +7,8 @@ import pufferlib
 import pufferlib.models
 
 from pufferlib.models import Default as Policy  # noqa: F401
-from pufferlib.models import Convolutional as Conv  # noqa: F401
+from pufferlib.models import Convolutional as Conv
+from pufferlib.ocean.attention import AttentionBlock  # noqa: F401
 
 
 Recurrent = pufferlib.models.LSTMWrapper
@@ -141,6 +142,7 @@ class Drive(nn.Module):
         self.max_waypoints = env.max_waypoints
         self.waypoint_features = env.waypoint_features
         self.use_waypoints = self.max_waypoints > 0
+        self.waypoint_encoder_arch = env.waypoint_encoder_arch
 
         self.ego_encoder = nn.Sequential(
             pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size)),
@@ -165,11 +167,19 @@ class Drive(nn.Module):
 
         num_branches = 3
         if self.use_waypoints:
-            self.waypoint_encoder = nn.Sequential(
-                pufferlib.pytorch.layer_init(nn.Linear(self.waypoint_features, input_size)),
-                nn.LayerNorm(input_size),
-                pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
-            )
+            if self.waypoint_encoder_arch == "mlp":
+                self.waypoint_encoder = nn.Sequential(
+                    pufferlib.pytorch.layer_init(nn.Linear(self.waypoint_features, input_size)),
+                    nn.LayerNorm(input_size),
+                    pufferlib.pytorch.layer_init(nn.Linear(input_size, input_size)),
+                )
+
+            elif self.waypoint_encoder_arch == "attention":
+                self.waypoint_encoder = nn.Sequential(
+                    pufferlib.pytorch.layer_init(nn.Linear(self.waypoint_features, input_size)),
+                    AttentionBlock(input_size),
+                )
+
             num_branches += 1
 
         self.shared_embedding = nn.Sequential(
@@ -225,7 +235,12 @@ class Drive(nn.Module):
                 :, waypoint_start : waypoint_start + self.max_waypoints * self.waypoint_features
             ]
             waypoints = waypoint_obs.view(-1, self.max_waypoints, self.waypoint_features)
-            waypoint_features, _ = self.waypoint_encoder(waypoints).max(dim=1)
+            waypoint_features = self.waypoint_encoder(waypoints)
+            if self.waypoint_encoder_arch == "mlp":
+                waypoint_features, _ = waypoint_features.max(dim=1)
+            elif self.waypoint_encoder_arch == "attention":
+                waypoint_features = waypoint_features[:, 0]
+
             branch_features.append(waypoint_features)
 
         concat_features = torch.cat(branch_features, dim=1)
