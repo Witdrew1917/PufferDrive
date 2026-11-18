@@ -738,6 +738,7 @@ struct Drive {
     IDMMap *idm_map;
     IDMAgentState *idm_agent_states;
     int navigation_enabled; // ini/kwarg `navigation`; legacy maps require map_XXX.navi sidecars
+    int record_pid_anchor;
     int snap_goal_to_navi_endpoint;
     int append_goal_to_navi_lookahead;
     int navigation_waypoints;          // route waypoints in the observation when navigation_enabled
@@ -2718,7 +2719,8 @@ void init(Drive *env) {
                             env->non_sdc_controller == CONTROLLER_NAVI_PID ||
                             env->non_vehicle_controller == CONTROLLER_NAVI_PID;
         env->navigation =
-            load_navigation_binary(env, env->navigation_enabled || env->snap_goal_to_navi_endpoint || pid_requested);
+            load_navigation_binary(env, env->navigation_enabled || env->snap_goal_to_navi_endpoint ||
+                                            pid_requested || env->record_pid_anchor);
         if (env->navigation != NULL) {
             for (int goal_idx = 0; goal_idx < env->navigation->num_goals; goal_idx++) {
                 env->navigation->goal_x[goal_idx] -= env->world_mean_x;
@@ -2802,10 +2804,12 @@ int waypoint_feature_count(const Drive *env) {
 }
 
 
-// Layout: [ego | partners | road segments | navigation waypoints (navigation only)]
+// Layout: [ego | partners | road segments | optional navigation waypoints | optional PID targets]
+#define PID_ANCHOR_FEATURES 3
 int observation_size(const Drive *env) {
     return ego_feature_count(env) + PARTNER_FEATURES * (MAX_AGENTS - 1) +
-           ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + waypoint_feature_count(env);
+           ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS + waypoint_feature_count(env) +
+           (env->record_pid_anchor ? PID_ANCHOR_FEATURES : 0);
 }
 
 void allocate(Drive *env) {
@@ -3221,12 +3225,19 @@ void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *leng
     }
 }
 
+static void write_pid_anchor(Drive *env, int agent_idx, float *out);
+
 void compute_observations(Drive *env) {
     int ego_dim = ego_feature_count(env);
     int max_obs = observation_size(env);
-    int waypoint_obs_start = max_obs - waypoint_feature_count(env);
+    int pid_anchor_start = max_obs - (env->record_pid_anchor ? PID_ANCHOR_FEATURES : 0);
+    int waypoint_obs_start = pid_anchor_start - waypoint_feature_count(env);
     memset(env->observations, 0, max_obs * env->active_agent_count * sizeof(float));
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
+    if (env->record_pid_anchor) {
+        for (int i = 0; i < env->active_agent_count; i++)
+            write_pid_anchor(env, env->active_agent_indices[i], observations[i] + pid_anchor_start);
+    }
     for (int i = 0; i < env->active_agent_count; i++) {
         float *obs = &observations[i][0];
         Entity *ego_entity = &env->entities[env->active_agent_indices[i]];
@@ -3640,6 +3651,20 @@ static void override_action_with_expert(Drive *env, int action_idx, int agent_id
 #include "idm.h"
 #include "navi_pid.h"
 
+static void write_pid_anchor(Drive *env, int agent_idx, float *out) {
+    Entity *agent = &env->entities[agent_idx];
+    if (agent->controller != CONTROLLER_POLICY || agent->type > CYCLIST || agent->removed || agent->stopped || !agent->valid ||
+        agent->x == INVALID_POSITION) {
+        for (int i = 0; i < PID_ANCHOR_FEATURES; i++)
+            out[i] = -1.0f;
+        return;
+    }
+
+    NaviPIDAction action = navi_pid_action(env, agent_idx, false);
+    for (int i = 0; i < PID_ANCHOR_FEATURES; i++)
+        out[i] = action.discrete[i];
+}
+
 static void move_agent_with_controller(Drive *env, int action_idx, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
 
@@ -3665,7 +3690,7 @@ static void move_agent_with_controller(Drive *env, int action_idx, int agent_idx
     if (agent->controller == CONTROLLER_NAVI_PID) {
         if (agent->removed || agent->x == INVALID_POSITION)
             return;
-        NaviPIDAction action = navi_pid_action(env, agent_idx);
+        NaviPIDAction action = navi_pid_action(env, agent_idx, true);
         if (action_idx >= 0) {
             if (env->action_type == 1) {
                 int width = env->dynamics_model == DELTA_LOCAL ? 3 : 2;

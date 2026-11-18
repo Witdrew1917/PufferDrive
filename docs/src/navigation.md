@@ -67,6 +67,11 @@ The PID produces actions for the selected `dynamics_model`, just like a policy: 
 actions use the model's bins. The native dynamics update and constrain the motion; for controlled agents, the
 generated actions are visible in `env.actions` after `step()`.
 
+For PPO with discrete `delta_local` actions, set `reg_mode = kl_pid_anchor` to use the native PID as a
+checkpoint-free teacher. Three target bins travel with each rollout observation but are hidden from the policy.
+PPO still controls the car. When `fix_lambdas = True`, set `lambda_value` above zero to give the auxiliary
+loss weight; the default is zero.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `navi_pid_speed_gain` | `1.0` | Gain on desired-speed error. |

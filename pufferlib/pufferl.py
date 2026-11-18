@@ -247,6 +247,8 @@ class PuffeRL:
         # We only do this for the driver env to save memory
         self.reg_mode = full_args["env"]["reg_mode"]
         self.bc_anchor, self.data = self.vecenv.driver_env._init_regularization_strategy(device=config["device"])
+        if self.reg_mode == "kl_pid_anchor":
+            self.pid_target_slice = self.vecenv.driver_env.pid_target_slice
         self.resample_freq_epoch = self.vecenv.driver_env.resample_frequency / self.vecenv.driver_env.episode_length
 
         # Lambda conditioning
@@ -315,7 +317,11 @@ class PuffeRL:
                     state["lstm_h"] = self.lstm_h[env_id.start]
                     state["lstm_c"] = self.lstm_c[env_id.start]
 
-                logits, value = self.policy.forward_eval(o_device, state)
+                policy_obs = o_device
+                if self.reg_mode == "kl_pid_anchor":
+                    policy_obs = o_device.clone()
+                    policy_obs[..., self.pid_target_slice] = 0
+                logits, value = self.policy.forward_eval(policy_obs, state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
@@ -461,7 +467,10 @@ class PuffeRL:
             prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs, self.minibatch_segments)
             mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
-            mb_obs = self.observations[idx]
+            if self.reg_mode == "kl_pid_anchor":
+                mb_obs = self.observations[idx.to(self.observations.device)].to(device)
+            else:
+                mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
             mb_logprobs = self.logprobs[idx]
             mb_rewards = self.rewards[idx]
@@ -483,7 +492,11 @@ class PuffeRL:
                 lstm_c=None,
             )
 
-            logits, newvalue = self.policy(mb_obs, state)
+            policy_obs = mb_obs
+            if self.reg_mode == "kl_pid_anchor":
+                policy_obs = mb_obs.clone()
+                policy_obs[..., self.pid_target_slice] = 0
+            logits, newvalue = self.policy(policy_obs, state)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile("train_misc", epoch)
@@ -634,6 +647,18 @@ class PuffeRL:
                 # Average and clip
                 human_log_prob = torch.clamp(human_log_prob, -15, 0)
                 reg_loss = -human_log_prob.mean()
+
+            elif self.reg_mode == "kl_pid_anchor":
+                anchor_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
+                targets = anchor_obs[:, self.pid_target_slice].long()
+                valid_targets = (targets >= 0).all(dim=-1) & mb_masks.reshape(-1).bool()
+                per_sample_kl = pufferlib.pytorch.categorical_target_kl(logits, targets, valid_targets)
+                target_count = valid_targets.sum().clamp_min(1)
+                self.sampled_lambdas = anchor_obs[:, self.lambda_obs_idx : self.lambda_obs_idx + 1]
+                self.sampled_collision_rewards = anchor_obs[:, self.reward_veh_obs_idx : self.reward_veh_obs_idx + 1]
+                unweighted_reg_loss = per_sample_kl.sum() / target_count
+                reg_loss = (per_sample_kl * self.sampled_lambdas.squeeze(-1)).sum() / target_count
+                self.data["data/anchor_entropy"] = 0.0
 
             else:
                 unweighted_reg_loss = torch.tensor(0.0, device=device)

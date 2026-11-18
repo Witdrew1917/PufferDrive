@@ -384,6 +384,12 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         return -1;
     }
     env->navigation_enabled = conf.navigation;
+    env->record_pid_anchor =
+        kwargs && PyDict_GetItemString(kwargs, "record_pid_anchor") && unpack(kwargs, "record_pid_anchor");
+    if (env->record_pid_anchor && (env->dynamics_model != DELTA_LOCAL || env->action_type != 0)) {
+        PyErr_SetString(PyExc_ValueError, "kl_pid_anchor requires discrete delta_local actions");
+        return -1;
+    }
     env->snap_goal_to_navi_endpoint = conf.snap_goal_to_navi_endpoint;
     env->append_goal_to_navi_lookahead = conf.append_goal_to_navi_lookahead;
     env->navigation_waypoints = conf.navigation_waypoints;

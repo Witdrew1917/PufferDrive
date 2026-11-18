@@ -7,7 +7,18 @@ import pytest
 
 import pufferlib
 import pufferlib.emulation
-from pufferlib.pytorch import NativeDType, nativize_dtype, nativize_tensor
+from pufferlib.pytorch import NativeDType, categorical_target_kl, nativize_dtype, nativize_tensor
+
+
+def test_categorical_target_kl_selects_each_head_and_masks_missing_targets():
+    dx = torch.tensor([[[1.0, 3.0], [2.0, 1.0]]], requires_grad=True)
+    dy = torch.tensor([[[4.0, 2.0, 1.0], [2.0, 4.0, 1.0]]], requires_grad=True)
+    loss = categorical_target_kl([dx, dy], torch.tensor([[1, 0], [-1, -1]]), torch.tensor([True, False]))
+    expected = -dx[0, 0].log_softmax(0)[1] - dy[0, 0].log_softmax(0)[0]
+    torch.testing.assert_close(loss, torch.stack((expected, torch.zeros_like(expected))))
+    loss.sum().backward()
+    assert dx.grad[0, 0, 1] < 0 and dy.grad[0, 0, 0] < 0
+    assert torch.count_nonzero(dx.grad[0, 1]) == torch.count_nonzero(dy.grad[0, 1]) == 0
 
 
 # TODO: align=True for dtype

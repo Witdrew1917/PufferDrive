@@ -157,6 +157,8 @@ ENV_SCRIPT = textwrap.dedent(
     replay_actions = config.pop("replay_actions", None)
     env = Drive(num_agents=1, num_maps=1, map_dir=sys.argv[1], control_mode="control_vehicles",
                 episode_length=91, resample_frequency=0, **config)
+    if env.record_pid_anchor:
+        assert env._init_regularization_strategy(device="cpu") == (None, {})
     obs, _ = env.reset(seed=0)
     observations, rewards, actions = [obs[0].tolist()], [], []
     for step in range(steps):
@@ -333,6 +335,21 @@ class TestZbinEnv(unittest.TestCase):
         write_zbin(self.map_dir / "map_000.bin", trajectories=[(22.0, 22.0)], sdc_track_index=0)
         result = self._result(sdc_controller="navi_pid", dynamics_model="delta_local", goal_radius=0.0)
         self.assertGreater(result["observations"][-1, 6], 0.0)
+
+    def test_pid_anchor_records_pre_step_targets_without_controlling_agent(self):
+        config = {"dynamics_model": "delta_local", "navigation": 1}
+        pid = self._result(sdc_controller="navi_pid", **config)
+        policy = self._result(**config)
+        anchored = self._result(reg_mode="kl_pid_anchor", **config)
+        np.testing.assert_array_equal(anchored["observations"][:, :-3], policy["observations"])
+        np.testing.assert_array_equal(anchored["observations"][0, -3:], np.asarray(pid["actions"][0]).reshape(3))
+        self.assertEqual(anchored["actions"], policy["actions"])
+        self.assertEqual(anchored["final_state"], policy["final_state"])
+
+    def test_pid_anchor_rejects_non_delta_actions(self):
+        completed = self._run_env(reg_mode="kl_pid_anchor", dynamics_model="classic")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("kl_pid_anchor requires discrete delta_local actions", completed.stderr)
 
     def test_navi_pid_speed_gain_and_speed_limit_fraction(self):
         full_speed = self._result(navigation=0, sdc_controller="navi_pid")

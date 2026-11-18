@@ -42,12 +42,13 @@ static PIDRoute navi_pid_goal_segment(const Entity *agent) {
     return route;
 }
 
-static PIDRoute navi_pid_route(Drive *env, int agent_idx) {
+static PIDRoute navi_pid_route(Drive *env, int agent_idx, bool refresh_navigation) {
     Entity *agent = &env->entities[agent_idx];
     PIDRoute route = {.remaining = -1.0f};
     if (!navigation_loaded(env) || agent->navi_goal_idx < 0)
         return route;
-    update_navigation_state(env, agent_idx);
+    if (refresh_navigation)
+        update_navigation_state(env, agent_idx);
     if (env->append_goal_to_navi_lookahead && agent->navi_pid_on_goal_segment)
         return navi_pid_goal_segment(agent);
     if (agent->current_lane_idx < 0 || agent->navi_off_route)
@@ -196,7 +197,7 @@ static int navi_pid_action_bin(float value, const float *bins, int count) {
     return best;
 }
 
-static NaviPIDAction navi_pid_action(Drive *env, int agent_idx) {
+static NaviPIDAction navi_pid_action(Drive *env, int agent_idx, bool refresh_navigation) {
     Entity *agent = &env->entities[agent_idx];
     if (agent->stopped) {
         if (env->action_type == 1)
@@ -207,7 +208,7 @@ static NaviPIDAction navi_pid_action(Drive *env, int agent_idx) {
             return (NaviPIDAction){.discrete = {2 * 3 + 1}};
         return (NaviPIDAction){.discrete = {(NUM_ACCEL_BINS / 2) * NUM_STEER_BINS + NUM_STEER_BINS / 2}};
     }
-    PIDRoute route = navi_pid_route(env, agent_idx);
+    PIDRoute route = navi_pid_route(env, agent_idx, refresh_navigation);
     float signed_speed =
         copysignf(hypotf(agent->vx, agent->vy), agent->vx * agent->heading_x + agent->vy * agent->heading_y);
     float speed = fmaxf(0.0f, signed_speed);

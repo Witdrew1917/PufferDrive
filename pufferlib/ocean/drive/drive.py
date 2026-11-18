@@ -56,6 +56,7 @@ class RegMode(IntEnum):
     NONE = 0
     LOG_PROB_DIRECT = 1
     KL_ANCHOR = 2
+    KL_PID_ANCHOR = 3
 
 
 DYNAMICS_MODEL_MAP = {"classic": 0, "jerk": 1, "delta_local": 2}
@@ -274,13 +275,33 @@ class Drive(pufferlib.PufferEnv):
             else binding.NAVIGATION_WAYPOINT_FEATURES
         )
 
+        str_to_reg_mode = {
+            "None": RegMode.NONE,
+            "log_prob_direct": RegMode.LOG_PROB_DIRECT,
+            "kl_anchor": RegMode.KL_ANCHOR,
+            "kl_pid_anchor": RegMode.KL_PID_ANCHOR,
+        }
+        self.reg_mode = str_to_reg_mode.get(str(reg_mode).strip('"'))
+        self.record_pid_anchor = self.reg_mode == RegMode.KL_PID_ANCHOR
+        if self.record_pid_anchor and (dynamics_model != "delta_local" or action_type != "discrete"):
+            raise ValueError("kl_pid_anchor requires discrete delta_local actions")
+        self.pid_target_slice = slice(-3, None) if self.record_pid_anchor else None
+
         self.num_obs = (
             self.ego_features
             + self.max_partner_objects * self.partner_features
             + self.max_road_objects * self.road_features
             + self.max_waypoints * self.waypoint_features
+            + (3 if self.record_pid_anchor else 0)
         )
-        self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(self.num_obs,), dtype=np.float32)
+        if self.record_pid_anchor:
+            high = np.ones(self.num_obs, dtype=np.float32)
+            high[self.pid_target_slice] = [binding.NUM_DX_BINS - 1, binding.NUM_DY_BINS - 1, binding.NUM_YAW_BINS - 1]
+            self.single_observation_space = gymnasium.spaces.Box(low=-1, high=high, dtype=np.float32)
+        else:
+            self.single_observation_space = gymnasium.spaces.Box(
+                low=-1, high=1, shape=(self.num_obs,), dtype=np.float32
+            )
 
         self.init_steps = init_steps
         self.init_mode_str = init_mode
@@ -289,12 +310,6 @@ class Drive(pufferlib.PufferEnv):
         self.non_sdc_controller_str = non_sdc_controller
         self.non_vehicle_controller_str = non_vehicle_controller
         self.map_dir = map_dir
-        str_to_reg_mode = {
-            "None": RegMode.NONE,
-            "log_prob_direct": RegMode.LOG_PROB_DIRECT,
-            "kl_anchor": RegMode.KL_ANCHOR,
-        }
-        self.reg_mode = str_to_reg_mode.get(str(reg_mode).strip('"'))
 
         if self.control_mode_str == "control_vehicles":
             self.control_mode = 0
@@ -386,12 +401,12 @@ class Drive(pufferlib.PufferEnv):
             self.non_vehicle_controller_str,
         )
         if (
-            self.navigation or self.snap_goal_to_navi_endpoint or needs_pid_navigation
+            self.navigation or self.snap_goal_to_navi_endpoint or needs_pid_navigation or self.record_pid_anchor
         ) and self.map_format == MAP_FORMAT_LEGACY:
             missing = [i for i in range(num_maps) if not os.path.exists(f"{map_dir}/map_{i:03d}.navi")]
             if missing:
                 raise FileNotFoundError(
-                    f"navigation, goal snapping, or navi_pid requires .navi sidecars, but {len(missing)} of {num_maps} maps in "
+                    f"navigation, goal snapping, navi_pid, or kl_pid_anchor requires .navi sidecars, but {len(missing)} of {num_maps} maps in "
                     f"{map_dir} lack one "
                     f"(first: map_{missing[0]:03d}.navi). Generate them with: "
                     f"python -m pufferlib.ocean.drive.drive navigation --map-dir {map_dir}"
@@ -481,6 +496,7 @@ class Drive(pufferlib.PufferEnv):
                 navi_pid_speed_lookahead_distance=self.navi_pid_speed_lookahead_distance,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
                 goal_visible_mode=self.goal_visible_mode,
+                record_pid_anchor=self.record_pid_anchor,
             )
             self.env_ids.append(env_id)
 
@@ -617,6 +633,7 @@ class Drive(pufferlib.PufferEnv):
                 navi_pid_speed_lookahead_distance=self.navi_pid_speed_lookahead_distance,
                 goal_obs_dropout_prob=self.goal_obs_dropout_prob,
                 goal_visible_mode=self.goal_visible_mode,
+                record_pid_anchor=self.record_pid_anchor,
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)
