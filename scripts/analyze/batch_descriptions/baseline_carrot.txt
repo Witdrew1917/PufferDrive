@@ -1,1 +1,1 @@
-laveno-chalmers-university-of-technology/pufferlib/mk05h2ui --env.goal-visible-mode=2 --env.navigation-lookahead-distance=50 --env.append-goal-to-navi-lookahead
+laveno-chalmers-university-of-technology/pufferlib/mk05h2ui --env.goal-visible-mode=2 --env.navigation-lookahead-distance=50 --env.append-goal-to-navi-lookahead=1
