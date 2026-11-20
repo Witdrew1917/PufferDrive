@@ -1,0 +1,3 @@
+#navi
+laveno-chalmers-university-of-technology/pufferlib/42bg4fe0 --env.waypoint-encoder-arch=mlp
+laveno-chalmers-university-of-technology/pufferlib/s0hga5vs --env.waypoint-encoder-arch=attention
