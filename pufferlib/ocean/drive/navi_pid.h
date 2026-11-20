@@ -1,6 +1,7 @@
 #ifndef PUFFERLIB_OCEAN_DRIVE_NAVI_PID_H
 #define PUFFERLIB_OCEAN_DRIVE_NAVI_PID_H
 
+#include <cmath>
 #define PID_ROUTE_POINTS 40
 #define PID_ROUTE_SPACING 2.0f
 #define PID_ROUTE_DISTANCE (PID_ROUTE_POINTS * PID_ROUTE_SPACING)
@@ -167,11 +168,12 @@ static float navi_pid_curvature(const PIDRoute *route, int i) {
     return denominator > 1e-4f ? 2.0f * (ax * by - ay * bx) / denominator : 0.0f;
 }
 
-static float navi_pid_preview_speed(const Drive *env, const Entity *agent, float distance, float target) {
+static float navi_pid_preview_speed(const Drive *env, const Entity *agent, const PIDRoute *route, float distance, float target) {
     const ZNavigation *zn = env->znavigation;
     if (distance <= 0.0f || agent->znavi_entity_idx < 0)
         return target;
 
+    int route_idx = 1;
     ZNaviWalk walk =
         znavi_walk_init(agent->znavi_entity_idx, agent->znavi_point_idx, agent->znavi_proj_x, agent->znavi_proj_y);
     for (int step = 0; step < ZNAVI_LOOKAHEAD_MAX_WALK_STEPS; step++) {
@@ -183,7 +185,21 @@ static float navi_pid_preview_speed(const Drive *env, const Entity *agent, float
             continue;
         float next_limit = env->entities[env->num_objects + road].road_speed_limit;
         if (next_limit > 0.0f && isfinite(next_limit))
-            target = fminf(target, next_limit * env->navi_pid_speed_limit_fraction);
+            next_limit = next_limit * env->navi_pid_speed_limit_fraction;
+
+            if (target > next_limit) {
+                target = next_limit;
+                route_idx = (walk.accum > PID_ROUTE_SPACING) ? (int)floorf(walk.accum, PID_ROUTE_SPACING) : 1;
+
+            }
+    }
+    float route_curvature = navi_pid_curvature(&route, route_idx);
+    float curvature_magnitude = fabsf(route_curvature);
+    for (int i = 2; i + 2 < route.count && i * PID_ROUTE_SPACING <= preview_distance; i++)
+        curvature_magnitude = fmaxf(curvature_magnitude, fabsf(navi_pid_curvature(&route, i)));
+    if (curvature_magnitude > 1e-5f) {
+        float curvature_speed = sqrtf(PID_MAX_LATERAL_ACCELERATION / curvature_magnitude);
+        target = fminf(target, curvature_speed);
     }
     return target;
 }
@@ -309,7 +325,14 @@ static NaviPIDAction navi_pid_action(Drive *env, int agent_idx, bool refresh_nav
     // Carry sub-bin forward motion so a PID starting from rest can escape the zero bin.
     dx = clip(dx + agent->navi_pid_dx_residual, 0.0f, DELTA_MAX_DX);
     int dx_bin = navi_pid_action_bin(dx, DELTA_DX_VALUES, NUM_DX_BINS);
-    agent->navi_pid_dx_residual = dx - DELTA_DX_VALUES[dx_bin];
+    // move_dynamics clamps the executed step to the longitudinal acceleration bound; carry the residual
+    // against what will actually execute (bounded to half a bin, so clamp losses are not caught up later),
+    // otherwise the phantom residual pins agents to their speed bin.
+    float max_dx_change = A_LONG_MAX * env->dt * env->dt;
+    float executed_dx =
+        clip(DELTA_DX_VALUES[dx_bin], agent->prev_action_dx - max_dx_change, agent->prev_action_dx + max_dx_change);
+    float half_bin = 0.5f * (DELTA_DX_VALUES[1] - DELTA_DX_VALUES[0]);
+    agent->navi_pid_dx_residual = clip(dx - executed_dx, -half_bin, half_bin);
     int dy_bin = navi_pid_action_bin(dy, DELTA_DY_VALUES, NUM_DY_BINS);
     int yaw_bin = navi_pid_action_bin(yaw, DELTA_YAW_VALUES, NUM_YAW_BINS);
     return (NaviPIDAction){.discrete = {dx_bin, dy_bin, yaw_bin}};

@@ -358,6 +358,14 @@ class TestZbinEnv(unittest.TestCase):
         self.assertGreater(full_speed["observations"][-1, 6], no_speed_gain["observations"][-1, 6])
         self.assertLess(half_speed_limit["observations"][-1, 6], full_speed["observations"][-1, 6])
 
+    def test_navi_pid_discrete_delta_brakes_from_initial_speed(self):
+        # 8 m/s start: the 1.4 m/s dx bin exceeds the per-step accel clamp, which used to pin the speed bin.
+        write_zbin(self.map_dir / "map_000.bin", trajectories=[(22.0, 94.0)], sdc_track_index=0)
+        config = {"sdc_controller": "navi_pid", "dynamics_model": "delta_local", "goal_radius": 0.0, "steps": 40}
+        stopped = self._result(navi_pid_speed_limit_fraction=0.0, **config)
+        # Holding ~8 m/s for 4 s would cover >30 m; braking (slowed by dx-bin quantization) stays well below.
+        self.assertLess(stopped["final_state"]["x"] - 22.0, 20.0)
+
     def test_navi_pid_previews_curvature_before_the_bend(self):
         write_zbin(self.map_dir / "map_000.bin", bend_x=40.0)
         near_only = self._result(sdc_controller="navi_pid", navi_pid_speed_lookahead_distance=0)["observations"]
