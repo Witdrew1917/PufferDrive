@@ -1,7 +1,6 @@
 #ifndef PUFFERLIB_OCEAN_DRIVE_NAVI_PID_H
 #define PUFFERLIB_OCEAN_DRIVE_NAVI_PID_H
 
-#include <cmath>
 #define PID_ROUTE_POINTS 40
 #define PID_ROUTE_SPACING 2.0f
 #define PID_ROUTE_DISTANCE (PID_ROUTE_POINTS * PID_ROUTE_SPACING)
@@ -168,12 +167,11 @@ static float navi_pid_curvature(const PIDRoute *route, int i) {
     return denominator > 1e-4f ? 2.0f * (ax * by - ay * bx) / denominator : 0.0f;
 }
 
-static float navi_pid_preview_speed(const Drive *env, const Entity *agent, const PIDRoute *route, float distance, float target) {
+static float navi_pid_preview_speed(const Drive *env, const Entity *agent, float distance, float target) {
     const ZNavigation *zn = env->znavigation;
     if (distance <= 0.0f || agent->znavi_entity_idx < 0)
         return target;
 
-    int route_idx = 1;
     ZNaviWalk walk =
         znavi_walk_init(agent->znavi_entity_idx, agent->znavi_point_idx, agent->znavi_proj_x, agent->znavi_proj_y);
     for (int step = 0; step < ZNAVI_LOOKAHEAD_MAX_WALK_STEPS; step++) {
@@ -184,22 +182,9 @@ static float navi_pid_preview_speed(const Drive *env, const Entity *agent, const
         if (road < 0 || road == zn->line_road[previous_line])
             continue;
         float next_limit = env->entities[env->num_objects + road].road_speed_limit;
-        if (next_limit > 0.0f && isfinite(next_limit))
-            next_limit = next_limit * env->navi_pid_speed_limit_fraction;
-
-            if (target > next_limit) {
-                target = next_limit;
-                route_idx = (walk.accum > PID_ROUTE_SPACING) ? (int)floorf(walk.accum, PID_ROUTE_SPACING) : 1;
-
-            }
-    }
-    float route_curvature = navi_pid_curvature(&route, route_idx);
-    float curvature_magnitude = fabsf(route_curvature);
-    for (int i = 2; i + 2 < route.count && i * PID_ROUTE_SPACING <= preview_distance; i++)
-        curvature_magnitude = fmaxf(curvature_magnitude, fabsf(navi_pid_curvature(&route, i)));
-    if (curvature_magnitude > 1e-5f) {
-        float curvature_speed = sqrtf(PID_MAX_LATERAL_ACCELERATION / curvature_magnitude);
-        target = fminf(target, curvature_speed);
+        if (next_limit > 0.0f && isfinite(next_limit)) {
+            target = fminf(target, next_limit * env->navi_pid_speed_limit_fraction);
+        }
     }
     return target;
 }
