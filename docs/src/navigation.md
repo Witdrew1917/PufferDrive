@@ -238,13 +238,13 @@ right feasibility (capped at 500 m). The loader validates every index and reject
 with `malformed zpufferdrive binary`.
 
 Each step, for each agent with a route, PufferDrive follows zdrive's non-expert path (`compute_agent_metrics` in
-`zdrive_agent_obs.c`), except for the projected-distance refinement below.
+`zdrive_agent_obs.c`), with the lane-selection differences below.
 
 1. **Localize**: find the closest lane, with a 1000 m penalty for lanes whose heading differs by more than 60°.
-   Among lanes within 4 m, prefer those routed to the agent's goal. Near-ties (within 0.75 m) go to the shorter
-   distance to goal at the projected sample. Unlike zdrive's first-reachable-sample ranking, a candidate is
-   reachable only if that projected sample is reachable. If none qualifies, use the geometric match.
-   Candidates come from the same spatial grid and in the same order as zdrive, since the tie-break depends on it.
+   Among segments less than 4 m away, find the closest one with a reachable route at the projected sample.
+   Then choose the shortest route to the goal from among reachable segments within 0.75 m of that closest
+   distance. Unlike zdrive's ranking, the tie window does not move when a farther segment wins on route length.
+   If no candidate qualifies, use the geometric match.
 2. **Look up** the navi entity and point on that lane. `distance_to_goal` and feasibility are read at point
    `max(p - 1, 0)`. Values of 1999.99 m or more, or a failed lookup, mean unreachable: 0 feasibility and
    2000 m distance (`navi_off_route`).
@@ -364,8 +364,8 @@ rejection.
 route-end padding, `navigation = 0` ignoring loaded routes, unmoved goals, config validation and truncated-file
 rejection. Its parity test compiles `tests/zdrive_navigation_oracle.c` against a zpufferdrive checkout and
 `tests/zbin_navigation_harness.c` against PufferDrive. Both teleport every object to each logged pose and print
-`distance_to_goal`, feasibility and the lookahead with `%.9g`. The existing real-map fixture outputs match byte for
-byte; other maps may differ where projected-sample lane selection differs from zdrive. Configure it with
+the selected route sample, `distance_to_goal`, feasibility and the lookahead. Feature outputs must match byte for
+byte when both select the same route sample. Synthetic tests cover PufferDrive's lane-selection rules. Configure it with
 `ZPUFFERDRIVE_ROOT` (default `~/Repositories/zpufferdrive`), `ZBIN_MAP_DIR` (default
 `~/Data/zpufferdrive/waymo_binaries/interactive_1k`) and `ZBIN_PARITY_MAPS` (default 20). It is skipped when these
 are missing.

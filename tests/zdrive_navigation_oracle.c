@@ -91,8 +91,9 @@ int main(int argc, char **argv) {
                 for (int k = 0; k < 3; k++)
                     feasibility[k] = CLAMP(raw[k] / agent->current_speed_limit / MAX_LANE_FEASIBILITY_TIME, 0.0f, 1.0f);
             }
-            printf("%d %d %d %d %.9g %.9g %.9g %.9g %.9g", t, i, agent->id, agent->goal_index,
-                   agent->current_speed_limit, agent->distance_to_goal, feasibility[0], feasibility[1], feasibility[2]);
+            printf("%d %d %d %d %d %d %.9g %.9g %.9g %.9g %.9g", t, i, agent->id, agent->goal_index,
+                   agent->closest_navi_entity_idx, agent->closest_navi_point_idx, agent->current_speed_limit,
+                   agent->distance_to_goal, feasibility[0], feasibility[1], feasibility[2]);
 
             float spacing = lookahead_distance / (float)n_waypoints;
             NaviWalk walk = navi_walk_init(&env, agent->closest_navi_entity_idx, agent->closest_navi_point_idx,

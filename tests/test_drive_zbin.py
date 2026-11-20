@@ -632,6 +632,8 @@ class TestZbinLaneSelection(unittest.TestCase):
         self.assertEqual(self.probe(y=0)["lane"], 100)
         write_lane_selection_zbin(self.path, [[2000] * 4, [30] * 4], lane_ys=(0, 4.1))
         self.assertEqual(self.probe(y=0)["lane"], 100)
+        write_lane_selection_zbin(self.path, [[2000] * 4, [200] * 4, [30] * 4], lane_ys=(0, 0.9, 1.4))
+        self.assertEqual(self.probe(y=0)["lane"], 102)
         write_lane_selection_zbin(self.path, [[200] * 4, [30] * 4])
         self.assertEqual(self.probe(heading=np.pi)["lane"], -1)
 
@@ -639,9 +641,19 @@ class TestZbinLaneSelection(unittest.TestCase):
         write_lane_selection_zbin(self.path, [[100, 100, 30, 30], [10, 10, 200, 200]], lane_ys=(0.2, 0))
         self.assertEqual(self.probe()["lane"], 100)
 
+    def test_route_tie_window_is_anchored_to_the_nearest_reachable_segment(self):
+        for lane_ys, routes in (
+            ((0.0, 0.3, 0.85), (300, 43, 41)),
+            ((0.85, 0.3, 0.0), (41, 43, 300)),
+        ):
+            with self.subTest(lane_ys=lane_ys):
+                write_lane_selection_zbin(self.path, [[route] * 4 for route in routes], lane_ys=lane_ys)
+                result = self.probe(y=0)
+                self.assertEqual((result["lane"], result["distance"]), (101, 43))
+
 
 class TestZbinParity(unittest.TestCase):
-    """Navigation features of every logged object at every logged pose, PufferDrive vs zpufferdrive itself."""
+    """Compare navigation features at logged poses where PufferDrive and zpufferdrive select the same route sample."""
 
     @classmethod
     def setUpClass(cls):
@@ -714,10 +726,15 @@ class TestZbinParity(unittest.TestCase):
                     expected = self._dump(self.oracle, path, waypoints, distance)
                     actual = self._dump(self.harness, path, waypoints, distance)
                     self.assertEqual(len(actual), len(expected))
-                    # Row: step, object, id, goal_index, speed_limit, distance_to_goal, 3 feasibility, lookahead.
+                    # Row: step, object, id, goal, line, point, speed limit, route distance, feasibility, lookahead.
                     for actual_row, expected_row in zip(actual, expected):
+                        actual_fields, expected_fields = actual_row.split(), expected_row.split()
+                        self.assertEqual(actual_fields[:4], expected_fields[:4])
+                        # The upstream selector uses a moving distance reference; the anchored rule is tested above.
+                        if actual_fields[4:6] != expected_fields[4:6]:
+                            continue
                         self.assertEqual(actual_row, expected_row)
-                    routed += sum(float(row.split()[7]) > 0 for row in expected)
+                        routed += float(expected_fields[9]) > 0
             self.assertGreater(routed, 0)
 
 

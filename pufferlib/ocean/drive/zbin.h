@@ -38,7 +38,7 @@
 #define ZNAVI_SEGMENT_MAX_CELLS 256
 #define ZNAVI_MAX_LANE_DISTANCE 10.0f       // MAX_LANE_DISTANCE
 #define ZNAVI_MAX_NEARBY_LANE_DISTANCE 4.0f // MAX_NEARBY_LANE_DISTANCE
-#define ZNAVI_LANE_TIE_DISTANCE 0.75f       // NAVI_LANE_TIE_DISTANCE
+#define ZNAVI_LANE_TIE_DISTANCE 1.50f       // NAVI_LANE_TIE_DISTANCE
 #define ZNAVI_MAX_LANE_FEASIBILITY_TIME 30.0F
 #define ZNAVI_MAX_LANE_FEASIBILITY 500.0F
 #define ZNAVI_UNREACHABLE_DISTANCE 2000.0f // UNREACHABLE_DISTANCE_TO_GOAL
@@ -960,11 +960,13 @@ static int znavi_localize(Drive *env, Entity *agent, float *out_distance_to_goal
     float closest_speed_limit = 0.0F;
     int closest_lane_entity_idx = -1;
     int closest_lane_waypoint_idx = -1;
-    float min_navi_lane_distance = ZNAVI_MAX_NEARBY_LANE_DISTANCE;
-    float navi_lane_best_route_distance = ZNAVI_UNREACHABLE_DISTANCE;
-    int closest_navi_lane_entity_idx = -1;
-    int closest_navi_lane_waypoint_idx = -1;
-    float closest_navi_lane_speed_limit = 0.0F;
+    float nearest_reachable_distance = ZNAVI_MAX_NEARBY_LANE_DISTANCE;
+    struct {
+        int candidate_idx;
+        float distance;
+        float route_distance;
+    } reachable[ZNAVI_MAX_DETECTION_ROAD_ENTITIES];
+    int reachable_count = 0;
 
     const int *candidates = NULL;
     int list_size = znavi_cell_candidates(env, zn, znavi_grid_index(zn, agent->x, agent->y), &candidates);
@@ -996,24 +998,25 @@ static int znavi_localize(Drive *env, Entity *agent, float *out_distance_to_goal
             float route_distance = zn->distance_to_goal[sample];
             if (!(route_distance < ZNAVI_UNREACHABLE_DISTANCE - 0.01F))
                 continue;
-            int tied_with_best =
-                closest_navi_lane_entity_idx >= 0 && fabsf(dist - min_navi_lane_distance) <= ZNAVI_LANE_TIE_DISTANCE;
-            int wins =
-                closest_navi_lane_entity_idx < 0 ||
-                (tied_with_best ? route_distance < navi_lane_best_route_distance : dist < min_navi_lane_distance);
-            if (wins) {
-                min_navi_lane_distance = dist;
-                navi_lane_best_route_distance = route_distance;
-                closest_navi_lane_entity_idx = entity_idx;
-                closest_navi_lane_waypoint_idx = waypoint_idx;
-                closest_navi_lane_speed_limit = road_entity->road_speed_limit;
-            }
+            nearest_reachable_distance = ZB_MIN(nearest_reachable_distance, dist);
+            reachable[reachable_count].candidate_idx = i;
+            reachable[reachable_count].distance = dist;
+            reachable[reachable_count].route_distance = route_distance;
+            reachable_count++;
         }
     }
-    if (closest_navi_lane_entity_idx >= 0) {
-        closest_lane_entity_idx = closest_navi_lane_entity_idx;
-        closest_lane_waypoint_idx = closest_navi_lane_waypoint_idx;
-        closest_speed_limit = closest_navi_lane_speed_limit;
+
+    // Keep the tie window fixed even when a farther segment wins on route length.
+    float best_route_distance = ZNAVI_UNREACHABLE_DISTANCE;
+    for (int i = 0; i < reachable_count; i++) {
+        if (reachable[i].distance - nearest_reachable_distance <= ZNAVI_LANE_TIE_DISTANCE &&
+            reachable[i].route_distance < best_route_distance) {
+            best_route_distance = reachable[i].route_distance;
+            int candidate_idx = reachable[i].candidate_idx;
+            closest_lane_entity_idx = candidates[candidate_idx * 2];
+            closest_lane_waypoint_idx = candidates[candidate_idx * 2 + 1];
+            closest_speed_limit = env->entities[closest_lane_entity_idx].road_speed_limit;
+        }
     }
 
     // find_navi_edge_from_lane

@@ -71,8 +71,9 @@ int main(int argc, char **argv) {
             float distance_to_goal;
             znavi_localize(&env, agent, &distance_to_goal);
             znavi_write_observations(&env, agent, ego, waypoints);
-            printf("%d %d %d %d %.9g %.9g %.9g %.9g %.9g", t, i, agent->id, agent->navi_goal_idx,
-                   agent->navi_speed_limit, distance_to_goal, ego[0], ego[1], ego[2]);
+            printf("%d %d %d %d %d %d %.9g %.9g %.9g %.9g %.9g", t, i, agent->id, agent->navi_goal_idx,
+                   agent->znavi_entity_idx, agent->znavi_point_idx, agent->navi_speed_limit, distance_to_goal, ego[0],
+                   ego[1], ego[2]);
             for (int k = 0; k < env.navigation_waypoints * ZNAVI_WAYPOINT_FEATURES; k++)
                 printf(" %.9g", waypoints[k]);
             printf("\n");
