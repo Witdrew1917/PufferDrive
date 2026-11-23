@@ -6,16 +6,6 @@ import torch
 from torch.distributions.utils import logits_to_probs
 
 
-def categorical_target_kl(logits, targets, valid):
-    """Per-sample KL from a deterministic target over independent categorical heads."""
-    targets = targets.masked_fill(~valid[:, None], 0)
-    per_sample = sum(
-        -torch.log_softmax(head.reshape(-1, head.shape[-1]).float(), dim=-1).gather(1, targets[:, h : h + 1]).squeeze(1)
-        for h, head in enumerate(logits)
-    )
-    return per_sample.masked_fill(~valid, 0)
-
-
 numpy_to_torch_dtype_dict = {
     np.dtype("float64"): torch.float64,
     np.dtype("float32"): torch.float32,
@@ -235,3 +225,11 @@ def sample_logits(logits, action=None):
         return action.squeeze(0), logprob.squeeze(0), logits_entropy.squeeze(0)
 
     return action.T, logprob.sum(0), logits_entropy
+
+
+def gaussian_kernel(sigma: float):
+    radius = int(3 * sigma)
+    x = torch.arange(-radius, radius + 1, dtype=torch.float32)
+    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel /= kernel.sum()
+    return kernel

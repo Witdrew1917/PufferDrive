@@ -29,6 +29,7 @@ import torch
 import torch.distributed
 from torch.distributed.elastic.multiprocessing.errors import record
 import torch.utils.cpp_extension
+import torch.nn.functional as F
 
 import pufferlib
 import pufferlib.sweep
@@ -246,6 +247,7 @@ class PuffeRL:
 
         # We only do this for the driver env to save memory
         self.reg_mode = full_args["env"]["reg_mode"]
+        self.pid_anchor_smearing = full_args["env"]["pid_anchor_smearing"]
         self.bc_anchor, self.data = self.vecenv.driver_env._init_regularization_strategy(device=config["device"])
         if self.reg_mode == "kl_pid_anchor":
             self.pid_target_slice = self.vecenv.driver_env.pid_target_slice
@@ -652,7 +654,18 @@ class PuffeRL:
                 anchor_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
                 targets = anchor_obs[:, self.pid_target_slice].long()
                 valid_targets = (targets >= 0).all(dim=-1) & mb_masks.reshape(-1).bool()
-                per_sample_kl = pufferlib.pytorch.categorical_target_kl(logits, targets, valid_targets)
+                safe_targets = targets.masked_fill(~valid_targets[:, None], 0)  # -1 is not a valid index for one_hot
+                per_sample_kl = torch.zeros(targets.shape[0], device=targets.device)
+                for h, head in enumerate(logits):
+                    log_p = torch.log_softmax(head.reshape(-1, head.shape[-1]).float(), dim=-1)  # [B, n_bins_h]
+                    q = F.one_hot(safe_targets[:, h], num_classes=head.shape[-1]).float()      # [B, n_bins_h]
+                    if self.pid_anchor_smearing > 0.0:
+                        kernel = pufferlib.pytorch.gaussian_kernel(self.pid_anchor_smearing).to(targets.device).view(1, 1, -1)
+                        q = F.conv1d(q[:, None], kernel, padding=kernel.shape[-1] // 2).squeeze(1)  # smooth along the bins
+                        q = q / q.sum(-1, keepdim=True)  # put back the mass cut off at the edges
+                    per_sample_kl += (torch.special.xlogy(q, q) - q * log_p).sum(-1)  # KL(q || p)
+
+                per_sample_kl = per_sample_kl.masked_fill(~valid_targets, 0)
                 target_count = valid_targets.sum().clamp_min(1)
                 self.sampled_lambdas = anchor_obs[:, self.lambda_obs_idx : self.lambda_obs_idx + 1]
                 self.sampled_collision_rewards = anchor_obs[:, self.reward_veh_obs_idx : self.reward_veh_obs_idx + 1]

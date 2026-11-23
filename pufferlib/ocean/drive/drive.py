@@ -108,6 +108,7 @@ class Drive(pufferlib.PufferEnv):
         ini_file_path=DEFAULT_INI_FILE,
         reg_mode="None",
         anchor_cpt_path=None,
+        pid_anchor_smearing=0.0,
         uses_memory=False,
         memory_size=0,
         fix_rewards=False,
@@ -137,6 +138,7 @@ class Drive(pufferlib.PufferEnv):
         waypoint_encoder_arch="mlp",
     ):
         # env
+        self.pid_anchor_smearing = pid_anchor_smearing
         self.dt = dt
         self.render_mode = render_mode
         self.num_maps = num_maps

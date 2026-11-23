@@ -1,4 +1,4 @@
-#baseline (adam, adamw)
+#baseline
 laveno-chalmers-university-of-technology/pufferlib/iwh2tzeu
 laveno-chalmers-university-of-technology/pufferlib/u3em452p
 
