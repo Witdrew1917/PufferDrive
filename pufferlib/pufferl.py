@@ -249,8 +249,16 @@ class PuffeRL:
         self.reg_mode = full_args["env"]["reg_mode"]
         self.pid_anchor_smearing = full_args["env"]["pid_anchor_smearing"]
         self.bc_anchor, self.data = self.vecenv.driver_env._init_regularization_strategy(device=config["device"])
-        if self.reg_mode == "kl_pid_anchor":
+        self.uses_pid_anchor = self.reg_mode in ("kl_pid_anchor", "kl_joint_anchor")
+        self.uses_bc_anchor = self.reg_mode in ("kl_anchor", "kl_joint_anchor")
+        if self.uses_pid_anchor:
             self.pid_target_slice = self.vecenv.driver_env.pid_target_slice
+        # Per-term weights only apply in joint mode so the single-anchor modes keep their behaviour
+        joint = self.reg_mode == "kl_joint_anchor"
+        self.kl_bc_weight = float(full_args["env"].get("lambda_kl_bc_value", 1.0)) if joint else 1.0
+        self.kl_pid_weight = float(full_args["env"].get("lambda_kl_pid_value", 1.0)) if joint else 1.0
+        raw_policy = getattr(self.uncompiled_policy, "module", self.uncompiled_policy)  # unwrap DDP
+        self.hide_pid_targets = self.uses_pid_anchor and not getattr(raw_policy, "uses_pid_targets", False)
         self.resample_freq_epoch = self.vecenv.driver_env.resample_frequency / self.vecenv.driver_env.episode_length
 
         # Lambda conditioning
@@ -320,7 +328,7 @@ class PuffeRL:
                     state["lstm_c"] = self.lstm_c[env_id.start]
 
                 policy_obs = o_device
-                if self.reg_mode == "kl_pid_anchor":
+                if self.hide_pid_targets:
                     policy_obs = o_device.clone()
                     policy_obs[..., self.pid_target_slice] = 0
                 logits, value = self.policy.forward_eval(policy_obs, state)
@@ -469,7 +477,7 @@ class PuffeRL:
             prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
             idx = torch.multinomial(prio_probs, self.minibatch_segments)
             mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
-            if self.reg_mode == "kl_pid_anchor":
+            if self.uses_pid_anchor:
                 mb_obs = self.observations[idx.to(self.observations.device)].to(device)
             else:
                 mb_obs = self.observations[idx]
@@ -495,7 +503,7 @@ class PuffeRL:
             )
 
             policy_obs = mb_obs
-            if self.reg_mode == "kl_pid_anchor":
+            if self.hide_pid_targets:
                 policy_obs = mb_obs.clone()
                 policy_obs[..., self.pid_target_slice] = 0
             logits, newvalue = self.policy(policy_obs, state)
@@ -555,6 +563,8 @@ class PuffeRL:
             # influence future advantage estimates
             ratio_masked = ratio * mb_masks
             self.ratio[idx] = ratio_masked.detach()
+            unweighted_reg_loss = torch.tensor(0.0, device=device)
+            reg_loss = torch.tensor(0.0, device=device)
 
             with torch.no_grad():
                 # KL and clipfrac diagnostics — exclude dead timesteps
@@ -564,7 +574,7 @@ class PuffeRL:
                 approx_kl = (((ratio - 1) - logratio) * mb_masks).sum() / valid_count
                 clipfrac = (((ratio - 1.0).abs() > config["clip_coef"]) * mb_masks).sum() / valid_count
             # Regularization
-            if self.reg_mode == "kl_anchor":
+            if self.uses_bc_anchor:
                 # Flatten the batch and time dimensions for feeding into the BC anchor policy since it is trained without memory
                 # [B, rollout_horizon, obs_dim] -> [B * rollout_horizon, obs_dim]
                 anchor_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
@@ -602,15 +612,17 @@ class PuffeRL:
                 self.sampled_lambdas = anchor_obs[:, self.lambda_obs_idx].unsqueeze(-1)  # [B, 1]
                 self.sampled_collision_rewards = anchor_obs[:, self.reward_veh_obs_idx].unsqueeze(-1)  # [B, 1]
 
-                unweighted_reg_loss = per_sample_kl.mean()
+                bc_kl = per_sample_kl.mean()
+                unweighted_reg_loss = unweighted_reg_loss + bc_kl
+                self.data["data/bc_kl"] = bc_kl.item()
 
                 # Weight by lambda to get batch average
-                reg_loss = (per_sample_kl * self.sampled_lambdas.squeeze(-1)).mean()
+                reg_loss += self.kl_bc_weight * (per_sample_kl * self.sampled_lambdas.squeeze(-1)).mean()
 
                 with torch.no_grad():
                     self.data["data/anchor_entropy"] = anchor_entropy_accum / num_heads
 
-            elif self.reg_mode == "log_prob_direct":
+            if self.reg_mode == "log_prob_direct":
                 discrete_human_actions, continuous_human_actions, human_observations = (
                     self.vecenv.driver_env.sample_human_demonstrations()
                 )
@@ -648,9 +660,9 @@ class PuffeRL:
 
                 # Average and clip
                 human_log_prob = torch.clamp(human_log_prob, -15, 0)
-                reg_loss = -human_log_prob.mean()
+                reg_loss += -human_log_prob.mean()
 
-            elif self.reg_mode == "kl_pid_anchor":
+            if self.uses_pid_anchor:
                 anchor_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
                 targets = anchor_obs[:, self.pid_target_slice].long()
                 valid_targets = (targets >= 0).all(dim=-1) & mb_masks.reshape(-1).bool()
@@ -669,13 +681,13 @@ class PuffeRL:
                 target_count = valid_targets.sum().clamp_min(1)
                 self.sampled_lambdas = anchor_obs[:, self.lambda_obs_idx : self.lambda_obs_idx + 1]
                 self.sampled_collision_rewards = anchor_obs[:, self.reward_veh_obs_idx : self.reward_veh_obs_idx + 1]
-                unweighted_reg_loss = per_sample_kl.sum() / target_count
-                reg_loss = (per_sample_kl * self.sampled_lambdas.squeeze(-1)).sum() / target_count
-                self.data["data/anchor_entropy"] = 0.0
+                pid_kl = per_sample_kl.sum() / target_count
+                unweighted_reg_loss = unweighted_reg_loss + pid_kl
+                self.data["data/pid_kl"] = pid_kl.item()
+                reg_loss += self.kl_pid_weight * (per_sample_kl * self.sampled_lambdas.squeeze(-1)).sum() / target_count
+                if not self.uses_bc_anchor:
+                    self.data["data/anchor_entropy"] = 0.0
 
-            else:
-                unweighted_reg_loss = torch.tensor(0.0, device=device)
-                reg_loss = torch.tensor(0.0, device=device)
 
             # Compute total loss
             loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss + reg_loss
@@ -802,6 +814,9 @@ class PuffeRL:
             **{f"performance/{k}": v["elapsed"] for k, v in self.profile},
             "data/anchor_entropy": self.data.get("data/anchor_entropy", 0),
         }
+        for k in ("data/bc_kl", "data/pid_kl"):
+            if k in self.data:
+                logs[k] = self.data[k]
 
         if self.eval_stats:
             logs.update(self.eval_stats)

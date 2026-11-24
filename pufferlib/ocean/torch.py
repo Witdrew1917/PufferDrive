@@ -1,4 +1,4 @@
-from torch import nn
+from torch import Tensor, nn
 import torch
 import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
@@ -77,9 +77,11 @@ class BCPolicy(nn.Module):
     def encode_observations(self, observations, state=None):
         ego_dim = self.ego_dim
         partner_dim = self.max_partner_objects * self.partner_features
+        road_dim = self.max_road_objects * self.road_features
         ego_obs = observations[:, :ego_dim]
         partner_obs = observations[:, ego_dim : ego_dim + partner_dim]
-        road_obs = observations[:, ego_dim + partner_dim :]
+        # Bounded so trailing features (waypoints, PID targets) don't leak into the road block
+        road_obs = observations[:, ego_dim + partner_dim : ego_dim + partner_dim + road_dim]
 
         partner_objects = partner_obs.view(-1, self.max_partner_objects, self.partner_features)
         road_objects = road_obs.view(-1, self.max_road_objects, self.road_features)
@@ -95,9 +97,6 @@ class BCPolicy(nn.Module):
         concat_features = torch.cat([ego_features, road_features, partner_features], dim=1)
         return F.relu(self.shared_embedding(concat_features))
 
-    def dist(self, obs):
-        hidden = self.encode_observations(obs.float())
-        return [Categorical(logits=head(hidden)) for head in self.heads]
 
     def forward(self, obs, deterministic=False):
         dists = self.dist(obs)
@@ -126,6 +125,42 @@ class BCPolicy(nn.Module):
         if self.num_heads == 1:
             return dists[0].entropy().mean().item()
         return {f"entropy_head_{i}": d.entropy().mean().item() for i, d in enumerate(dists)}
+
+class NaviPBoostedBCPolicy(BCPolicy):
+    # Tells pufferl not to zero the PID target observations before the forward pass
+    uses_pid_targets = True
+
+    def __init__(self, env, input_size=128, hidden_size=128, **kwargs):
+        super().__init__(env, input_size, hidden_size, **kwargs)
+        self.pid_target_slice = env.pid_target_slice
+
+    def dist(self, obs):
+        hidden = self.encode_observations(obs.float())
+        actions = [head(hidden) for head in self.heads]
+        actions = self.apply_navip(obs, actions)
+
+        return [Categorical(logits=logits) for logits in actions]
+
+    def forward_eval(self, observations, state=None):
+        hidden = self.encode_observations(observations.float())
+        actions = [head(hidden) for head in self.heads]
+        actions = self.apply_navip(observations, actions)
+        return actions, torch.zeros(size=hidden.shape[:-1] + (1,), device=hidden.device)
+
+    def apply_navip(self, observations, actions) -> list[Tensor]:
+
+        targets = observations[:, self.pid_target_slice].long()
+        valid_targets = (targets >= 0).all(dim=-1)
+        safe_targets = targets.masked_fill(~valid_targets[:, None], 0)  # -1 is not a valid index for one_hot
+        navi_p_action = []
+        for h, head in enumerate(actions):
+            q = F.one_hot(safe_targets[:, h], num_classes=head.shape[-1]).float()      # [B, n_bins_h]
+            q = q * valid_targets[:, None]  # no PID target -> fall back to the BC distribution
+            p_bc = F.softmax(head.float(), dim=-1)
+            w = 0.5 * valid_targets[:, None].float()
+            navi_p_action.append(torch.log((1 - w) * p_bc + w * q + 1e-8))  # mix in probability space, return logits
+
+        return navi_p_action
 
 
 class Drive(nn.Module):

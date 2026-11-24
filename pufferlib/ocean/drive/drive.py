@@ -57,6 +57,7 @@ class RegMode(IntEnum):
     LOG_PROB_DIRECT = 1
     KL_ANCHOR = 2
     KL_PID_ANCHOR = 3
+    KL_JOINT_ANCHOR = 4
 
 
 DYNAMICS_MODEL_MAP = {"classic": 0, "jerk": 1, "delta_local": 2}
@@ -114,6 +115,8 @@ class Drive(pufferlib.PufferEnv):
         fix_rewards=False,
         fix_lambdas=True,
         lambda_value=0.0,
+        lambda_kl_bc_value=1.0,
+        lambda_kl_pid_value=1.0,
         obs_partner_noise_speed=0.0,
         obs_partner_noise_pos=0.0,
         async_resets=True,
@@ -167,6 +170,8 @@ class Drive(pufferlib.PufferEnv):
         self.fix_rewards = fix_rewards
         self.fix_lambdas = fix_lambdas
         self.lambda_value = lambda_value
+        self.lambda_kl_bc_value = lambda_kl_bc_value
+        self.lambda_kl_pid_value = lambda_kl_pid_value
         self.obs_partner_noise_speed = obs_partner_noise_speed
         self.obs_partner_noise_pos = obs_partner_noise_pos
         self._dynamics_model_flag = DYNAMICS_MODEL_MAP[dynamics_model]
@@ -282,9 +287,10 @@ class Drive(pufferlib.PufferEnv):
             "log_prob_direct": RegMode.LOG_PROB_DIRECT,
             "kl_anchor": RegMode.KL_ANCHOR,
             "kl_pid_anchor": RegMode.KL_PID_ANCHOR,
+            "kl_joint_anchor": RegMode.KL_JOINT_ANCHOR,
         }
         self.reg_mode = str_to_reg_mode.get(str(reg_mode).strip('"'))
-        self.record_pid_anchor = self.reg_mode == RegMode.KL_PID_ANCHOR
+        self.record_pid_anchor = self.reg_mode in (RegMode.KL_PID_ANCHOR, RegMode.KL_JOINT_ANCHOR)
         if self.record_pid_anchor and (dynamics_model != "delta_local" or action_type != "discrete"):
             raise ValueError("kl_pid_anchor requires discrete delta_local actions")
         self.pid_target_slice = slice(-3, None) if self.record_pid_anchor else None
@@ -745,12 +751,13 @@ class Drive(pufferlib.PufferEnv):
         return hash((obs.round(3).tobytes(), act.round(2).tobytes()))
 
     def _prepare_bc_anchor_observations(self, observations):
-        if not self.navigation or self.dynamics_model != "delta_local":
-            return observations
-
-        base_ego_dim = self.ego_features - binding.NAVIGATION_EGO_FEATURES
         partner_end = self.ego_features + self.max_partner_objects * self.partner_features
         road_end = partner_end + self.max_road_objects * self.road_features
+        if not self.navigation or self.dynamics_model != "delta_local":
+            # Drop trailing PID targets: the BC anchor treats everything after partners as road objects
+            return observations[:, :road_end] if self.record_pid_anchor else observations
+
+        base_ego_dim = self.ego_features - binding.NAVIGATION_EGO_FEATURES
         return torch.cat(
             (observations[:, :base_ego_dim], observations[:, self.ego_features : road_end]),
             dim=1,
@@ -760,7 +767,7 @@ class Drive(pufferlib.PufferEnv):
         bc_anchor = None
         data = {}
 
-        if self.reg_mode == RegMode.KL_ANCHOR:
+        if self.reg_mode in (RegMode.KL_ANCHOR, RegMode.KL_JOINT_ANCHOR):
             from examples.train_bc_policy import BCPolicy, load_bc_policy
 
             if self.dynamics_model == "delta_local":
@@ -776,6 +783,8 @@ class Drive(pufferlib.PufferEnv):
             if self.navigation and self.dynamics_model == "delta_local":
                 anchor_ego_features -= binding.NAVIGATION_EGO_FEATURES
                 anchor_obs_dim -= binding.NAVIGATION_EGO_FEATURES + self.max_waypoints * self.waypoint_features
+            if self.record_pid_anchor:
+                anchor_obs_dim -= 3  # PID targets are stripped in _prepare_bc_anchor_observations
 
             bc_anchor, metrics = load_bc_policy(
                 checkpoint_path=self.anchor_cpt_path,
