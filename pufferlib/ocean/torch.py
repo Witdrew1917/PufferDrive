@@ -97,6 +97,9 @@ class BCPolicy(nn.Module):
         concat_features = torch.cat([ego_features, road_features, partner_features], dim=1)
         return F.relu(self.shared_embedding(concat_features))
 
+    def dist(self, obs):
+        hidden = self.encode_observations(obs.float())
+        return [Categorical(logits=head(hidden)) for head in self.heads]
 
     def forward(self, obs, deterministic=False):
         dists = self.dist(obs)
@@ -129,10 +132,14 @@ class BCPolicy(nn.Module):
 class NaviPBoostedBCPolicy(BCPolicy):
     # Tells pufferl not to zero the PID target observations before the forward pass
     uses_pid_targets = True
+    supports_recurrent = False
 
     def __init__(self, env, input_size=128, hidden_size=128, **kwargs):
         super().__init__(env, input_size, hidden_size, **kwargs)
         self.pid_target_slice = env.pid_target_slice
+        if self.pid_target_slice is None or self.num_heads != 3:
+            raise ValueError("NaviPBoostedBCPolicy requires PID targets and three discrete delta_local action heads")
+        self.pid_anchor_smearing = env.pid_anchor_smearing
 
     def dist(self, obs):
         hidden = self.encode_observations(obs.float())
@@ -147,6 +154,9 @@ class NaviPBoostedBCPolicy(BCPolicy):
         actions = self.apply_navip(observations, actions)
         return actions, torch.zeros(size=hidden.shape[:-1] + (1,), device=hidden.device)
 
+    def forward(self, observations, state=None):
+        return self.forward_eval(observations, state)
+
     def apply_navip(self, observations, actions) -> list[Tensor]:
 
         targets = observations[:, self.pid_target_slice].long()
@@ -155,6 +165,7 @@ class NaviPBoostedBCPolicy(BCPolicy):
         navi_p_action = []
         for h, head in enumerate(actions):
             q = F.one_hot(safe_targets[:, h], num_classes=head.shape[-1]).float()      # [B, n_bins_h]
+            q = pufferlib.pytorch.smear_categorical_targets(q, self.pid_anchor_smearing)
             q = q * valid_targets[:, None]  # no PID target -> fall back to the BC distribution
             p_bc = F.softmax(head.float(), dim=-1)
             w = 0.5 * valid_targets[:, None].float()

@@ -233,3 +233,11 @@ def gaussian_kernel(sigma: float):
     kernel = torch.exp(-0.5 * (x / sigma) ** 2)
     kernel /= kernel.sum()
     return kernel
+
+
+def smear_categorical_targets(q: torch.Tensor, sigma: float):
+    if sigma <= 0.0:
+        return q
+    kernel = gaussian_kernel(sigma).to(device=q.device, dtype=q.dtype).view(1, 1, -1)
+    q = torch.nn.functional.conv1d(q[:, None], kernel, padding=kernel.shape[-1] // 2).squeeze(1)
+    return q / q.sum(-1, keepdim=True)

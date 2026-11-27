@@ -671,10 +671,7 @@ class PuffeRL:
                 for h, head in enumerate(logits):
                     log_p = torch.log_softmax(head.reshape(-1, head.shape[-1]).float(), dim=-1)  # [B, n_bins_h]
                     q = F.one_hot(safe_targets[:, h], num_classes=head.shape[-1]).float()      # [B, n_bins_h]
-                    if self.pid_anchor_smearing > 0.0:
-                        kernel = pufferlib.pytorch.gaussian_kernel(self.pid_anchor_smearing).to(targets.device).view(1, 1, -1)
-                        q = F.conv1d(q[:, None], kernel, padding=kernel.shape[-1] // 2).squeeze(1)  # smooth along the bins
-                        q = q / q.sum(-1, keepdim=True)  # put back the mass cut off at the edges
+                    q = pufferlib.pytorch.smear_categorical_targets(q, self.pid_anchor_smearing)
                     per_sample_kl += (torch.special.xlogy(q, q) - q * log_p).sum(-1)  # KL(q || p)
 
                 per_sample_kl = per_sample_kl.masked_fill(~valid_targets, 0)
@@ -1831,6 +1828,8 @@ def load_policy(args, vecenv, env_name=""):
 
     rnn_name = args["rnn_name"]
     if rnn_name is not None:
+        if not getattr(policy, "supports_recurrent", True):
+            raise ValueError(f"{args['policy_name']} does not support recurrence; set rnn_name = None")
         rnn_cls = getattr(env_module.torch, args["rnn_name"])
         policy = rnn_cls(vecenv.driver_env, policy, **args["rnn"])
 
