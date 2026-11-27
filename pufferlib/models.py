@@ -188,7 +188,7 @@ class LSTMWrapper(nn.Module):
 
         flat_hidden = hidden.reshape(B * TT, self.hidden_size)
         logits, values = self.policy.decode_actions(flat_hidden)
-        values = values.reshape(B, TT)
+        values = values.reshape(B, TT, -1)
         # state.batch_logits = logits.reshape(B, TT, -1)
         state["hidden"] = hidden
         state["lstm_h"] = lstm_h.detach()

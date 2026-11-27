@@ -62,6 +62,19 @@ signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
 ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 
 
+def _masked_mean(values, mask):
+    mask = mask.reshape(values.shape)
+    return (values * mask).sum() / mask.sum().clamp(min=1)
+
+
+def _adaptive_regularization_weights(logits, valid_pid_targets):
+    logits = logits.reshape(-1, 3)
+    available = torch.stack(
+        (torch.ones_like(valid_pid_targets), valid_pid_targets, torch.ones_like(valid_pid_targets)), dim=-1
+    )
+    return logits.masked_fill(~available, float("-inf")).softmax(dim=-1)
+
+
 class PuffeRL:
     def __init__(self, config, vecenv, policy, logger=None, full_args=None):
         self.full_args = full_args
@@ -232,6 +245,9 @@ class PuffeRL:
         # Initializations
         self.config = config
         self.vecenv = vecenv
+        self.extra_value_components = getattr(vecenv.driver_env, "extra_value_components", 0)
+        self.adaptive_weight_reg = config.get("adaptive_weight_reg", False)
+        self.adaptive_reg_stabilization_constant = config.get("adaptive_reg_stabilization_constant", 0.0)
         self.epoch = 0
         self.global_step = 0
         self.last_log_step = 0
@@ -255,8 +271,8 @@ class PuffeRL:
             self.pid_target_slice = self.vecenv.driver_env.pid_target_slice
         # Per-term weights only apply in joint mode so the single-anchor modes keep their behaviour
         joint = self.reg_mode == "kl_joint_anchor"
-        self.kl_bc_weight = float(full_args["env"].get("lambda_kl_bc_value", 1.0)) if joint else 1.0
-        self.kl_pid_weight = float(full_args["env"].get("lambda_kl_pid_value", 1.0)) if joint else 1.0
+        self.kl_bc_weight = torch.tensor(float(full_args["env"].get("lambda_kl_bc_value", 1.0)) if joint else 1.0, dtype=torch.float, device=device)
+        self.kl_pid_weight = torch.tensor(float(full_args["env"].get("lambda_kl_pid_value", 1.0)) if joint else 1.0, dtype=torch.float, device=device)
         raw_policy = getattr(self.uncompiled_policy, "module", self.uncompiled_policy)  # unwrap DDP
         self.hide_pid_targets = self.uses_pid_anchor and not getattr(raw_policy, "uses_pid_targets", False)
         self.resample_freq_epoch = self.vecenv.driver_env.resample_frequency / self.vecenv.driver_env.episode_length
@@ -332,6 +348,8 @@ class PuffeRL:
                     policy_obs = o_device.clone()
                     policy_obs[..., self.pid_target_slice] = 0
                 logits, value = self.policy.forward_eval(policy_obs, state)
+                if self.extra_value_components > 0:
+                    value = value[..., 0:1]
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
@@ -507,6 +525,9 @@ class PuffeRL:
                 policy_obs = mb_obs.clone()
                 policy_obs[..., self.pid_target_slice] = 0
             logits, newvalue = self.policy(policy_obs, state)
+            extra_values = None
+            if self.extra_value_components > 0:
+                newvalue, extra_values = newvalue[...,0], newvalue[...,1:]
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile("train_misc", epoch)
@@ -573,6 +594,28 @@ class PuffeRL:
                 old_approx_kl = ((-logratio) * mb_masks).sum() / valid_count
                 approx_kl = (((ratio - 1) - logratio) * mb_masks).sum() / valid_count
                 clipfrac = (((ratio - 1.0).abs() > config["clip_coef"]) * mb_masks).sum() / valid_count
+
+            if self.uses_pid_anchor:
+                anchor_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
+                targets = anchor_obs[:, self.pid_target_slice].long()
+                valid_targets = (targets >= 0).all(dim=-1) & mb_masks.reshape(-1).bool()
+
+            if self.adaptive_weight_reg:
+                assert isinstance(extra_values, torch.Tensor)
+                if extra_values.shape[-1] != 3:
+                    raise NotImplementedError
+
+                valid_pid_targets = (
+                    valid_targets if self.uses_pid_anchor else torch.zeros_like(mb_masks.reshape(-1), dtype=torch.bool)
+                )
+                extra_values = _adaptive_regularization_weights(extra_values, valid_pid_targets)
+                self.kl_bc_weight = extra_values[...,0]
+                self.kl_pid_weight = extra_values[...,1]
+                kl_adaptive_reg_stabilization_weight = extra_values[...,2]
+                reg_loss += _masked_mean(
+                    kl_adaptive_reg_stabilization_weight * self.adaptive_reg_stabilization_constant, mb_masks
+                )
+
             # Regularization
             if self.uses_bc_anchor:
                 # Flatten the batch and time dimensions for feeding into the BC anchor policy since it is trained without memory
@@ -612,12 +655,14 @@ class PuffeRL:
                 self.sampled_lambdas = anchor_obs[:, self.lambda_obs_idx].unsqueeze(-1)  # [B, 1]
                 self.sampled_collision_rewards = anchor_obs[:, self.reward_veh_obs_idx].unsqueeze(-1)  # [B, 1]
 
-                bc_kl = per_sample_kl.mean()
+                bc_kl = _masked_mean(per_sample_kl, mb_masks)
                 unweighted_reg_loss = unweighted_reg_loss + bc_kl
                 self.data["data/bc_kl"] = bc_kl.item()
 
                 # Weight by lambda to get batch average
-                reg_loss += self.kl_bc_weight * (per_sample_kl * self.sampled_lambdas.squeeze(-1)).mean()
+                reg_loss += _masked_mean(
+                    self.kl_bc_weight.flatten() * per_sample_kl * self.sampled_lambdas.squeeze(-1), mb_masks
+                )
 
                 with torch.no_grad():
                     self.data["data/anchor_entropy"] = anchor_entropy_accum / num_heads
@@ -663,9 +708,6 @@ class PuffeRL:
                 reg_loss += -human_log_prob.mean()
 
             if self.uses_pid_anchor:
-                anchor_obs = mb_obs.reshape(-1, *self.vecenv.single_observation_space.shape)
-                targets = anchor_obs[:, self.pid_target_slice].long()
-                valid_targets = (targets >= 0).all(dim=-1) & mb_masks.reshape(-1).bool()
                 safe_targets = targets.masked_fill(~valid_targets[:, None], 0)  # -1 is not a valid index for one_hot
                 per_sample_kl = torch.zeros(targets.shape[0], device=targets.device)
                 for h, head in enumerate(logits):
@@ -681,7 +723,7 @@ class PuffeRL:
                 pid_kl = per_sample_kl.sum() / target_count
                 unweighted_reg_loss = unweighted_reg_loss + pid_kl
                 self.data["data/pid_kl"] = pid_kl.item()
-                reg_loss += self.kl_pid_weight * (per_sample_kl * self.sampled_lambdas.squeeze(-1)).sum() / target_count
+                reg_loss += (self.kl_pid_weight.flatten() * per_sample_kl * self.sampled_lambdas.squeeze(-1)).sum() / target_count
                 if not self.uses_bc_anchor:
                     self.data["data/anchor_entropy"] = 0.0
 

@@ -189,6 +189,7 @@ class Drive(nn.Module):
         self.waypoint_features = env.waypoint_features
         self.use_waypoints = self.max_waypoints > 0
         self.waypoint_encoder_arch = env.waypoint_encoder_arch
+        self.extra_value_components = env.extra_value_components
 
         self.ego_encoder = nn.Sequential(
             pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size)),
@@ -240,7 +241,7 @@ class Drive(nn.Module):
             self.atn_dim = env.single_action_space.nvec.tolist()
 
         self.actor = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, sum(self.atn_dim)), std=0.01)
-        self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1), std=1)
+        self.value_fn = pufferlib.pytorch.layer_init(nn.Linear(hidden_size, 1 + self.extra_value_components), std=1)
 
     def forward(self, observations, state=None):
         hidden = self.encode_observations(observations)
@@ -253,7 +254,7 @@ class Drive(nn.Module):
     def forward_eval(self, observations, state=None):
         hidden = self.encode_observations(observations, state=state)
         logits, values = self.decode_actions(hidden)
-        return logits, values
+        return logits, values[...,0:1] # needed if extra value components are added
 
     def encode_observations(self, observations, state=None):
         ego_dim = self.ego_dim

@@ -139,8 +139,10 @@ class Drive(pufferlib.PufferEnv):
         snap_goal_to_navi_endpoint=0,
         append_goal_to_navi_lookahead=0,
         waypoint_encoder_arch="mlp",
+        extra_value_components=0,
     ):
         # env
+        self.extra_value_components = extra_value_components
         self.pid_anchor_smearing = pid_anchor_smearing
         self.dt = dt
         self.render_mode = render_mode
