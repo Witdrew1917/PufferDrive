@@ -161,6 +161,10 @@ adapter `build_znavigation` in `zbin.h` passes it the road polylines and agents 
   a neighbouring lane whose goal sub-line merely starts earlier. Start candidates are all lanes within 5 m and 90° of the agent.
   - Agents whose goal is unreachable get a random reachable dead-end goal, seeded from the map's CRC-32.
   - Agents longer than 8 m are only routed from their closest start lane.
+- **Side feasibility**: the left/right feasibility reads the adjacent lanes found by the lateral probe. Unlike
+  zpufferdrive, a probe between lane centres at most 6 m apart ignores lanes that cross it at more than 30° from
+  parallel (junction connectors). Otherwise, a sub-line placed inside a junction would see no neighbours. This
+  changes only the side feasibilities, not routes or lane changes.
 - **Parity**: on maps regenerated with current zpufferdrive, routes match the stored tables for about 99.5% of
   samples. The remaining differences come from line types that zbin files do not keep: yellow solid lines are
   stored as dashed. Building takes tens of milliseconds per map, versus a few milliseconds to load the sections.

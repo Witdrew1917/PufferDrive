@@ -49,13 +49,13 @@ typedef enum {
 
 typedef struct {
     int num_polylines;
-    const int *point_offset;   // [num_polylines + 1]: points of polyline i are [offset[i], offset[i + 1])
-    const float *x, *y;        // [point_offset[num_polylines]] any common origin
-    const int *type;           // [num_polylines] caller type id in [0, num_types), others are ignored
-    const float *speed_limit;  // [num_polylines] m/s, NULL or <= 0 -> default_speed_limit
-    int num_types;             // caller (fork) specific type table:
-    const ZNaviRole *type_role;           // [num_types]
-    const unsigned char *type_crossable;  // [num_types] 1: lane changes may cross it (NULL: none crossable)
+    const int *point_offset;             // [num_polylines + 1]: points of polyline i are [offset[i], offset[i + 1])
+    const float *x, *y;                  // [point_offset[num_polylines]] any common origin
+    const int *type;                     // [num_polylines] caller type id in [0, num_types), others are ignored
+    const float *speed_limit;            // [num_polylines] m/s, NULL or <= 0 -> default_speed_limit
+    int num_types;                       // caller (fork) specific type table:
+    const ZNaviRole *type_role;          // [num_types]
+    const unsigned char *type_crossable; // [num_types] 1: lane changes may cross it (NULL: none crossable)
 } ZNaviMapInput;
 
 // Agents to assign goals to (all are treated as controlled). Any pointer except x/y/heading may be NULL.
@@ -91,42 +91,42 @@ typedef struct {
     int verbose;
     uint64_t seed;
     // Constants (defaults = Python values)
-    double discretization_time;    // s, sub-line length = time * max(speed, 1)
-    double default_speed_limit;    // m/s, used for speed limits <= 0
-    double cell_size;              // m, obstruction grid
-    double connection_threshold;   // m, forward connection end-start gap
-    double connection_max_angle;   // rad
-    double unreachable_distance;   // m, distance_to_goal of unreachable samples
-    double lane_change_cost;       // m, routing cost added to lane changes
-    double goal_dedup_distance;    // m, dead-end goals closer than this to an accepted one are dropped
-    double goal_set_radius;        // m, non-snapped goal set radius
-    double lane_change_margin;     // m, F7 first/last lane-change margin, F4 last lane-change margin
-    double max_route_deviation;    // m, F4 cap above the distance to goal
-    double feasibility_bonus_min;  // m, F4 random bonus on the goal's own lane
+    double discretization_time;   // s, sub-line length = time * max(speed, 1)
+    double default_speed_limit;   // m/s, used for speed limits <= 0
+    double cell_size;             // m, obstruction grid
+    double connection_threshold;  // m, forward connection end-start gap
+    double connection_max_angle;  // rad
+    double unreachable_distance;  // m, distance_to_goal of unreachable samples
+    double lane_change_cost;      // m, routing cost added to lane changes
+    double goal_dedup_distance;   // m, dead-end goals closer than this to an accepted one are dropped
+    double goal_set_radius;       // m, non-snapped goal set radius
+    double lane_change_margin;    // m, F7 first/last lane-change margin, F4 last lane-change margin
+    double max_route_deviation;   // m, F4 cap above the distance to goal
+    double feasibility_bonus_min; // m, F4 random bonus on the goal's own lane
     double feasibility_bonus_max;
-    double start_max_distance;     // m, agent start line search
-    double start_max_angle;        // rad
-    double long_vehicle_length;    // m
+    double start_max_distance;  // m, agent start line search
+    double start_max_angle;     // rad
+    double long_vehicle_length; // m
 } ZNaviBuildConfig;
 
 typedef struct {
-    int num_lines;            // navi lines = lane segments
-    int *line_polyline;       // [num_lines]
-    int *line_segment;        // [num_lines] segment index within the polyline
-    int *line_num_sub;        // [num_lines] sub-lines (samples) of the line, may be 0
-    int *line_sample_offset;  // [num_lines]
+    int num_lines;           // navi lines = lane segments
+    int *line_polyline;      // [num_lines]
+    int *line_segment;       // [num_lines] segment index within the polyline
+    int *line_num_sub;       // [num_lines] sub-lines (samples) of the line, may be 0
+    int *line_sample_offset; // [num_lines]
     int num_samples;
-    int *sample_line;         // [num_samples]
-    int *sample_index;        // [num_samples] index within its line
+    int *sample_line;  // [num_samples]
+    int *sample_index; // [num_samples] index within its line
     int num_goals;
-    float *goal_x, *goal_y;   // [num_goals]
-    int *goal_sample;         // [num_goals] primary goal sample
+    float *goal_x, *goal_y; // [num_goals]
+    int *goal_sample;       // [num_goals] primary goal sample
     // [num_goals * num_samples], index g * num_samples + s
-    int *next_sample;         // next sample on the route, -1 at the goal or when unreachable
-    float *distance_to_goal;  // m, unreachable_distance when unreachable
+    int *next_sample;        // next sample on the route, -1 at the goal or when unreachable
+    float *distance_to_goal; // m, unreachable_distance when unreachable
     float *feasibility_left, *feasibility_center, *feasibility_right; // m, unclamped (may be inf)
     int num_agents;
-    int *agent_goal;          // [num_agents] goal index or -1
+    int *agent_goal; // [num_agents] goal index or -1
 } ZNaviTables;
 
 static ZNaviBuildConfig znavi_default_config(void) {
@@ -220,8 +220,8 @@ static double znb_wrap(double a) {
 }
 
 // Segment a0-a1 vs b0-b1; *ua = parameter along a. Parallel segments never intersect.
-static int znb_intersect(double a0x, double a0y, double a1x, double a1y, double b0x, double b0y, double b1x,
-                         double b1y, double *ua) {
+static int znb_intersect(double a0x, double a0y, double a1x, double a1y, double b0x, double b0y, double b1x, double b1y,
+                         double *ua) {
     double adx = a1x - a0x, ady = a1y - a0y, bdx = b1x - b0x, bdy = b1y - b0y;
     double denom = bdy * adx - bdx * ady;
     if (fabs(denom) <= 1e-6)
@@ -487,8 +487,7 @@ typedef struct {
     int n, cap;
 } ZnbHitVec;
 
-static int znb_clip(double x0, double y0, double x1, double y1, double xmin, double ymin, double xmax,
-                    double ymax) {
+static int znb_clip(double x0, double y0, double x1, double y1, double xmin, double ymin, double xmax, double ymax) {
     double t0 = 0, t1 = 1, dx = x1 - x0, dy = y1 - y0;
     double p[4] = {-dx, dx, -dy, dy}, q[4] = {x0 - xmin, xmax - x0, y0 - ymin, ymax - y0};
     for (int k = 0; k < 4; k++) {
@@ -631,8 +630,8 @@ typedef struct {
     double *sx0, *sy0, *sx1, *sy1;
     int num_markers;
     double *mx0, *my0, *mx1, *my1;
-    ZnbSegGrid obs_grid;    // [static obstacles, sub-lines]
-    ZnbPtGrid center_grid;  // sub-line centers
+    ZnbSegGrid obs_grid;   // [static obstacles, sub-lines]
+    ZnbPtGrid center_grid; // sub-line centers
     // Longitudinal graph, same-lane weights (len_i + len_j) / 2
     ZnbCsr lon, lon_rev;
     ZnbReach *reach;
@@ -766,18 +765,23 @@ static double znb_signed_angle(const ZnbCtx *c, int s, int d, double px, double 
 // ------------------------------------------------------------------------------------------------------------------
 
 typedef struct {
-    const double *radius;         // [N] search radius per source, <= 0: none
+    const double *radius;          // [N] search radius per source, <= 0: none
     const double *ang_lo, *ang_hi; // [N] angle window per source (both sides)
     int num_steps;
     int steps[2];
-    double same_dir, same_pos;    // angle tolerances
-    const int *lane_ids;          // [N]
+    double same_dir, same_pos;         // angle tolerances
+    const int *lane_ids;               // [N]
     const double *along_lo, *along_hi; // [N] or NULL
-    double max_lateral;           // < 0: none
-    double gap;                   // < 0: none (max lane center gap probes)
-    int one_target_lane;          // only with symmetric = 0 and num_steps = 1
+    double max_lateral;                // < 0: none
+    double gap;                        // < 0: none (max lane center gap probes)
+    int one_target_lane;               // only with symmetric = 0 and num_steps = 1
     int symmetric;
-    double target_angle;          // < 0: none (one target per lane, closest to this angle)
+    double target_angle; // < 0: none (one target per lane, closest to this angle)
+    // PufferDrive refinement: in step `junction_step` (< 0: none), for pairs at most `junction_max_distance` apart,
+    // only lanes within `junction_parallel_angle` of (anti)parallel to the source can lie in between; lanes crossing
+    // the probe more steeply (junction connectors) are ignored.
+    int junction_step;
+    double junction_parallel_angle, junction_max_distance;
 } ZnbLatParams;
 
 typedef struct {
@@ -838,38 +842,29 @@ static int znb_gap_blocked(ZnbCtx *c, int i, int j, double gap) {
     return 0;
 }
 
-static void znb_eval_pair(ZnbCtx *c, const ZnbLatParams *P, ZnbPair *p) {
-    if (p->evaluated)
-        return;
-    p->evaluated = 1;
+// Lanes crossed by the centre-to-centre probe i -> j (`items`: probe hits). Sets *blocked on a static obstacle, an
+// opposing or same-lane crossing, or any crossing when `any_crossing_blocks`. With `parallel_cos` > 0, lanes not
+// within acos(parallel_cos) of (anti)parallel to i are ignored.
+static int znb_count_crossings(ZnbCtx *c, const ZnbLatParams *P, int i, int j, const int *items, int nh,
+                               int any_crossing_blocks, double parallel_cos, int *blocked) {
     const double cos_opposing = cos(M_PI - M_PI / 4);
-    int any_crossing_blocks = 1;
-    for (int s = 0; s < P->num_steps; s++)
-        any_crossing_blocks &= P->steps[s] == 1;
-    int i = p->src, j = p->dst, blocked = 0;
-    znb_seggrid_query(&c->obs_grid, c->cx[i], c->cy[i], c->cx[j], c->cy[j], &c->hits, &c->cells);
-    int nh = c->hits.n;
-    int *items = (int *)znb_alloc(nh, sizeof(int));
-    for (int h = 0; h < nh; h++)
-        items[h] = c->hits.a[h].item;
     int crossed_cap = 8, crossed = 0;
     int *lanes = (int *)znb_alloc(crossed_cap, sizeof(int));
-    for (int h = 0; h < nh && !blocked; h++) {
+    *blocked = 0;
+    for (int h = 0; h < nh && !*blocked; h++) {
         int it = items[h];
         if (it < c->num_static) {
-            blocked = 1;
+            *blocked = 1;
             break;
         }
         int k = it - c->num_static;
         if (k == i || k == j)
             continue;
-        if (any_crossing_blocks) {
-            blocked = 1;
-            break;
-        }
-        if (c->fx[k] * c->fx[i] + c->fy[k] * c->fy[i] < cos_opposing || znb_same_lane(c, i, k) ||
-            znb_same_lane(c, j, k)) {
-            blocked = 1;
+        double dot = c->fx[k] * c->fx[i] + c->fy[k] * c->fy[i];
+        if (parallel_cos > 0 && fabs(dot) < parallel_cos)
+            continue;
+        if (any_crossing_blocks || dot < cos_opposing || znb_same_lane(c, i, k) || znb_same_lane(c, j, k)) {
+            *blocked = 1;
             break;
         }
         int lane = P->lane_ids[k], seen = 0;
@@ -883,12 +878,38 @@ static void znb_eval_pair(ZnbCtx *c, const ZnbLatParams *P, ZnbPair *p) {
             lanes[crossed++] = lane;
         }
     }
-    free(items);
     free(lanes);
+    return crossed;
+}
+
+static void znb_eval_pair(ZnbCtx *c, const ZnbLatParams *P, ZnbPair *p) {
+    if (p->evaluated)
+        return;
+    p->evaluated = 1;
+    int any_crossing_blocks = 1;
+    for (int s = 0; s < P->num_steps; s++)
+        any_crossing_blocks &= P->steps[s] == 1;
+    int i = p->src, j = p->dst, blocked = 0;
+    znb_seggrid_query(&c->obs_grid, c->cx[i], c->cy[i], c->cx[j], c->cy[j], &c->hits, &c->cells);
+    int nh = c->hits.n;
+    int *items = (int *)znb_alloc(nh, sizeof(int));
+    for (int h = 0; h < nh; h++)
+        items[h] = c->hits.a[h].item;
+    int crossed = znb_count_crossings(c, P, i, j, items, nh, any_crossing_blocks, -1.0, &blocked);
+    int junction_blocked = blocked, junction_crossed = crossed;
+    if (P->junction_step >= 0 && P->junction_step < P->num_steps && p->dist <= P->junction_max_distance)
+        junction_crossed = znb_count_crossings(c, P, i, j, items, nh, any_crossing_blocks,
+                                               cos(P->junction_parallel_angle), &junction_blocked);
+    free(items);
     if (!blocked && P->gap > 0)
         blocked = znb_gap_blocked(c, i, j, P->gap);
-    for (int s = 0; s < P->num_steps; s++)
-        p->blocked[s] = blocked || (P->steps[s] > 0 && crossed >= P->steps[s]);
+    if (!junction_blocked && P->gap > 0)
+        junction_blocked = znb_gap_blocked(c, i, j, P->gap);
+    for (int s = 0; s < P->num_steps; s++) {
+        int b = s == P->junction_step ? junction_blocked : blocked;
+        int n = s == P->junction_step ? junction_crossed : crossed;
+        p->blocked[s] = b || (P->steps[s] > 0 && n >= P->steps[s]);
+    }
 }
 
 static int znb_cmp_pair_key(const void *a, const void *b) {
@@ -1047,13 +1068,13 @@ static void znb_lateral(ZnbCtx *c, const ZnbLatParams *P, ZnbCsr out[2][2]) {
     // Step 3: obstruction and target selection.
     int64_t *keys[2][2] = {{NULL, NULL}, {NULL, NULL}};
     int nk[2][2] = {{0, 0}, {0, 0}}, kcap[2][2] = {{0, 0}, {0, 0}};
-#define ZNB_KEY_PUSH(st, sd, s, d)                                                                                    \
-    do {                                                                                                              \
-        if (nk[st][sd] == kcap[st][sd]) {                                                                             \
-            kcap[st][sd] = kcap[st][sd] ? 2 * kcap[st][sd] : 256;                                                     \
-            keys[st][sd] = (int64_t *)znb_realloc(keys[st][sd], kcap[st][sd], sizeof(int64_t));                       \
-        }                                                                                                             \
-        keys[st][sd][nk[st][sd]++] = (int64_t)(s) * N + (d);                                                          \
+#define ZNB_KEY_PUSH(st, sd, s, d)                                                                                     \
+    do {                                                                                                               \
+        if (nk[st][sd] == kcap[st][sd]) {                                                                              \
+            kcap[st][sd] = kcap[st][sd] ? 2 * kcap[st][sd] : 256;                                                      \
+            keys[st][sd] = (int64_t *)znb_realloc(keys[st][sd], kcap[st][sd], sizeof(int64_t));                        \
+        }                                                                                                              \
+        keys[st][sd][nk[st][sd]++] = (int64_t)(s) * N + (d);                                                           \
     } while (0)
 
     if (P->one_target_lane && !P->symmetric && P->num_steps == 1) {
@@ -1474,8 +1495,10 @@ static int znavi_build(const ZNaviMapInput *in, const ZNaviAgentInput *agents, c
     int num_obs = num_static + N;
     double *ox0 = (double *)znb_alloc(num_obs, sizeof(double)), *oy0 = (double *)znb_alloc(num_obs, sizeof(double));
     double *ox1 = (double *)znb_alloc(num_obs, sizeof(double)), *oy1 = (double *)znb_alloc(num_obs, sizeof(double));
-    double *mx0 = (double *)znb_alloc(num_markers, sizeof(double)), *my0 = (double *)znb_alloc(num_markers, sizeof(double));
-    double *mx1 = (double *)znb_alloc(num_markers, sizeof(double)), *my1 = (double *)znb_alloc(num_markers, sizeof(double));
+    double *mx0 = (double *)znb_alloc(num_markers, sizeof(double)),
+           *my0 = (double *)znb_alloc(num_markers, sizeof(double));
+    double *mx1 = (double *)znb_alloc(num_markers, sizeof(double)),
+           *my1 = (double *)znb_alloc(num_markers, sizeof(double));
     int so = 0, mo = 0;
     for (int p = 0; p < P; p++) {
         ZNaviRole role = znb_role(in, p);
@@ -1532,9 +1555,8 @@ static int znavi_build(const ZNaviMapInput *in, const ZNaviAgentInput *agents, c
                 int j = q.a[k];
                 if (j == i)
                     continue;
-                int ok = j == next_in_line ||
-                         (hypot(c->x0[j] - c->x1[i], c->y0[j] - c->y1[i]) < thr &&
-                          c->fx[i] * c->fx[j] + c->fy[i] * c->fy[j] > cos_max);
+                int ok = j == next_in_line || (hypot(c->x0[j] - c->x1[i], c->y0[j] - c->y1[i]) < thr &&
+                                               c->fx[i] * c->fx[j] + c->fy[i] * c->fy[j] > cos_max);
                 if (ok)
                     znb_ipush(&q, -1 - j); // marked, collected below
             }
@@ -1652,6 +1674,9 @@ static int znavi_build(const ZNaviMapInput *in, const ZNaviAgentInput *agents, c
         lp.gap = -1;
         lp.symmetric = 1;
         lp.target_angle = M_PI / 2;
+        lp.junction_step = 1; // adjacent lanes (side feasibilities only)
+        lp.junction_parallel_angle = M_PI / 6;
+        lp.junction_max_distance = 6.0;
         ZnbCsr out[2][2];
         znb_lateral(c, &lp, out);
         perp[0] = out[0][0];
@@ -1696,6 +1721,7 @@ static int znavi_build(const ZNaviMapInput *in, const ZNaviAgentInput *agents, c
         lp.gap = cfg->gap_probe ? 5.0 : -1;
         lp.one_target_lane = 1;
         lp.target_angle = -1;
+        lp.junction_step = -1;
         ZnbCsr out[2][2];
         znb_lateral(c, &lp, out);
         lc[0] = out[0][0];
@@ -1836,8 +1862,9 @@ static int znavi_build(const ZNaviMapInput *in, const ZNaviAgentInput *agents, c
                     for (int k = 0; k < agent_sets[a].n; k++) {
                         int m = agent_sets[a].members[k];
                         double dx = c->x1[m] - c->x0[m], dy = c->y1[m] - c->y0[m], len = hypot(dx, dy);
-                        double along = len > 0 ? ((agents->goal_x[a] - c->x0[m]) * dx +
-                                                  (agents->goal_y[a] - c->y0[m]) * dy) / len : 0.0;
+                        double along =
+                            len > 0 ? ((agents->goal_x[a] - c->x0[m]) * dx + (agents->goal_y[a] - c->y0[m]) * dy) / len
+                                    : 0.0;
                         seed[k] = ZNB_MAX(along, 0.0);
                         lo = ZNB_MIN(lo, seed[k]);
                     }

@@ -1153,7 +1153,7 @@ ZNavigation *build_znavigation(Drive *env) {
 //   int32 line_road[num_lines], line_segment[num_lines], line_num_sub[num_lines], object_goal[num_objects],
 //   int32 next_entity[G*S], next_point[G*S], float32 feasibility_left/center/right[G*S], distance_to_goal[G*S]
 #define ZNAVI_SIDECAR_SUFFIX ".znavi"
-#define ZNAVI_SIDECAR_VERSION 1
+#define ZNAVI_SIDECAR_VERSION 2 // bump whenever znavi_build.h output changes
 #define ZNAVI_SIDECAR_REGENERATE_HINT "python -m pufferlib.ocean.drive.drive navigation --map-dir <map_dir> --overwrite"
 
 static char *znavi_sidecar_path(const char *map_name) {
@@ -1225,7 +1225,7 @@ static ZNavigation *znavi_read_sidecar(Drive *env, FILE *f, uint32_t crc, uint64
         return NULL;
     }
     if (version != ZNAVI_SIDECAR_VERSION) {
-        *error = "unsupported version";
+        *error = "written by another navigation builder version";
         return NULL;
     }
     if (fread(&file_crc, sizeof(file_crc), 1, f) != 1 || fread(&file_size, sizeof(file_size), 1, f) != 1 ||
