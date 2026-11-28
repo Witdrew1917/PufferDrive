@@ -172,13 +172,18 @@ static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
 static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 
 // Classic action space (for CLASSIC dynamics model)
-#define NUM_ACCEL_BINS 21
+#define NUM_ACCEL_BINS 7
 #define ACCEL_MIN -4.0f
 #define ACCEL_MAX 4.0f
 
-#define NUM_STEER_BINS 31
+#define NUM_STEER_BINS 13
 #define STEER_MIN -1.0f // radians
 #define STEER_MAX 1.0f
+
+static const float ACCELERATION_VALUES[NUM_ACCEL_BINS] = {-4.0000f, -2.6670f, -1.3330f, -0.0000f,
+                                                          1.3330f,  2.6670f,  4.0000f};
+static const float STEERING_VALUES[NUM_STEER_BINS] = {-1.000f, -0.833f, -0.667f, -0.500f, -0.333f, -0.167f, 0.000f,
+                                                      0.167f,  0.333f,  0.500f,  0.667f,  0.833f,  1.000f};
 #define NUM_DX_BINS 51
 #define NUM_DY_BINS 51
 #define NUM_YAW_BINS 127
@@ -192,8 +197,6 @@ static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 #define YAW_ACCEL_MAX 8.0f // rad/s^2 — max change in yaw rate per second
 
 static int COLLECT_EXPERT_TELEPORT = 1;
-static float ACCELERATION_VALUES[NUM_ACCEL_BINS];
-static float STEERING_VALUES[NUM_STEER_BINS];
 static float DELTA_DX_VALUES[NUM_DX_BINS];
 static float DELTA_DY_VALUES[NUM_DY_BINS];
 static float DELTA_YAW_VALUES[NUM_YAW_BINS];
@@ -344,6 +347,8 @@ struct Entity {
     float navi_pid_terminal_x, navi_pid_terminal_y;
     float navi_pid_steering;
     float navi_pid_dx_residual;
+    float navi_pid_steer_residual;
+    float navi_pid_accel_residual;
 
     // Navigation (env->znavigation loaded)
     int navi_goal_idx;         // -1 when the agent has no navigation goal
@@ -769,16 +774,6 @@ void add_log(Drive *env) {
     }
 }
 void init_action_space() {
-    // Classic discrete action space
-    float accel_step = (ACCEL_MAX - ACCEL_MIN) / (NUM_ACCEL_BINS - 1);
-    for (int i = 0; i < NUM_ACCEL_BINS; i++) {
-        ACCELERATION_VALUES[i] = ACCEL_MIN + i * accel_step;
-    }
-
-    float steer_step = (STEER_MAX - STEER_MIN) / (NUM_STEER_BINS - 1);
-    for (int i = 0; i < NUM_STEER_BINS; i++) {
-        STEERING_VALUES[i] = STEER_MIN + i * steer_step;
-    }
     // Delta-local discrete action space
     float dx_step = (2.0f * DELTA_MAX_DX) / (NUM_DX_BINS - 1);
     for (int i = 0; i < NUM_DX_BINS; i++) {
@@ -988,6 +983,8 @@ void set_start_position(Drive *env) {
         e->navi_pid_on_goal_segment = false;
         e->navi_pid_steering = 0.0f;
         e->navi_pid_dx_residual = 0.0f;
+        e->navi_pid_steer_residual = 0.0f;
+        e->navi_pid_accel_residual = 0.0f;
         e->collision_delta_v = 0.0f;
         e->collision_delta_v_max = 0.0f;
         e->collision_delta_v_sum = 0.0f;

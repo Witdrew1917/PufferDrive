@@ -189,6 +189,28 @@ static int navi_pid_action_bin(float value, const float *bins, int count) {
     return best;
 }
 
+// Mirrors the longitudinal update of the JERK dynamics: true if this jerk makes the agent reverse now, or leaves
+// more deceleration than can be released (at JERK_LONG[3]) before the speed reaches zero.
+static int navi_pid_jerk_reverses(const Entity *agent, float signed_speed, float jerk, float dt) {
+    float a_new = agent->a_long + jerk * dt;
+    a_new = agent->a_long * a_new < 0.0f ? 0.0f : clip(a_new, -5.0f, 2.5f);
+    float v_new = signed_speed + 0.5f * (a_new + agent->a_long) * dt;
+    if (signed_speed * v_new < 0.0f)
+        v_new = 0.0f;
+    if (v_new < 0.0f)
+        return 1;
+    return a_new < 0.0f && v_new < a_new * a_new / (2.0f * JERK_LONG[3]);
+}
+
+// CLASSIC moves the centre along heading + beta with beta = tanh(0.5 * tan(steer)), giving a path curvature of
+// cos(beta) * tan(steer) / length. Invert that with a few fixed-point iterations.
+static float navi_pid_classic_steering(float curvature, float length) {
+    float target = curvature * length, u = target;
+    for (int i = 0; i < 4; i++)
+        u = target / cosf(tanhf(0.5f * u));
+    return atanf(u);
+}
+
 static NaviPIDAction navi_pid_action(Drive *env, int agent_idx, bool refresh_navigation) {
     Entity *agent = &env->entities[agent_idx];
     if (agent->stopped) {
@@ -243,9 +265,10 @@ static NaviPIDAction navi_pid_action(Drive *env, int agent_idx, bool refresh_nav
         acceleration = fminf(acceleration, gap_acceleration);
     }
     acceleration = clip(acceleration, ACCEL_MIN, ACCEL_MAX);
-    float new_speed = clip(speed + acceleration * env->dt, 0.0f, MAX_SPEED);
-    if (signed_speed >= 0.0f)
-        acceleration = (new_speed - speed) / env->dt;
+    // Never command reverse motion: brake to a stop, and recover forward if the agent is already rolling backwards.
+    float next_speed = clip(signed_speed + acceleration * env->dt, 0.0f, MAX_SPEED);
+    acceleration = clip((next_speed - signed_speed) / env->dt, ACCEL_MIN, ACCEL_MAX);
+    float new_speed = clip(signed_speed + acceleration * env->dt, 0.0f, MAX_SPEED);
 
     float steering = 0.0f;
     if (route.count >= 2 && agent->wheelbase > 0.0f) {
@@ -257,8 +280,9 @@ static NaviPIDAction navi_pid_action(Drive *env, int agent_idx, bool refresh_nav
                          env->navi_pid_heading_gain * heading_error;
         float feedback_limit = PID_MAX_LATERAL_ACCELERATION / fmaxf(speed * speed, 4.0f);
         float curvature =
-            clip(route_curvature, -0.1f, 0.1f) + clip(feedback, -feedback_limit, feedback_limit);
-        float target = atanf(curvature * agent->wheelbase);
+            clip(route_curvature, -0.5f, 0.5f) + clip(feedback, -feedback_limit, feedback_limit);
+        float target = env->dynamics_model == CLASSIC ? navi_pid_classic_steering(curvature, agent->length)
+                                                      : atanf(curvature * agent->wheelbase);
         float previous = env->dynamics_model == JERK ? agent->steering_angle : agent->navi_pid_steering;
         steering = previous + env->dt / (0.02f + env->dt) * (target - previous);
     }
@@ -267,23 +291,61 @@ static NaviPIDAction navi_pid_action(Drive *env, int agent_idx, bool refresh_nav
     if (env->dynamics_model == CLASSIC) {
         if (env->action_type == 1)
             return (NaviPIDAction){.continuous = {clip(acceleration / ACCEL_MAX, -1.0f, 1.0f), steering / STEER_MAX}};
-        int accel_bin = navi_pid_action_bin(acceleration, ACCELERATION_VALUES, NUM_ACCEL_BINS);
-        if (signed_speed >= 0.0f && signed_speed + ACCELERATION_VALUES[accel_bin] * env->dt < 0.0f)
+        // Carry quantization error forward so the coarse bins average to the commanded acceleration / steering.
+        float accel_target = acceleration + agent->navi_pid_accel_residual;
+        int accel_bin = navi_pid_action_bin(accel_target, ACCELERATION_VALUES, NUM_ACCEL_BINS);
+        int braking_clamped = 0;
+        while (accel_bin + 1 < NUM_ACCEL_BINS && ACCELERATION_VALUES[accel_bin] < 0.0f &&
+               signed_speed + ACCELERATION_VALUES[accel_bin] * env->dt < 0.0f) {
             accel_bin++;
-        int steer_bin = navi_pid_action_bin(steering, STEERING_VALUES, NUM_STEER_BINS);
+            braking_clamped = 1;
+        }
+        float half_accel_bin = 0.5f * (ACCELERATION_VALUES[1] - ACCELERATION_VALUES[0]);
+        agent->navi_pid_accel_residual =
+            braking_clamped ? 0.0f : clip(accel_target - ACCELERATION_VALUES[accel_bin], -half_accel_bin, half_accel_bin);
+
+        // Carry steering quantization error so small corrections still reach the ±1 bins, but drop it near zero
+        // and on sign changes so it cannot dither left/right on a straight.
+        float steer_residual = agent->navi_pid_steer_residual;
+        if (fabsf(steering) < 0.02f || steering * steer_residual < 0.0f)
+            steer_residual = 0.0f;
+        float steer_target = steering + steer_residual;
+        int steer_bin = navi_pid_action_bin(steer_target, STEERING_VALUES, NUM_STEER_BINS);
+        float half_steer_bin = 0.5f * (STEERING_VALUES[1] - STEERING_VALUES[0]);
+        agent->navi_pid_steer_residual =
+            clip(steer_target - STEERING_VALUES[steer_bin], -half_steer_bin, half_steer_bin);
         return (NaviPIDAction){.discrete = {accel_bin * NUM_STEER_BINS + steer_bin}};
     }
 
     float curvature = agent->wheelbase > 0.0f ? tanf(steering) / agent->wheelbase : 0.0f;
     if (env->dynamics_model == JERK) {
+        // Braking can only be released at JERK_LONG[3] m/s^3; brake no harder than can be released before
+        // the speed reaches zero, otherwise the residual deceleration rolls the agent backwards.
+        float release = JERK_LONG[3];
+        acceleration = fmaxf(acceleration, -sqrtf(2.0f * release * new_speed));
         float longitudinal = (acceleration - agent->a_long) / env->dt;
         float lateral = (new_speed * new_speed * curvature - agent->a_lat) / env->dt;
         if (env->action_type == 1) {
+            longitudinal = clip(longitudinal, JERK_LONG[0], JERK_LONG[3]);
+            if (navi_pid_jerk_reverses(agent, signed_speed, longitudinal, env->dt)) {
+                // Smallest brake release that avoids reversing.
+                float lo = longitudinal, hi = JERK_LONG[3];
+                for (int i = 0; i < 12; i++) {
+                    float mid = 0.5f * (lo + hi);
+                    if (navi_pid_jerk_reverses(agent, signed_speed, mid, env->dt))
+                        lo = mid;
+                    else
+                        hi = mid;
+                }
+                longitudinal = hi;
+            }
             float scale = longitudinal < 0.0f ? -JERK_LONG[0] : JERK_LONG[3];
             return (NaviPIDAction){
                 .continuous = {clip(longitudinal / scale, -1.0f, 1.0f), clip(lateral / JERK_LAT[2], -1.0f, 1.0f)}};
         }
         int long_bin = navi_pid_action_bin(longitudinal, JERK_LONG, 4);
+        while (long_bin + 1 < 4 && navi_pid_jerk_reverses(agent, signed_speed, JERK_LONG[long_bin], env->dt))
+            long_bin++;
         int lat_bin = navi_pid_action_bin(lateral, JERK_LAT, 3);
         return (NaviPIDAction){.discrete = {long_bin * 3 + lat_bin}};
     }

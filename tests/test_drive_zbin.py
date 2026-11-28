@@ -346,10 +346,25 @@ class TestZbinEnv(unittest.TestCase):
         self.assertEqual(anchored["actions"], policy["actions"])
         self.assertEqual(anchored["final_state"], policy["final_state"])
 
-    def test_pid_anchor_rejects_non_delta_actions(self):
-        completed = self._run_env(reg_mode="kl_pid_anchor", dynamics_model="classic")
-        self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("kl_pid_anchor requires discrete delta_local actions", completed.stderr)
+    def test_pid_anchor_records_jerk_joint_action_target(self):
+        config = {"dynamics_model": "jerk", "navigation": 1}
+        pid = self._result(sdc_controller="navi_pid", **config)
+        policy = self._result(**config)
+        anchored = self._result(reg_mode="kl_pid_anchor", **config)
+        np.testing.assert_array_equal(anchored["observations"][:, :-3], policy["observations"])
+        np.testing.assert_array_equal(anchored["observations"][0, -3:], [np.asarray(pid["actions"][0]).item(), 0, 0])
+        self.assertEqual(anchored["final_state"], policy["final_state"])
+
+    def test_pid_anchor_rejects_unsupported_configs(self):
+        cases = [
+            ({"dynamics_model": "jerk", "action_type": "continuous"}, "kl_pid_anchor requires discrete actions"),
+            ({"dynamics_model": "jerk", "pid_anchor_smearing": 1.0}, "pid_anchor_smearing requires delta_local"),
+        ]
+        for config, message in cases:
+            with self.subTest(**config):
+                completed = self._run_env(reg_mode="kl_pid_anchor", **config)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(message, completed.stderr)
 
     def test_navi_pid_speed_gain_and_speed_limit_fraction(self):
         full_speed = self._result(navigation=0, sdc_controller="navi_pid")

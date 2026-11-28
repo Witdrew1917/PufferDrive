@@ -192,11 +192,12 @@ def evaluate_bc_policy(config, vecenv, evaluator, policy_path):
     evaluator.mode = "bc_policy"
 
     from train_bc_policy import BCPolicy
+    from pufferlib.ocean.drive import binding
 
     bc_policy = BCPolicy(
         input_size=vecenv.observation_space.shape[-1],
         hidden_size=1024,
-        output_size=21 * 31,
+        output_size=binding.NUM_ACCEL_BINS * binding.NUM_STEER_BINS,
     )
     bc_policy.load_state_dict(torch.load(policy_path))
     bc_policy.eval().to(config["train"]["device"])

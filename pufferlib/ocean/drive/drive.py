@@ -273,8 +273,13 @@ class Drive(pufferlib.PufferEnv):
         }
         self.reg_mode = str_to_reg_mode.get(str(reg_mode).strip('"'))
         self.record_pid_anchor = self.reg_mode in (RegMode.KL_PID_ANCHOR, RegMode.KL_JOINT_ANCHOR)
-        if self.record_pid_anchor and (dynamics_model != "delta_local" or action_type != "discrete"):
-            raise ValueError("kl_pid_anchor requires discrete delta_local actions")
+        if self.record_pid_anchor and action_type != "discrete":
+            raise ValueError("kl_pid_anchor requires discrete actions")
+        if self.record_pid_anchor and dynamics_model != "delta_local":
+            if self.reg_mode == RegMode.KL_JOINT_ANCHOR:
+                raise ValueError("kl_joint_anchor requires discrete delta_local actions")
+            if float(pid_anchor_smearing) > 0.0:
+                raise ValueError("pid_anchor_smearing requires delta_local actions (joint action indices are not ordinal)")
         self.pid_target_slice = slice(-3, None) if self.record_pid_anchor else None
 
         self.num_obs = (
