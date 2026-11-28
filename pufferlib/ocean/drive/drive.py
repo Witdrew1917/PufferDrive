@@ -1442,9 +1442,12 @@ def process_all_navigation(map_dir, num_workers=None, overwrite=False):
     chunksize = max(1, min(256, len(map_files) // (num_workers * 16)))
     counts = {"written": 0, "existing": 0, "zbin": 0, "failed": 0}
     failed = []
-    with Pool(num_workers) as pool:
+    # ProcessPoolExecutor raises BrokenProcessPool if a worker dies in C code; multiprocessing.Pool would hang forever.
+    from concurrent.futures import ProcessPoolExecutor
+
+    with ProcessPoolExecutor(num_workers) as pool:
         for name, status, error in tqdm(
-            pool.imap_unordered(_process_single_navigation, [(p, overwrite) for p in map_files], chunksize=chunksize),
+            pool.map(_process_single_navigation, [(p, overwrite) for p in map_files], chunksize=chunksize),
             total=len(map_files),
             desc="Writing navigation sidecars",
             unit="map",
