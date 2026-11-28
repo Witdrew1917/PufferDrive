@@ -143,7 +143,7 @@ With `navigation = 1` the ego block grows by 3 and `navigation_waypoints` × 3 w
 
 **Jerk adds (3):** steering_angle, long_accel, lat_accel
 
-**Navigation adds (3, opt-in with `navigation = 1`):** left/center/right lane feasibility (how far the agent can stay on that lane and still reach its goal; all zero without a navigation goal). Legacy maps encode metres divided by 200, capped at 1, and require [navigation sidecars](data.md#navigation-sidecars-optional); with goal behavior 1, new goals are snapped to sidecar goal lanes. [zpufferdrive maps](data.md#zpufferdrive-binaries) encode seconds at the lane speed limit divided by 30, capped at 1, and never move goals.
+**Navigation adds (3, opt-in with `navigation = 1`):** left/center/right lane feasibility (how far the agent can stay on that lane and still reach its goal; all zero without a navigation goal). Encoded as seconds at the lane speed limit divided by 30, capped at 1; navigation never moves goals. Legacy maps build their [navigation](data.md#navigation) at load time.
 
 
 ### Partner features (up to `MAX_AGENTS - 1` agents, 7 each)
@@ -166,12 +166,11 @@ mid_x, mid_y, length, width, dir_cos, dir_sin, type
 > [!NOTE]
 > Road observations use a spatial grid with 5m cells. The 21×21 vision range gives ~105m visibility in all directions.
 
-### Navigation waypoints (opt-in with `navigation = 1`, `navigation_waypoints` × 3)
-rel_x, rel_y, valid (legacy maps). zpufferdrive maps use 2 features per waypoint instead: `x_forward, y_left` divided by `navigation_lookahead_norm`, spread evenly over `navigation_lookahead_distance` metres of route, `(0, 0)` past the route end. See [Lane navigation](navigation.md#zpufferdrive-maps).
+### Navigation waypoints (opt-in with `navigation = 1`, `navigation_waypoints` × 2)
+x_forward, y_left in the ego frame, divided by `navigation_lookahead_norm`
 
-- `navigation_waypoints` (default 16, max 64) points every `navigation_waypoint_spacing` metres (default 5) along the route to the navigation goal, starting from the agent's projection onto its current (or last known) lane; positions scaled by 0.02 like road/partner features
-- The route follows `next_lane`; where the goal is only reachable through a lane change it switches to the left/right lane closer to the goal
-- Ends at the goal lane's end; remaining slots and agents without a goal or off route are zero (`valid = 0`)
+- `navigation_waypoints` (default 16, max 50) points spread evenly over `navigation_lookahead_distance` metres (default 120) of route toward the navigation goal, starting from the agent's localized route sample
+- Slots past the route end, and all slots for agents without a route, are `(0, 0)`. See [Lane navigation](navigation.md#waypoints-navigation_waypoints--2)
 - The `Drive` torch policy encodes them in a fourth branch (shared per-waypoint MLP + max-pool). The C demo policy (`drivenet.h`) does not support navigation
 
 

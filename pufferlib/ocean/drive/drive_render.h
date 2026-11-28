@@ -262,17 +262,14 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
     float py = env->entities[active_idx].y;
     // Navigation waypoints
     const float *waypoint_obs = &agent_obs[max_obs - waypoint_feature_count(env)];
-    int zbin = env->map_format == MAP_FORMAT_ZBIN;
-    int waypoint_stride = zbin ? ZNAVI_WAYPOINT_FEATURES : NAVIGATION_WAYPOINT_FEATURES;
-    float waypoint_scale = zbin ? env->navigation_lookahead_norm : 50.0f;
     for (int k = 0; env->navigation_enabled && k < env->navigation_waypoints; k++) {
-        const float *waypoint = &waypoint_obs[k * waypoint_stride];
-        // zbin slots past the end of the route are (0, 0); legacy ones have valid = 0
-        if (zbin ? (waypoint[0] == 0.0f && waypoint[1] == 0.0f) : waypoint[2] == 0.0f) {
+        const float *waypoint = &waypoint_obs[k * ZNAVI_WAYPOINT_FEATURES];
+        // slots past the end of the route are (0, 0)
+        if (waypoint[0] == 0.0f && waypoint[1] == 0.0f) {
             break;
         }
-        float waypoint_x = waypoint[0] * waypoint_scale;
-        float waypoint_y = waypoint[1] * waypoint_scale;
+        float waypoint_x = waypoint[0] * env->navigation_lookahead_norm;
+        float waypoint_y = waypoint[1] * env->navigation_lookahead_norm;
         if (mode == 1) {
             float local_x = waypoint_x;
             waypoint_x = px + (local_x * heading_self_x - waypoint_y * heading_self_y);
@@ -720,34 +717,6 @@ void draw_inferred_trajectory(Drive *env, int agent_array_idx) {
     }
 }
 
-void draw_lane_polyline(const Entity *lane, float z, Color color) {
-    for (int point_idx = 0; point_idx + 1 < lane->array_size; point_idx++) {
-        DrawLine3D((Vector3){lane->traj_x[point_idx], lane->traj_y[point_idx], z},
-                   (Vector3){lane->traj_x[point_idx + 1], lane->traj_y[point_idx + 1], z}, color);
-    }
-}
-
-static void draw_navigation_route_lane(const Drive *env, int goal, int lane_idx, float z, Color color) {
-    const Navigation *navigation = env->navigation;
-    const Entity *lane = &env->entities[navigation->lane_entity_idx[lane_idx]];
-    float terminal = navigation_terminal_progress(navigation, goal, lane_idx);
-    if (terminal < 0.0f) {
-        draw_lane_polyline(lane, z, color);
-        return;
-    }
-    float progress = 0.0f;
-    for (int j = 0; j + 1 < lane->array_size && progress < terminal; j++) {
-        float sx = lane->traj_x[j], sy = lane->traj_y[j];
-        float dx = lane->traj_x[j + 1] - sx, dy = lane->traj_y[j + 1] - sy;
-        float length = hypotf(dx, dy);
-        if (length <= 0.0f)
-            continue;
-        float fraction = fminf((terminal - progress) / length, 1.0f);
-        DrawLine3D((Vector3){sx, sy, z}, (Vector3){sx + fraction * dx, sy + fraction * dy, z}, color);
-        progress += length;
-    }
-}
-
 static Color znavi_feasibility_color(float feasibility_m) {
     float ratio = fminf(feasibility_m / NAVI_OBS_FEASIBILITY_HORIZON_M, 1.0f);
     return (Color){(unsigned char)(255.0f * (1.0f - ratio)), (unsigned char)(255.0f * ratio), 0, 255};
@@ -794,7 +763,7 @@ static void znavi_draw_route(const Drive *env, const Entity *agent, float z, Col
     }
 }
 
-// zbin counterpart of draw_navigation_overlay.
+// Navigation overlay: feasibility-coloured route lanes, the selected agent's route, lookahead points and goal.
 void znavi_draw_navigation_overlay(Drive *env) {
     const Entity *agent = &env->entities[env->active_agent_indices[env->human_agent_idx]];
     if (agent->navi_goal_idx == -1) {
@@ -808,54 +777,6 @@ void znavi_draw_navigation_overlay(Drive *env) {
     rlSetLineWidth(1.0f);
     DrawSphere((Vector3){agent->goal_position_x, agent->goal_position_y, Z_AGENT_DETAILS}, NAVI_RENDER_GOAL_RADIUS_M,
                PUFF_CYAN);
-}
-
-// Lanes coloured by centre feasibility toward the selected agent's goal (red→green), grey if unreachable.
-void draw_navigation_overlay(Drive *env) {
-    const Navigation *navigation = env->navigation;
-    const Entity *agent = &env->entities[env->active_agent_indices[env->human_agent_idx]];
-    if (agent->navi_goal_idx == -1) {
-        return;
-    }
-    int goal_table_offset = agent->navi_goal_idx * navigation->num_lanes;
-    rlSetLineWidth(NAVI_RENDER_LANE_WIDTH_PX);
-    for (int navi_lane_idx = 0; navi_lane_idx < navigation->num_lanes; navi_lane_idx++) {
-        const Entity *lane = &env->entities[navigation->lane_entity_idx[navi_lane_idx]];
-        Color lane_color = Fade(GRAY, NAVI_RENDER_UNREACHABLE_ALPHA);
-        if (navigation->distance_to_goal_m[goal_table_offset + navi_lane_idx] < NAVI_UNREACHABLE_M) {
-            float feasibility_ratio = fminf(navigation->feasibility_center_m[goal_table_offset + navi_lane_idx] /
-                                                NAVI_OBS_FEASIBILITY_HORIZON_M,
-                                            1.0f);
-            lane_color = (Color){(unsigned char)(255.0f * (1.0f - feasibility_ratio)),
-                                 (unsigned char)(255.0f * feasibility_ratio), 0, 255};
-        }
-        draw_lane_polyline(lane, Z_ROAD_MARKINGS + NAVI_RENDER_Z_OFFSET, lane_color);
-    }
-    if (agent->navi_lane_idx != -1) {
-        rlSetLineWidth(NAVI_RENDER_ROUTE_WIDTH_PX);
-        int navi_lane_idx = agent->navi_lane_idx;
-        for (int hop_count = 0; hop_count < navigation->num_lanes && navi_lane_idx != -1; hop_count++) {
-            draw_navigation_route_lane(env, agent->navi_goal_idx, navi_lane_idx,
-                                       Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET, PUFF_CYAN);
-            navi_lane_idx = navigation->next_lane[goal_table_offset + navi_lane_idx];
-        }
-    }
-    rlSetLineWidth(1.0f);
-    float waypoint_x[NAVI_MAX_WAYPOINTS];
-    float waypoint_y[NAVI_MAX_WAYPOINTS];
-    // The sidecar is also drawn with navigation off, where the waypoint settings are not validated.
-    int max_waypoints = env->navigation_waypoints > 0 ? env->navigation_waypoints : NAVI_DEFAULT_WAYPOINTS;
-    if (max_waypoints > NAVI_MAX_WAYPOINTS)
-        max_waypoints = NAVI_MAX_WAYPOINTS;
-    float spacing =
-        env->navigation_waypoint_spacing > 0.0f ? env->navigation_waypoint_spacing : NAVI_DEFAULT_WAYPOINT_SPACING_M;
-    int waypoint_count = navigation_route_waypoints(env, agent, max_waypoints, spacing, waypoint_x, waypoint_y);
-    for (int k = 0; k < waypoint_count; k++) {
-        DrawSphere((Vector3){waypoint_x[k], waypoint_y[k], Z_AGENT_DETAILS}, NAVI_RENDER_WAYPOINT_RADIUS_M, WHITE);
-    }
-    DrawSphere(
-        (Vector3){navigation->goal_x[agent->navi_goal_idx], navigation->goal_y[agent->navi_goal_idx], Z_AGENT_DETAILS},
-        NAVI_RENDER_GOAL_RADIUS_M, PUFF_CYAN);
 }
 
 // Logged (and inferred) expert trajectories for the replay / inferred-expert verification modes.
@@ -1215,9 +1136,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
         }
     }
 
-    if (env->navigation != NULL && obs_only == 0) {
-        draw_navigation_overlay(env);
-    } else if (env->znavigation != NULL && obs_only == 0) {
+    if (env->znavigation != NULL && obs_only == 0) {
         znavi_draw_navigation_overlay(env);
     }
 
@@ -2000,73 +1919,21 @@ static void gui_set_line_width(float width) {
 }
 
 static void gui_draw_feasibility_lanes(Drive *env, const Entity *agent) {
-    if (env->znavigation != NULL) {
-        gui_set_line_width(NAVI_RENDER_LANE_WIDTH_PX);
-        znavi_draw_feasibility_lanes(env, agent->navi_goal_idx, Z_ROAD_MARKINGS + NAVI_RENDER_Z_OFFSET);
-        gui_set_line_width(1.0f);
-        return;
-    }
-    const Navigation *navigation = env->navigation;
-    int goal_table_offset = agent->navi_goal_idx * navigation->num_lanes;
     gui_set_line_width(NAVI_RENDER_LANE_WIDTH_PX);
-    for (int navi_lane_idx = 0; navi_lane_idx < navigation->num_lanes; navi_lane_idx++) {
-        const Entity *lane = &env->entities[navigation->lane_entity_idx[navi_lane_idx]];
-        Color lane_color = Fade(GRAY, NAVI_RENDER_UNREACHABLE_ALPHA);
-        if (navigation->distance_to_goal_m[goal_table_offset + navi_lane_idx] < NAVI_UNREACHABLE_M) {
-            float feasibility_ratio = fminf(navigation->feasibility_center_m[goal_table_offset + navi_lane_idx] /
-                                                NAVI_OBS_FEASIBILITY_HORIZON_M,
-                                            1.0f);
-            lane_color = (Color){(unsigned char)(255.0f * (1.0f - feasibility_ratio)),
-                                 (unsigned char)(255.0f * feasibility_ratio), 0, 255};
-        }
-        draw_lane_polyline(lane, Z_ROAD_MARKINGS + NAVI_RENDER_Z_OFFSET, lane_color);
-    }
+    znavi_draw_feasibility_lanes(env, agent->navi_goal_idx, Z_ROAD_MARKINGS + NAVI_RENDER_Z_OFFSET);
     gui_set_line_width(1.0f);
 }
 
 static void gui_draw_route(Drive *env, int active_idx, Color color, int is_selected) {
-    const Navigation *navigation = env->navigation;
     const Entity *agent = &env->entities[env->active_agent_indices[active_idx]];
     if (agent->navi_goal_idx < 0)
         return;
-    if (env->znavigation != NULL) {
-        gui_set_line_width(is_selected ? NAVI_RENDER_ROUTE_WIDTH_PX : NAVI_RENDER_LANE_WIDTH_PX);
-        znavi_draw_route(env, agent, Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET,
-                         is_selected ? color : Fade(color, 0.7f),
-                         is_selected ? GUI_WAYPOINT_RADIUS_M : GUI_WAYPOINT_RADIUS_M * 0.6f, ORANGE);
-        gui_set_line_width(1.0f);
-        DrawSphere((Vector3){agent->goal_position_x, agent->goal_position_y, Z_AGENT_DETAILS},
-                   is_selected ? NAVI_RENDER_GOAL_RADIUS_M : NAVI_RENDER_GOAL_RADIUS_M * 0.6f, color);
-        return;
-    }
-    int goal_table_offset = agent->navi_goal_idx * navigation->num_lanes;
-    int lane_idx = agent->navi_lane_idx;
     gui_set_line_width(is_selected ? NAVI_RENDER_ROUTE_WIDTH_PX : NAVI_RENDER_LANE_WIDTH_PX);
-    for (int hop = 0; hop < navigation->num_lanes && lane_idx != -1; hop++) {
-        draw_navigation_route_lane(env, agent->navi_goal_idx, lane_idx, Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET,
-                                   is_selected ? color : Fade(color, 0.7f));
-        lane_idx = navigation->next_lane[goal_table_offset + lane_idx];
-    }
+    znavi_draw_route(env, agent, Z_ROAD_MARKINGS + 2.0f * NAVI_RENDER_Z_OFFSET, is_selected ? color : Fade(color, 0.7f),
+                     is_selected ? GUI_WAYPOINT_RADIUS_M : GUI_WAYPOINT_RADIUS_M * 0.6f, ORANGE);
     gui_set_line_width(1.0f);
-
-    float xs[NAVI_MAX_WAYPOINTS];
-    float ys[NAVI_MAX_WAYPOINTS];
-    int max_waypoints = env->navigation_waypoints > 0 ? env->navigation_waypoints : NAVI_DEFAULT_WAYPOINTS;
-    if (max_waypoints > NAVI_MAX_WAYPOINTS)
-        max_waypoints = NAVI_MAX_WAYPOINTS;
-    float spacing =
-        env->navigation_waypoint_spacing > 0.0f ? env->navigation_waypoint_spacing : NAVI_DEFAULT_WAYPOINT_SPACING_M;
-    int count = navigation_route_waypoints(env, agent, max_waypoints, spacing, xs, ys);
-    float radius = is_selected ? GUI_WAYPOINT_RADIUS_M : GUI_WAYPOINT_RADIUS_M * 0.6f;
-    for (int k = 0; k < count; k++) {
-        Vector3 base = {xs[k], ys[k], Z_AGENT_DETAILS};
-        DrawCylinderEx(base, (Vector3){xs[k], ys[k], Z_AGENT_DETAILS + 0.05f}, radius, radius, 16, ORANGE);
-        DrawCircle3D((Vector3){xs[k], ys[k], Z_AGENT_DETAILS + 0.06f}, radius, (Vector3){0, 0, 1}, 0.0f,
-                     Fade(BLACK, 0.6f));
-    }
-    Vector3 goal = {navigation->goal_x[agent->navi_goal_idx], navigation->goal_y[agent->navi_goal_idx],
-                    Z_AGENT_DETAILS};
-    DrawSphere(goal, is_selected ? NAVI_RENDER_GOAL_RADIUS_M : NAVI_RENDER_GOAL_RADIUS_M * 0.6f, color);
+    DrawSphere((Vector3){agent->goal_position_x, agent->goal_position_y, Z_AGENT_DETAILS},
+               is_selected ? NAVI_RENDER_GOAL_RADIUS_M : NAVI_RENDER_GOAL_RADIUS_M * 0.6f, color);
 }
 
 static void gui_draw_nav(Drive *env) {
@@ -2100,10 +1967,10 @@ static int gui_feasibility_state(Drive *env, Vector3 base[3], Vector2 *dir, floa
     vals[0] = agent->navi_feasibility_left_m;
     vals[1] = agent->navi_feasibility_center_m;
     vals[2] = agent->navi_feasibility_right_m;
-    // zbin feasibility is 0 for a missing neighbour lane, like a forbidden one
-    has_lane[0] = env->navigation == NULL || env->navigation->left_lane[agent->navi_lane_idx] != -1;
+    // feasibility is 0 for a missing neighbour lane, like a forbidden one
+    has_lane[0] = 1;
     has_lane[1] = 1;
-    has_lane[2] = env->navigation == NULL || env->navigation->right_lane[agent->navi_lane_idx] != -1;
+    has_lane[2] = 1;
     for (int i = 0; i < 3; i++) {
         base[i] =
             (Vector3){agent->x + hx * ahead - hy * lateral[i], agent->y + hy * ahead + hx * lateral[i], GUI_FEAS_Z};
@@ -2455,8 +2322,7 @@ static void gui_draw_hud(Drive *env) {
                  status_color);
         gui_draw_action(env, x, &y);
         if (navigation_loaded(env) && agent->navi_goal_idx >= 0 && agent->navi_lane_idx >= 0) {
-            int has_left = env->navigation == NULL || env->navigation->left_lane[agent->navi_lane_idx] != -1;
-            int has_right = env->navigation == NULL || env->navigation->right_lane[agent->navi_lane_idx] != -1;
+            int has_left = 1, has_right = 1; // a missing neighbour lane reads as 0 m feasibility
             const char *left = gui_feasibility_label(agent->navi_feasibility_left_m, has_left);
             char left_buf[32];
             snprintf(left_buf, sizeof(left_buf), "%s", left); // TextFormat reuses a small ring of buffers

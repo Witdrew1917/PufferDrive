@@ -1,38 +1,39 @@
 # Lane navigation
 
-Lane navigation gives agents a lane-level route to their goal. There are two backends, chosen by the map format:
+Lane navigation gives agents a lane-level route to their goal. Every map format uses zpufferdrive (zdrive)
+navigation (`ZNavigation`, `pufferlib/ocean/drive/zbin.h`), with a projected-distance lane-selection refinement
+(see [zpufferdrive maps](#zpufferdrive-maps)):
 
-- **Legacy PufferDrive maps** use a precomputed `map_XXX.navi` sidecar next to every `map_XXX.bin` (see [Sidecars](#sidecars)).
-- **zpufferdrive (zdrive) v14 maps** carry their own routes; PufferDrive follows zdrive's navigation with a
-  projected-distance lane-selection refinement (see [zpufferdrive maps](#zpufferdrive-maps)).
+- **zpufferdrive v14 maps** carry their own routes (Sections 3-4), which are read at load time.
+- **Legacy PufferDrive maps** have no routes; they are built from the road entities
+  (see [Built navigation](#built-navigation)) and cached in a `map_XXX.znavi` sidecar next to the map
+  (see [Navigation sidecars](#navigation-sidecars)). A missing sidecar is written on first use.
+- With `zbin_navigation_source = 1`, routes are built in memory at load time for every map format, for the loaded
+  agents only, and no sidecar is read or written.
 
-Navigation data is **loaded whenever it is present** (sidecar or built-in sections). It then drives the
-`navi_*` metrics and the render overlay. Agents only **use** it when `navigation = 1`. With `navigation = 0`
-(default), observations, rewards, goals and the policy are identical to a run without navigation data unless
-`snap_goal_to_navi_endpoint` is enabled.
+Navigation data is always loaded. It drives the `navi_*` metrics and the render overlay. Agents only **use** it
+when `navigation = 1`. With `navigation = 0` (default), observations, rewards, goals and the policy are identical
+to a run without navigation data unless `snap_goal_to_navi_endpoint` is enabled.
 
 With `navigation = 1` the environment:
 
 - tracks each agent's current lane, distance to goal and lane feasibility,
 - extends the **ego observation by 3** (left / center / right lane feasibility),
-- appends a **route-waypoint stream** to the observation (`navigation_waypoints` × 3 floats for legacy maps,
-  × 2 for zpufferdrive maps),
-- enables the `reward_progress_navi` reward,
-- for legacy maps only, snaps newly sampled goals to sidecar goal lanes.
+- appends a **route-waypoint stream** to the observation (`navigation_waypoints` × 2 floats),
+- enables the `reward_progress_navi` reward.
 
 ## Quick start
 
 ```bash
-# 1. Maps must be in the current .bin format (see data.md)
+# 1. Maps must be in the current .bin format (see data.md); conversion also writes the map_XXX.znavi sidecars
 python -m pufferlib.ocean.drive.drive maps --data-folder data/processed/training
+# (existing legacy maps) write the missing sidecars up front instead of on first use
+python -m pufferlib.ocean.drive.drive navigation --map-dir resources/drive/binaries/training
 
-# 2. Build sidecars next to the bins (bins are not modified)
-python -m pufferlib.ocean.drive.drive navigation --map-dir resources/drive/binaries/training --workers 16
-
-# 3. Train with navigation enabled
+# 2. Train with navigation enabled
 puffer train puffer_drive --env.navigation 1 --env.map-dir resources/drive/binaries/training
 
-# 4. Render a rollout with the navigation overlay (window: 0, mp4: 1)
+# 3. Render a rollout with the navigation overlay (window: 0, mp4: 1)
 scripts/render_navigation.sh resources/drive/binaries/training latest 1
 ```
 
@@ -44,22 +45,23 @@ The C extension needs no rebuild when switching `navigation` on or off; all sett
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `navigation` | `0` | `1` lets agents use navigation. Legacy maps then need a `.navi` sidecar for every map in `map_dir`. |
-| `snap_goal_to_navi_endpoint` | `0` | Snap initial logged goals: project onto the goal lane for legacy maps, or use the nearest route terminal for zpufferdrive maps. Independent of `navigation`; legacy maps require sidecars, and generated goals are unchanged. |
-| `navigation_waypoints` | `16` | Route waypoints observed per agent: `[1, 64]` (`NAVI_MAX_WAYPOINTS`) for legacy maps, `[1, 50]` (`NAVI_LOOKAHEAD_WAYPOINTS_MAX`) for zpufferdrive maps. |
-| `navigation_waypoint_spacing` | `5.0` | Legacy maps: metres between consecutive waypoints along the route (> 0). |
-| `navigation_lookahead_distance` | `120.0` | zpufferdrive maps: route arclength covered by the waypoints, in metres. Must satisfy `0 < distance <= navigation_lookahead_norm`. |
-| `navigation_lookahead_norm` | `150.0` | zpufferdrive maps: metres that waypoint coordinates are divided by. |
+| `navigation` | `0` | `1` lets agents use navigation. |
+| `snap_goal_to_navi_endpoint` | `0` | Snap initial logged goals to the nearest usable terminal of their route. Independent of `navigation`; generated goals are unchanged. |
+| `navigation_waypoints` | `16` | Route waypoints observed per agent, `[1, 50]` (`NAVI_LOOKAHEAD_WAYPOINTS_MAX`). |
+| `navigation_lookahead_distance` | `120.0` | Route arclength covered by the waypoints, in metres. Must satisfy `0 < distance <= navigation_lookahead_norm`. |
+| `navigation_lookahead_norm` | `150.0` | Metres that waypoint coordinates are divided by. |
+| `append_goal_to_navi_lookahead` | `0` | `1` extends the route lookahead from its reachable terminal to the mission goal. |
+| `zbin_navigation_source` | `0` | `0`: stored navigation; zpufferdrive maps read their Sections 3-4, legacy maps read their `map_XXX.znavi` sidecar (written when missing). `1`: always build navigation in memory at load time for the loaded agents. |
 
 ## Navigation PID controller
 
 Select `navi_pid` with `--env.sdc-controller navi_pid` or `--env.non-sdc-controller navi_pid`. It follows
-navigation routes even when policy navigation observations are disabled. Zpufferdrive maps use the localized lane
-speed limit multiplied by `navi_pid_speed_limit_fraction`; legacy maps do not expose lane speed limits to this
-controller and use `navi_pid_default_speed` instead. For speed control, the controller previews the route by
-arclength and can lower the target for upcoming lane limits (zbin only) or for the tightest sampled bend
+navigation routes even when policy navigation observations are disabled. It uses the localized lane speed limit
+multiplied by `navi_pid_speed_limit_fraction`, or `navi_pid_default_speed` when no usable limit is available
+(legacy maps have no lane speed limits; built navigation then assumes 50 km/h). For speed control, the controller
+previews the route by arclength and can lower the target for upcoming lane limits or for the tightest sampled bend
 (`sqrt(4.0 / |curvature|)` in m/s). Preview never raises the current target. Steering still uses local curvature.
-On zbin maps, `append_goal_to_navi_lookahead = 1` also extends the PID route from its reachable terminal to
+`append_goal_to_navi_lookahead = 1` also extends the PID route from its reachable terminal to
 the mission goal. The PID uses that final segment for steering and braking even when policy navigation is disabled.
 
 The PID produces actions for the selected `dynamics_model`, just like a policy: acceleration and steering for
@@ -86,131 +88,17 @@ loss weight; the default is zero.
 All gains must be finite and non-negative, and the fallback speed must be positive.
 
 > [!IMPORTANT]
-> `navigation`, `navigation_waypoints` and the map format change the observation size. A policy trained with one
-> setting cannot be loaded with another. `navigation_waypoint_spacing`, `navigation_lookahead_distance` and
-> `navigation_lookahead_norm` keep the shape but change the meaning of the inputs.
-
-## Sidecars
-
-### Generating
-
-```bash
-python -m pufferlib.ocean.drive.drive navigation --map-dir <map_dir> [--workers N] [--max-goals 64] [--seed 42] [--overwrite]
-```
-
-- `--max-goals`: goal lanes per map (default 64, max 1024). Lanes holding a logged agent goal are always included.
-  The rest are chosen by farthest-point sampling, dead-end lanes first.
-- `--seed`: seed for goal selection.
-- `--overwrite`: rebuild sidecars that already exist. Without it existing sidecars are skipped.
-
-Each sidecar stores a CRC-32 and the byte size of its `.bin`. If a map is regenerated, its sidecar becomes stale and
-environment creation aborts with a fingerprint mismatch. Rebuild with `--overwrite`. Creating an env with
-`navigation = 1` or `snap_goal_to_navi_endpoint = 1` also fails early, with the command to run, if any map lacks a sidecar. Sidecars that exist are
-also loaded (and validated) with `navigation = 0`, for metrics and rendering.
-
-Split-aware navigation and overlapping goal terminals require version 4 sidecars. Regenerate older sidecars with
-`--overwrite` and rebuild the native extension; map binaries and policy observation shapes do not change.
-Existing weights remain loadable,
-but their guidance and evaluation results can change at ambiguous intersections.
-
-### What is computed (`pufferlib/ocean/drive/navigation.py`)
-
-Map bins carry no lane connectivity, so it is inferred from geometry:
-
-- **Successors**: lane B follows lane A if B starts within 0.5 m of A's end with a compatible heading.
-- **Split branches**: nearby starts or common predecessors identify candidate siblings. A pair must share at least
-  2 m of aligned approach, with centerlines no more than 1 m apart and tangent cosine at least 0.9. The shared
-  prefix ends when either condition fails. Relations are pairwise, not transitive, and do not permit jumping
-  between separate turn pockets, crossing lanes, or ordinary adjacent lanes.
-- **Lateral neighbours**: probed at 25/50/75 % of the lane, one lane width (3.7 m) to each side. All probes must hit
-  the same aligned lane, and no road edge may lie between the lanes (a road edge forbids the lane change).
-- **Goal lanes**: the visible goal is the end point of a representative goal lane. Each object's logged goal is
-  matched to the lane
-  containing it (aligned with the object's final heading). That gives `object_goal_idx`, the goal each   agent drives
-  to at reset. Other same-direction lanes sharing the goal's final 2 m of approach (within 1 m, tangent cosine
-  at least 0.9) receive hidden routing copies at the goal's exact projection. This includes a straight lane
-  overlapping the end of a turning lane, but excludes adjacent, crossing and opposing lanes.
-  Copies share the original goal ID and marker and do not consume additional goal slots or move the goal.
-- **Per goal × lane tables** (Dijkstra toward the goal lane's end, lane change cost 10 m):
-  - `next_lane`: longitudinal next hop toward any copy of the goal without lane changes, or -1.
-  - `longitudinal_distance_to_goal_m`: distance from the lane start without lane changes, used to rank ambiguous
-    split branches. A lane with `next_lane = -1` and a distance below `1e9` is a terminal: the distance is the
-    stopping arc length on that lane, which may be before its end. `next_lane = -1` with an unreachable
-    longitudinal distance still means no longitudinal route. This reuses the Dijkstra pass already needed for
-    `next_lane`, seeded with all copies of the same goal.
-  - `distance_to_goal_m`: distance from the lane start to the goal with lane changes allowed, or `1e9` (unreachable).
-  - `feasibility_left_m / center_m / right_m`: metres the agent can keep following the left / own / right lane
-    (taking the best successor) while the goal stays reachable, capped at 1000 m. 0 means that lane is not
-    available or does not lead to the goal.
-
-Split detection compares local candidate prefixes rather than all pairs of lane polylines. It adds one
-`float32[num_goals, num_lanes]` distance table (20% more storage for the per-goal/lane tables) and sparse split
-metadata, but no additional Dijkstra pass. Runtime selection projects onto local sibling candidates; it does not
-run a shortest-path search per agent.
-
-### File format
-
-Little-endian. 44-byte header: magic `"PDNAVI01"`, `version` (int32 = 4), `map_crc32` (uint32), `map_size_bytes`
-(uint64), then `num_objects`, `num_roads`, `num_lanes`, `num_goals`, `num_branches` (int32). Followed by:
-
-| Array | Type | Size |
-|-------|------|------|
-| `lane_entity_idx`, `left_lane`, `right_lane` | int32 | `num_lanes` |
-| `goal_lane` | int32 | `num_goals` |
-| `goal_x`, `goal_y` | float32 | `num_goals` |
-| `object_goal_idx` | int32 | `num_objects` |
-| `next_lane` | int32 | `num_goals × num_lanes` |
-| `distance_to_goal_m`, `feasibility_left_m`, `feasibility_center_m`, `feasibility_right_m` | float32 | `num_goals × num_lanes` |
-| `longitudinal_distance_to_goal_m` | float32 | `num_goals × num_lanes` |
-| `branch_offsets` | int32 | `num_lanes + 1` |
-| `branch_lane` | int32 | `num_branches` |
-| `branch_end_m`, `branch_other_end_m` | float32 | `num_branches` |
-
-`branch_offsets[lane]:branch_offsets[lane + 1]` selects its sibling entries. Each entry holds the sibling index
-and shared-prefix arc-length limits on the source and sibling lanes. Entries in each row are strictly ascending.
-
-Version 4 retains version 3's array layout; the version bump identifies the new multi-terminal routing semantics.
-Hidden goal copies require no additional arrays: a finite longitudinal distance with no next hop encodes a
-terminal's stopping position.
-
-Lane indices in the sidecar are *navi lane* indices (position in `lane_entity_idx`), not entity indices. The C loader
-(`load_navigation_binary` in `drive.h`) rejects missing, truncated, trailing-byte, out-of-range or stale files.
-
-## Runtime state (C, `drive.h`)
-
-Every step, for each controlled agent:
-
-1. **Current lane** (`update_current_lane`): the closest `ROAD_LANE` within 4 m. Lanes whose heading differs by more
-   than 30° get a 3 m distance penalty. This remains the physical lane match.
-2. **Navigation anchor** (`navigation_branch_lane`): while projections onto sibling branches remain within their
-   shared prefixes, within 1 m of the agent and one another, and aligned with its heading, choose the shorter
-   reachable longitudinal route from the projected position. Near ties (within 0.1 m) prefer the previous
-   navigation anchor, then geometric fit and lane index. If none has a longitudinal route, keep the physical
-   match. After divergence the physical branch wins, even if it is longer. Off-lane preserves the last known
-   anchor and state. No goal means normal geometric matching.
-3. **Navigation state** (`update_navigation_state`): from the selected anchor's lane-start table values minus the
-   agent's projected progress, compute remaining distance, off-route status, and left / center / right feasibility.
-   These retain their original lane-change-aware semantics; only split ranking excludes lane changes. When sibling
-   anchors change, progress is measured on the new anchor for both positions, so movement still counts but
-   selection alone cannot earn progress reward.
-   Side feasibility uses projection onto the selected anchor's neighbouring lane.
-   The progress reward requires a new closest navigation distance for the current goal; retracing a route does not
-   earn the same progress again. The closest distance is initialized again when a new goal is sampled.
-4. **Goals**: each agent retains its logged goal and associated `object_goal_idx` by default. With
-   `snap_goal_to_navi_endpoint = 1`, the initial goal is projected onto its associated goal lane after agent
-   selection; agents without a navigation goal retain their logged goal. Sidecar routes and their distance tables
-   still lead to the lane's original terminal, which may be beyond the projected goal. When a new goal is sampled
-   (`sample_new_goal`, e.g. goal behavior 1), it is snapped to the reachable sidecar goal whose route distance is
-   closest to `goal_target_distance`, resolving ambiguous branches for each prospective goal without changing
-   agent state during comparison. If no sidecar goal is reachable, the normal lane-point sampling is used and
-   the agent has no navigation goal.
+> `navigation` and `navigation_waypoints` change the observation size. A policy trained with one setting cannot
+> be loaded with another. `navigation_lookahead_distance` and `navigation_lookahead_norm` keep the shape but change
+> the meaning of the inputs. Policies trained with the removed legacy `.navi` navigation (3 features per waypoint)
+> cannot be loaded with `navigation = 1`.
 
 ## zpufferdrive maps
 
 zpufferdrive v14 binaries (`map_XXX.bin` written by zpufferdrive's `scripts/python/process_maps.py`) are detected
 automatically: the file starts with version 14, at least 4 section offsets, and the offsets are increasing and
 within the file. The format of a map directory is taken from `map_000.bin`; all maps in it must share that format.
-`pufferlib/ocean/drive/zbin.h` holds the loader and the navigation runtime. No sidecar or conversion is needed.
+`pufferlib/ocean/drive/zbin.h` holds the loader and the navigation runtime. No conversion is needed.
 
 ### Scene
 
@@ -242,8 +130,11 @@ Each step, for each agent with a route, PufferDrive follows zdrive's non-expert 
 
 1. **Localize**: find the closest lane, with a 1000 m penalty for lanes whose heading differs by more than 60°.
    Among segments less than 4 m away, find the closest one with a reachable route at the projected sample.
-   Then choose the shortest route to the goal from among reachable segments within 0.75 m of that closest
+   Then choose the shortest route to the goal from among reachable segments within 1.5 m of that closest
    distance. Unlike zdrive's ranking, the tie window does not move when a farther segment wins on route length.
+   The route lengths compared are the remaining distances: the stored sample distance minus the agent's progress
+   past the sample start. Otherwise long samples (sparse legacy polylines) would lose to candidates that merely
+   start further ahead, such as a merging turn lane.
    If no candidate qualifies, use the geometric match.
 2. **Look up** the navi entity and point on that lane. `distance_to_goal` and feasibility are read at point
    `max(p - 1, 0)`. Values of 1999.99 m or more, or a failed lookup, mean unreachable: 0 feasibility and
@@ -251,6 +142,47 @@ Each step, for each agent with a route, PufferDrive follows zdrive's non-expert 
 3. **Goals**: the agent keeps its original route, including after `goal_behavior = 1` resamples the visible goal
    with the normal (non-snapping) lane-point sampler, as zdrive does. `reward_progress_navi` is driven by
    `distance_to_goal`.
+
+### Built navigation
+
+Legacy maps (and zpufferdrive maps with `zbin_navigation_source = 1`) build the Sections 3-4 tables at load time, with
+`pufferlib/ocean/drive/znavi_build.h`, a C port of zpufferdrive's `goal.py` that depends only on libc/libm. The
+adapter `build_znavigation` in `zbin.h` passes it the road polylines and agents and wraps the result in the same
+`ZNavigation`, so the runtime above is unchanged for both map formats.
+
+- **Lanes and obstacles**: lanes are graph nodes, sub-sampled every `0.75 s × max(speed_limit, 1 m/s)`. Road edges
+  and zbin solid road lines block lane changes, while other road lines can be crossed. Legacy maps have no solid-line
+  information and no lane speed limits, so missing lane speed limits default to 50 km/h, as in zpufferdrive's
+  `load_map.py`.
+- **Goals**: each agent's logged goal is localized to every lane sub-line within 4 m (`ZBIN_NAVI_GOAL_SET_RADIUS`;
+  zpufferdrive `snap_goals=False`). The route therefore ends on whichever nearby lane is best reachable, not on the
+  geometrically closest one. Unlike zpufferdrive, each of these goal sub-lines starts the route search with its
+  along-lane distance to the goal, measured relative to the closest one. So staying in lane beats a lane change into
+  a neighbouring lane whose goal sub-line merely starts earlier. Start candidates are all lanes within 5 m and 90° of the agent.
+  - Agents whose goal is unreachable get a random reachable dead-end goal, seeded from the map's CRC-32.
+  - Agents longer than 8 m are only routed from their closest start lane.
+- **Parity**: on maps regenerated with current zpufferdrive, routes match the stored tables for about 99.5% of
+  samples. The remaining differences come from line types that zbin files do not keep: yellow solid lines are
+  stored as dashed. Building takes tens of milliseconds per map, versus a few milliseconds to load the sections.
+
+### Navigation sidecars
+
+With `zbin_navigation_source = 0`, legacy maps cache their built navigation in `map_XXX.znavi` next to
+`map_XXX.bin`. The sidecar belongs to the map binary, not to a run:
+
+- it routes **every logged object** with at least one valid sample, using the trajectories as loaded (before
+  `remove_bad_trajectories` or any other run-dependent preprocessing). Every run then uses the goals of the objects
+  it controls, whatever `init_mode`, controllers or agent budget it uses;
+- it is bound to the map by the map file's CRC-32 and byte size. If the map changes, or the sidecar is truncated or
+  invalid, environment creation fails with an error; regenerate with
+  `python -m pufferlib.ocean.drive.drive navigation --map-dir <dir> --overwrite`;
+- it is written atomically (temporary file + rename) by `drive.py maps` after each map binary, by the
+  `navigation` subcommand (`--map-dir`, `--workers`, `--overwrite`; zpufferdrive maps are skipped), or by the
+  environment when the sidecar is missing. If the directory is read-only, the environment only prints a warning
+  and uses the built navigation.
+
+Because the sidecar routes every object, its goal set (and so its random fallback goals) can differ from
+`zbin_navigation_source = 1`, which only routes the agents a run loads.
 
 ## Observations
 
@@ -260,43 +192,21 @@ Layout with `navigation = 1`:
 [ ego (dynamics ego + 3) | partners ((MAX_AGENTS-1) × 7) | roads (128 × 7) | waypoints (navigation_waypoints × F) ]
 ```
 
-`F` (`env.waypoint_features`) is 3 for legacy maps and 2 for zpufferdrive maps. The partner and road blocks keep
-their offsets. Waypoints come last.
+`F` (`env.waypoint_features`) is 2. The partner and road blocks keep their offsets. Waypoints come last.
 
 ### Ego: lane feasibility (+3)
 
 The last 3 ego features are `left, center, right` lane feasibility: how far the agent can stay in that lane and
 still reach its goal. 0 means the lane doesn't exist, isn't allowed or doesn't lead to the goal. All three are 0
-when the agent has no navigation goal.
+when the agent has no navigation goal. Each is `clamp(feasibility_m / speed_limit / 30, 0, 1)`, time at the
+current lane's speed limit over a 30 s horizon; all three are 0 when the lane has no speed limit.
 
-- Legacy maps: `min(feasibility_m / 200, 1)`, a 200 m horizon.
-- zpufferdrive maps: `clamp(feasibility_m / speed_limit / 30, 0, 1)`, time at the current lane's speed limit over a
-  30 s horizon. All three are 0 when the lane has no speed limit.
-
-### Waypoints, zpufferdrive maps (`navigation_waypoints` × 2)
+### Waypoints (`navigation_waypoints` × 2)
 
 Per waypoint: `x_forward, y_left`, in the ego frame and divided by `navigation_lookahead_norm`. Waypoint `w`
 (0-based) lies `(w + 1) × navigation_lookahead_distance / navigation_waypoints` metres along the route from the
 agent's localized navi point, following the route's next hops (zdrive's `NaviWalk`). Slots beyond the route end,
 and all slots for agents without a route, are `(0, 0)`. There is no valid flag.
-
-### Waypoints, legacy maps (`navigation_waypoints` × 3)
-
-Per waypoint: `rel_x, rel_y, valid`. Positions are in the ego frame and scaled by 0.02, like partner and road
-features.
-
-Route walk (`navigation_route_waypoints`):
-
-- Start at the agent's projection onto its resolved navigation anchor (or last known anchor when off-lane).
-- Every `navigation_waypoint_spacing` metres along the lane polyline, emit a waypoint.
-- At the lane end, continue on `next_lane`.
-- If the current lane has no `next_lane` toward the goal (a lane change is needed), hop to the left or right
-  neighbour with the smaller `distance_to_goal_m`, then keep walking from the projected position. Distance strictly
-  decreases, so the walk always terminates.
-- Stop at the sidecar goal's projected position on any terminal lane, even if the lane continues beyond it,
-  or when no hop is possible.
-
-Unused slots, and all slots for agents without a goal or off route, are zero (`valid = 0`).
 
 ## Policy (`pufferlib/ocean/torch.py`)
 
@@ -317,38 +227,34 @@ The C demo policy (`drivenet.h`, used by `drive.c`) has no waypoint branch and r
 Set `sdc_controller`, `non_sdc_controller`, or `non_vehicle_controller` to `navi_pid` to follow the navigation
 route with a kinematic bicycle controller. It uses proportional speed and route-tracking feedback and a
 proportional/derivative following-gap controller; it does not use a learned policy or the IDM extension. It works
-with either map format and also works with `navigation = 0`, without changing policy observation sizes.
-Legacy maps still require sidecars for every map. With `non_sdc_controller = "navi_pid"`, the default
+with either map format and also works with `navigation = 0`, without changing policy observation sizes. With `non_sdc_controller = "navi_pid"`, the default
 `non_vehicle_controller = "auto"` replays non-vehicles. Explicitly selected non-expert background agents also use
 `navi_pid` when the active-agent limit is reached.
 
-The controller uses zbin lane speed limits, or 9 m/s when no usable limit is available. It brakes for vehicles
+The controller uses lane speed limits, or `navi_pid_default_speed` (9 m/s) when no usable limit is available. It brakes for vehicles
 ahead and near the end of the available route. If localization fails or the agent has no reachable navigation
 goal, it warns and brakes rather than continuing without guidance. The controller follows the navigation
-terminal, which can differ from the visible logged goal; zbin retains its original route after a goal resample.
+terminal, which can differ from the visible logged goal, and retains its original route after a goal resample.
 Lateral tracking uses 2D route waypoints, so it does not model road elevation changes.
 
 ## Metrics
 
-Logged whenever navigation data is loaded:
+Always logged:
 
 - `navi_goal_active_rate`: fraction of agent-steps with a navigation goal.
 - `navi_off_route_rate`: fraction of agent-steps on a lane from which the goal is unreachable.
 
 ## Rendering
 
-When navigation data is loaded the renderer draws, for the selected agent:
+The renderer draws, for the selected agent:
 
 - lanes coloured by feasibility toward its goal (red → green, grey = unreachable),
-- its route in cyan: legacy `next_lane` from the resolved navigation anchor, or the zdrive route lookahead,
+- its route in cyan (the zdrive route lookahead),
 - its observed route waypoints (small spheres),
 - its goal.
 
-Only the selected goal marker is drawn. Routes and observed waypoints can reach any hidden copy and stop there;
-they do not continue to the end of a longer overlapping lane.
-
 The observation-only view also decodes the waypoint block. `scripts/render_navigation.sh [MAP_DIR] [MODEL|latest|none]
-[0|1]` generates missing sidecars and runs `puffer eval` with the overlay.
+[0|1]` runs `puffer eval` with the overlay.
 
 ## Tests
 
@@ -356,9 +262,9 @@ The observation-only view also decodes the waypoint block. `scripts/render_navig
 python -m unittest tests.test_drive_navigation tests.test_drive_zbin
 ```
 
-`test_drive_navigation` covers sidecar topology and round trip, `next_lane` termination, road-edge-blocked lane
-changes, reader validation, observation sizes, waypoint count and spacing, lane-change waypoints and stale-sidecar
-rejection.
+`test_drive_navigation` covers navigation built at load time on synthetic legacy maps: observation sizes, waypoint
+count, goal snapping, goal observation dropout, the `navi_pid` controller and the `map_XXX.znavi` sidecar (round
+trip, CLI, stale-map error).
 
 `test_drive_zbin` covers zpufferdrive maps on a synthetic binary: format detection, observation sizes and values,
 route-end padding, `navigation = 0` ignoring loaded routes, unmoved goals, config validation and truncated-file

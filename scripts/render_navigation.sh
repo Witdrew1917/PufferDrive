@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render a policy rollout with the lane-navigation overlay (navigation = 1).
+# Render a policy rollout with the navigation overlay (navigation = 1).
 # Usage: scripts/render_navigation.sh [MAP_DIR] [MODEL_PATH|latest|none] [RENDER_MODE 0=window|1=mp4]
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -9,8 +9,6 @@ MAP_DIR="${1:-resources/drive/binaries/interactive_1k}"
 MODEL_PATH="${2:-none}"
 RENDER_MODE="${3:-0}"
 NUM_MAPS="$(find "$MAP_DIR" -maxdepth 1 -name 'map_*.bin' | wc -l)"
-
-python -m pufferlib.ocean.drive.drive navigation --map-dir "$MAP_DIR"
 
 MODEL_ARGS=()
 if [ "$MODEL_PATH" != "none" ]; then

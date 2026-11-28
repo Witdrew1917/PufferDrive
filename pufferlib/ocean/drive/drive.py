@@ -122,7 +122,6 @@ class Drive(pufferlib.PufferEnv):
         async_resets=True,
         navigation=0,
         navigation_waypoints=16,
-        navigation_waypoint_spacing=5.0,
         navigation_lookahead_distance=120.0,
         navigation_lookahead_norm=150.0,
         navi_pid_speed_gain=1.0,
@@ -137,6 +136,7 @@ class Drive(pufferlib.PufferEnv):
         goal_visible_mode=0,
         reward_progress_navi=0.0,
         snap_goal_to_navi_endpoint=0,
+        zbin_navigation_source=0,
         append_goal_to_navi_lookahead=0,
         waypoint_encoder_arch="mlp",
         extra_value_components=0,
@@ -194,6 +194,9 @@ class Drive(pufferlib.PufferEnv):
         if snap_goal_to_navi_endpoint not in (0, 1):
             raise ValueError(f"snap_goal_to_navi_endpoint must be 0 or 1. Got: {snap_goal_to_navi_endpoint}")
         self.snap_goal_to_navi_endpoint = int(snap_goal_to_navi_endpoint)
+        if zbin_navigation_source not in (0, 1):
+            raise ValueError(f"zbin_navigation_source must be 0 or 1. Got: {zbin_navigation_source}")
+        self.zbin_navigation_source = int(zbin_navigation_source)
         if append_goal_to_navi_lookahead not in (0, 1):
             raise ValueError(f"append_goal_to_navi_lookahead must be 0 or 1. Got: {append_goal_to_navi_lookahead}")
         self.append_goal_to_navi_lookahead = int(append_goal_to_navi_lookahead)
@@ -201,7 +204,6 @@ class Drive(pufferlib.PufferEnv):
         if waypoint_encoder_arch not in ("mlp", "attention"):
             raise ValueError(f"waypoint_encoder_arch must be 'mlp' or 'attention'. Got: {waypoint_encoder_arch!r}")
         self.waypoint_encoder_arch = waypoint_encoder_arch
-        self.navigation_waypoint_spacing = float(navigation_waypoint_spacing)
         self.navigation_lookahead_distance = float(navigation_lookahead_distance)
         self.navigation_lookahead_norm = float(navigation_lookahead_norm)
         self.navi_pid_speed_gain = float(navi_pid_speed_gain)
@@ -237,37 +239,20 @@ class Drive(pufferlib.PufferEnv):
             )
         # A map directory holds a single format, detected from its first map.
         self.map_format = detect_map_format(f"{map_dir}/map_000.bin")
-        if self.append_goal_to_navi_lookahead and self.map_format != MAP_FORMAT_ZBIN:
-            raise ValueError("append_goal_to_navi_lookahead requires zbin maps")
         if self.navigation:
-            max_waypoints = (
-                binding.NAVI_LOOKAHEAD_WAYPOINTS_MAX
-                if self.map_format == MAP_FORMAT_ZBIN
-                else binding.NAVI_MAX_WAYPOINTS
-            )
+            max_waypoints = binding.NAVI_LOOKAHEAD_WAYPOINTS_MAX
             if not 1 <= self.navigation_waypoints <= max_waypoints:
                 raise ValueError(f"navigation_waypoints must be in [1, {max_waypoints}]. Got: {navigation_waypoints}")
-            if self.map_format == MAP_FORMAT_ZBIN:
-                if not 0.0 < self.navigation_lookahead_distance <= self.navigation_lookahead_norm:
-                    raise ValueError(
-                        "navigation_lookahead_distance must be in (0, navigation_lookahead_norm]. Got: "
-                        f"{navigation_lookahead_distance}, {navigation_lookahead_norm}"
-                    )
-            elif not self.navigation_waypoint_spacing > 0.0:
-                raise ValueError(f"navigation_waypoint_spacing must be > 0. Got: {navigation_waypoint_spacing}")
+            if not 0.0 < self.navigation_lookahead_distance <= self.navigation_lookahead_norm:
+                raise ValueError(
+                    "navigation_lookahead_distance must be in (0, navigation_lookahead_norm]. Got: "
+                    f"{navigation_lookahead_distance}, {navigation_lookahead_norm}"
+                )
             self.ego_features += binding.NAVIGATION_EGO_FEATURES
 
-        # Goal visibility resamples goals according to zbin navigation and so
-        # it is required to be present
-        if self.goal_visible_mode:
-            if self.map_format != MAP_FORMAT_ZBIN:
-                raise ValueError("goal_visible_mode currently supports zbin maps only")
-
-            # If moving goal observations according to navi, reject goal
-            # resampling (goal_behavior=1)
-            if self.goal_visible_mode == 2 and self.goal_behavior == 1:
-                raise ValueError(f"goal_visible_mode {self.goal_visible_mode} requires fixed mission goals")
-
+        # If moving goal observations according to navi, reject goal resampling (goal_behavior=1)
+        if self.goal_visible_mode == 2 and self.goal_behavior == 1:
+            raise ValueError(f"goal_visible_mode {self.goal_visible_mode} requires fixed mission goals")
 
         # Extract observation shapes from constants
         # These need to be defined in C, since they determine the shape of the arrays
@@ -275,14 +260,9 @@ class Drive(pufferlib.PufferEnv):
         self.max_partner_objects = binding.MAX_AGENTS - 1
         self.partner_features = binding.PARTNER_FEATURES
         self.road_features = binding.ROAD_FEATURES
-        # Navigation waypoints are appended after the road block: ego-frame (x, y, valid) per waypoint for legacy
-        # maps, ego-frame (x, y) for zpufferdrive maps
+        # Navigation waypoints are appended after the road block: ego-frame (x, y) per waypoint
         self.max_waypoints = self.navigation_waypoints if self.navigation else 0
-        self.waypoint_features = (
-            binding.ZNAVI_WAYPOINT_FEATURES
-            if self.map_format == MAP_FORMAT_ZBIN
-            else binding.NAVIGATION_WAYPOINT_FEATURES
-        )
+        self.waypoint_features = binding.ZNAVI_WAYPOINT_FEATURES
 
         str_to_reg_mode = {
             "None": RegMode.NONE,
@@ -405,23 +385,6 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(
                 f"num_maps ({num_maps}) exceeds available maps in directory ({available_maps}). Please reduce num_maps or add more maps to resources/drive/binaries."
             )
-        needs_pid_navigation = "navi_pid" in (
-            self.sdc_controller_str,
-            self.non_sdc_controller_str,
-            self.non_vehicle_controller_str,
-        )
-        if (
-            self.navigation or self.snap_goal_to_navi_endpoint or needs_pid_navigation or self.record_pid_anchor
-        ) and self.map_format == MAP_FORMAT_LEGACY:
-            missing = [i for i in range(num_maps) if not os.path.exists(f"{map_dir}/map_{i:03d}.navi")]
-            if missing:
-                raise FileNotFoundError(
-                    f"navigation, goal snapping, navi_pid, or kl_pid_anchor requires .navi sidecars, but {len(missing)} of {num_maps} maps in "
-                    f"{map_dir} lack one "
-                    f"(first: map_{missing[0]:03d}.navi). Generate them with: "
-                    f"python -m pufferlib.ocean.drive.drive navigation --map-dir {map_dir}"
-                )
-
         # Iterate through all maps to count total agents that can be initialized for each map
         agent_offsets, map_ids, num_envs = binding.shared(
             seed=seed,
@@ -491,9 +454,9 @@ class Drive(pufferlib.PufferEnv):
                 dynamics_model=self._dynamics_model_flag,
                 navigation=self.navigation,
                 snap_goal_to_navi_endpoint=self.snap_goal_to_navi_endpoint,
+                zbin_navigation_source=self.zbin_navigation_source,
                 append_goal_to_navi_lookahead=self.append_goal_to_navi_lookahead,
                 navigation_waypoints=self.navigation_waypoints,
-                navigation_waypoint_spacing=self.navigation_waypoint_spacing,
                 navigation_lookahead_distance=self.navigation_lookahead_distance,
                 navigation_lookahead_norm=self.navigation_lookahead_norm,
                 navi_pid_speed_gain=self.navi_pid_speed_gain,
@@ -628,9 +591,9 @@ class Drive(pufferlib.PufferEnv):
                 async_resets=int(self.async_resets),
                 navigation=self.navigation,
                 snap_goal_to_navi_endpoint=self.snap_goal_to_navi_endpoint,
+                zbin_navigation_source=self.zbin_navigation_source,
                 append_goal_to_navi_lookahead=self.append_goal_to_navi_lookahead,
                 navigation_waypoints=self.navigation_waypoints,
-                navigation_waypoint_spacing=self.navigation_waypoint_spacing,
                 navigation_lookahead_distance=self.navigation_lookahead_distance,
                 navigation_lookahead_norm=self.navigation_lookahead_norm,
                 navi_pid_speed_gain=self.navi_pid_speed_gain,
@@ -1350,20 +1313,41 @@ def analyze_action_space(
         print(f"  dyaw outside ±{bounds}: {n_outliers:,} / {len(arr):,} ({100 * n_outliers / len(arr):.2f}%)")
 
 
-def load_map(map_name, unique_map_id, binary_output=None):
-    """Loads a JSON map and optionally saves it as binary"""
+def navigation_sidecar_path(map_file):
+    """map_XXX.bin -> map_XXX.znavi (the map-intrinsic navigation cache of a legacy map)."""
+    stem, ext = os.path.splitext(str(map_file))
+    return (stem if ext == ".bin" else str(map_file)) + ".znavi"
+
+
+def write_navigation_sidecar(map_file, overwrite=False):
+    """Builds the navigation of a legacy map and writes map_XXX.znavi next to it.
+
+    The sidecar routes every logged object and is bound to the map binary (CRC-32 + size), so it does not depend
+    on the run configuration. zbin maps carry their navigation in Sections 3-4 and are skipped. Returns True when
+    a sidecar was written.
+    """
+    if detect_map_format(map_file) == MAP_FORMAT_ZBIN:
+        return False
+    return binding.write_navigation_sidecar(str(map_file), overwrite)
+
+
+def load_map(map_name, unique_map_id, binary_output=None, navigation=True):
+    """Loads a JSON map and optionally saves it as binary (plus its navigation sidecar)"""
     with open(map_name, "r") as f:
         map_data = json.load(f)
 
     if binary_output:
         save_map_binary(map_data, binary_output, unique_map_id)
+        if navigation:
+            # The binary was just (re)written, so any existing sidecar is stale.
+            write_navigation_sidecar(binary_output, overwrite=True)
 
 
 def _process_single_map(args):
     """Worker function to process a single map file"""
-    i, map_path, binary_path = args
+    i, map_path, binary_path, navigation = args
     try:
-        load_map(str(map_path), i, str(binary_path))
+        load_map(str(map_path), i, str(binary_path), navigation=navigation)
         return (i, map_path.name, True, None)
     except Exception as e:
         return (i, map_path.name, False, str(e))
@@ -1373,6 +1357,7 @@ def process_all_maps(
     data_folder="data/processed/training",
     max_maps=50_000,
     num_workers=None,
+    navigation=True,
 ):
     """Process all maps and save them as binaries using multiprocessing
 
@@ -1380,6 +1365,7 @@ def process_all_maps(
         data_folder: Path to the folder containing JSON map files
         max_maps: Maximum number of maps to process
         num_workers: Number of parallel workers (defaults to cpu_count())
+        navigation: Also write each map's map_XXX.znavi navigation sidecar
     """
     from pathlib import Path
 
@@ -1402,7 +1388,7 @@ def process_all_maps(
     for i, map_path in enumerate(json_files[:max_maps]):
         binary_file = f"map_{i:03d}.bin"
         binary_path = binary_dir / binary_file
-        tasks.append((i, map_path, binary_path))
+        tasks.append((i, map_path, binary_path, navigation))
 
     # Process maps in parallel with progress bar
     with Pool(num_workers) as pool:
@@ -1422,53 +1408,35 @@ def process_all_maps(
 
 
 def _process_single_navigation(args):
-    map_path, max_goals, seed = args
-    from pufferlib.ocean.drive.navigation import process_map_navigation
-
+    map_path, overwrite = args
     try:
-        navi = process_map_navigation(map_path, max_goals=max_goals, seed=seed)
-        return (map_path.name, True, f"lanes={navi['num_lanes']} goals={navi['num_goals']}")
+        return (map_path.name, write_navigation_sidecar(map_path, overwrite), None)
     except Exception as e:
-        return (map_path.name, False, f"{type(e).__name__}: {e}")
+        return (map_path.name, False, str(e))
 
 
-def process_all_navigation(
-    map_dir="resources/drive/binaries/training",
-    num_workers=None,
-    overwrite=False,
-    max_goals=64,
-    seed=42,
-):
-    """Open every map_XXX.bin in map_dir and write its lane-navigation sidecar map_XXX.navi next to it.
-
-    Returns the number of maps that failed.
-    """
+def process_all_navigation(map_dir, num_workers=None, overwrite=False):
+    """Writes the map_XXX.znavi navigation sidecar of every legacy map_*.bin in map_dir (zbin maps are skipped)."""
     from pathlib import Path
-    from pufferlib.ocean.drive.navigation import NAVI_MAX_GOALS, navigation_path_for
 
-    if not 1 <= max_goals <= NAVI_MAX_GOALS:
-        raise ValueError(f"max_goals must be in [1, {NAVI_MAX_GOALS}]. Got: {max_goals}")
-    map_paths = sorted(Path(map_dir).glob("map_*.bin"))
-    if not map_paths:
-        raise FileNotFoundError(f"No map_*.bin files in {map_dir}")
-    tasks = [(p, max_goals, seed) for p in map_paths if overwrite or not navigation_path_for(p).exists()]
-    skipped = len(map_paths) - len(tasks)
-
+    map_files = [p for p in sorted(Path(map_dir).glob("map_*.bin")) if detect_map_format(p) != MAP_FORMAT_ZBIN]
+    if not map_files:
+        print(f"No legacy map_*.bin files in {map_dir}")
+        return
     with Pool(num_workers or cpu_count()) as pool:
         results = list(
             tqdm(
-                pool.imap_unordered(_process_single_navigation, tasks),
-                total=len(tasks),
-                desc="Building navigation",
+                pool.imap(_process_single_navigation, [(p, overwrite) for p in map_files]),
+                total=len(map_files),
+                desc="Writing navigation sidecars",
                 unit="map",
             )
         )
-
-    failures = [(name, message) for name, success, message in results if not success]
-    print(f"Navigation: {len(results) - len(failures)} written, {len(failures)} failed, {skipped} skipped (existing)")
-    for name, message in failures:
-        print(f"  {name}: {message}")
-    return len(failures)
+    written = sum(1 for _, ok, _ in results if ok)
+    failed = [(name, error) for name, _, error in results if error is not None]
+    print(f"Wrote {written}, skipped {len(results) - written - len(failed)} existing, failed {len(failed)}")
+    for name, error in failed:
+        print(f"  {name}: {error}")
 
 
 def test_performance(timeout=10, atn_cache=12, num_agents=12):
@@ -1515,32 +1483,31 @@ def test_performance(timeout=10, atn_cache=12, num_agents=12):
 
 if __name__ == "__main__":
     import argparse
-    import sys
 
     parser = argparse.ArgumentParser(description="PufferDrive map processing")
     subparsers = parser.add_subparsers(dest="command")
     maps_parser = subparsers.add_parser("maps", help="Convert JSON scenarios to map_XXX.bin (default)")
     maps_parser.add_argument("--data-folder", default="data/processed/training")
-    navi_parser = subparsers.add_parser("navigation", help="Write map_XXX.navi lane-navigation sidecars")
-    navi_parser.add_argument("--map-dir", default="resources/drive/binaries/training")
+    maps_parser.add_argument(
+        "--no-navigation", action="store_true", help="Do not write the map_XXX.znavi navigation sidecars"
+    )
+    navi_parser = subparsers.add_parser(
+        "navigation", help="Write map_XXX.znavi navigation sidecars for the legacy map_XXX.bin files of a directory"
+    )
+    navi_parser.add_argument("--map-dir", required=True)
     navi_parser.add_argument("--workers", type=int, default=None)
-    navi_parser.add_argument("--max-goals", type=int, default=64)
-    navi_parser.add_argument("--seed", type=int, default=42)
-    navi_parser.add_argument("--overwrite", action="store_true", help="Rebuild sidecars that already exist")
+    navi_parser.add_argument("--overwrite", action="store_true", help="Rewrite existing sidecars")
     cli_args = parser.parse_args()
 
     if cli_args.command == "navigation":
-        failed_count = process_all_navigation(
-            map_dir=cli_args.map_dir,
-            num_workers=cli_args.workers,
-            overwrite=cli_args.overwrite,
-            max_goals=cli_args.max_goals,
-            seed=cli_args.seed,
-        )
-        sys.exit(1 if failed_count else 0)
+        process_all_navigation(cli_args.map_dir, num_workers=cli_args.workers, overwrite=cli_args.overwrite)
+        raise SystemExit(0)
     # test_performance()
     # Process the train dataset
-    process_all_maps(data_folder=getattr(cli_args, "data_folder", "data/processed/training"))
+    process_all_maps(
+        data_folder=getattr(cli_args, "data_folder", "data/processed/training"),
+        navigation=not getattr(cli_args, "no_navigation", False),
+    )
     # Process the validation/test dataset
     # process_all_maps(data_folder="data/processed/validation")
     # # Process the validation_interactive dataset

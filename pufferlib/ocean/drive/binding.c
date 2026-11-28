@@ -7,9 +7,26 @@
 static PyObject *py_gui_take_map_request(PyObject *self, PyObject *args) {
     return PyLong_FromLong(gui_take_map_request());
 }
+static PyObject *py_write_navigation_sidecar(PyObject *self, PyObject *args) {
+    const char *map_file;
+    int overwrite = 0;
+    if (!PyArg_ParseTuple(args, "s|p", &map_file, &overwrite))
+        return NULL;
+    int result;
+    Py_BEGIN_ALLOW_THREADS result = write_znavigation_sidecar(map_file, overwrite);
+    Py_END_ALLOW_THREADS if (result < 0) {
+        PyErr_Format(PyExc_OSError, "could not write the navigation sidecar of %s", map_file);
+        return NULL;
+    }
+    return PyBool_FromLong(result);
+}
 #define MY_METHODS                                                                                                     \
     {"gui_take_map_request", py_gui_take_map_request, METH_NOARGS,                                                     \
-     "Pop the interactive viewer's pending map change (-1 previous, +1 next, 0 none)"}
+     "Pop the interactive viewer's pending map change (-1 previous, +1 next, 0 none)"},                                \
+        {"write_navigation_sidecar", py_write_navigation_sidecar, METH_VARARGS,                                        \
+         "write_navigation_sidecar(map_file, overwrite=False) -> bool: write the map-intrinsic map_XXX.znavi of a "    \
+         "legacy "                                                                                                     \
+         "map; returns False when it exists and overwrite is False"}
 #include "../env_binding.h"
 
 static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
@@ -208,7 +225,6 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->ini_file = unpack_str(kwargs, "ini_file");
     env_init_config conf = {0};
     conf.navigation_waypoints = NAVI_DEFAULT_WAYPOINTS;
-    conf.navigation_waypoint_spacing = NAVI_DEFAULT_WAYPOINT_SPACING_M;
     conf.navigation_lookahead_distance = ZNAVI_DEFAULT_LOOKAHEAD_DISTANCE;
     conf.navigation_lookahead_norm = ZNAVI_DEFAULT_LOOKAHEAD_NORM;
     conf.navi_pid_speed_gain = 1.0f;
@@ -271,9 +287,9 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_INT(async_resets);
     OVERRIDE_INT(navigation);
     OVERRIDE_INT(snap_goal_to_navi_endpoint);
+    OVERRIDE_INT(zbin_navigation_source);
     OVERRIDE_INT(append_goal_to_navi_lookahead);
     OVERRIDE_INT(navigation_waypoints);
-    OVERRIDE_FLOAT(navigation_waypoint_spacing);
     OVERRIDE_FLOAT(navigation_lookahead_distance);
     OVERRIDE_FLOAT(navigation_lookahead_norm);
     OVERRIDE_FLOAT(navi_pid_speed_gain);
@@ -321,28 +337,18 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     int map_id = unpack(kwargs, "map_id");
     char map_file[512];
     snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
-    int zbin = drive_map_format(map_file) == MAP_FORMAT_ZBIN;
     if (conf.append_goal_to_navi_lookahead != 0 && conf.append_goal_to_navi_lookahead != 1) {
         PyErr_SetString(PyExc_ValueError, "append_goal_to_navi_lookahead must be 0 or 1");
         return -1;
     }
-    if (conf.append_goal_to_navi_lookahead && !zbin) {
-        PyErr_SetString(PyExc_ValueError, "append_goal_to_navi_lookahead requires zbin maps");
+    if (conf.navigation &&
+        (conf.navigation_waypoints < 1 || conf.navigation_waypoints > ZNAVI_LOOKAHEAD_WAYPOINTS_MAX)) {
+        PyErr_Format(PyExc_ValueError, "navigation_waypoints must be in [1, %d], got %d", ZNAVI_LOOKAHEAD_WAYPOINTS_MAX,
+                     conf.navigation_waypoints);
         return -1;
     }
-    int max_waypoints = zbin ? ZNAVI_LOOKAHEAD_WAYPOINTS_MAX : NAVI_MAX_WAYPOINTS;
-    if (conf.navigation && (conf.navigation_waypoints < 1 || conf.navigation_waypoints > max_waypoints)) {
-        PyErr_Format(PyExc_ValueError, "navigation_waypoints must be in [1, %d] for %s maps, got %d", max_waypoints,
-                     zbin ? "zpufferdrive" : "legacy", conf.navigation_waypoints);
-        return -1;
-    }
-    if (conf.navigation && !zbin && !(conf.navigation_waypoint_spacing > 0.0f)) {
-        PyErr_SetString(PyExc_ValueError, "navigation_waypoint_spacing must be > 0");
-        return -1;
-    }
-    if (conf.navigation && zbin &&
-        !(conf.navigation_lookahead_distance > 0.0f &&
-          conf.navigation_lookahead_distance <= conf.navigation_lookahead_norm)) {
+    if (conf.navigation && !(conf.navigation_lookahead_distance > 0.0f &&
+                             conf.navigation_lookahead_distance <= conf.navigation_lookahead_norm)) {
         PyErr_Format(PyExc_ValueError,
                      "zpufferdrive navigation needs 0 < navigation_lookahead_distance <= navigation_lookahead_norm, "
                      "got %g and %g",
@@ -353,13 +359,17 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyErr_SetString(PyExc_ValueError, "goal_obs_dropout_prob must be in [0, 1]");
         return -1;
     }
-    if (!(conf.goal_visible_mode == 0 || conf.goal_visible_mode == 1 || conf.goal_visible_mode ==2)) {
+    if (!(conf.goal_visible_mode == 0 || conf.goal_visible_mode == 1 || conf.goal_visible_mode == 2)) {
 
         PyErr_SetString(PyExc_ValueError, "goal_visible_mode must be (0, 1, or 2)");
         return -1;
     }
     if (conf.snap_goal_to_navi_endpoint != 0 && conf.snap_goal_to_navi_endpoint != 1) {
         PyErr_SetString(PyExc_ValueError, "snap_goal_to_navi_endpoint must be 0 or 1");
+        return -1;
+    }
+    if (conf.zbin_navigation_source != 0 && conf.zbin_navigation_source != 1) {
+        PyErr_SetString(PyExc_ValueError, "zbin_navigation_source must be 0 or 1");
         return -1;
     }
     if (!(isfinite(conf.navi_pid_speed_gain) && conf.navi_pid_speed_gain >= 0.0f &&
@@ -379,7 +389,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyErr_SetString(PyExc_ValueError, "navi_pid_default_speed must be finite and > 0");
         return -1;
     }
-    if (!(conf.navi_pid_speed_lookahead_distance >= 0.0f && conf.navi_pid_speed_lookahead_distance <= PID_ROUTE_DISTANCE)) {
+    if (!(conf.navi_pid_speed_lookahead_distance >= 0.0f &&
+          conf.navi_pid_speed_lookahead_distance <= PID_ROUTE_DISTANCE)) {
         PyErr_Format(PyExc_ValueError, "navi_pid_speed_lookahead_distance must be in [0, %d]", (int)PID_ROUTE_DISTANCE);
         return -1;
     }
@@ -391,9 +402,9 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         return -1;
     }
     env->snap_goal_to_navi_endpoint = conf.snap_goal_to_navi_endpoint;
+    env->zbin_navigation_source = conf.zbin_navigation_source;
     env->append_goal_to_navi_lookahead = conf.append_goal_to_navi_lookahead;
     env->navigation_waypoints = conf.navigation_waypoints;
-    env->navigation_waypoint_spacing = conf.navigation_waypoint_spacing;
     env->navigation_lookahead_distance = conf.navigation_lookahead_distance;
     env->navigation_lookahead_norm = conf.navigation_lookahead_norm;
     env->navi_pid_speed_gain = conf.navi_pid_speed_gain;

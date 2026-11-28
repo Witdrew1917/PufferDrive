@@ -4,6 +4,12 @@
 // ZNavigation following zdrive's non-expert navigation, with lane candidates ranked by the projected route sample.
 // Ports cite the zpufferdrive source they mirror (paths relative to zpufferdrive/ocean/zdrive/).
 // Included from drive.h right after struct Drive.
+//
+// ZNavigation is used for every map. Legacy maps always build it at load time from the road entities
+// (build_znavigation, see znavi_build.h); zbin maps read Sections 3-4 unless Drive.zbin_navigation_source = 1
+// requests building instead.
+
+#include "znavi_build.h"
 
 #define MAP_FORMAT_LEGACY 0
 #define MAP_FORMAT_ZBIN 1
@@ -322,6 +328,7 @@ Entity *load_zbin_map(const char *filename, Drive *env) {
         zbin_read(&num_waypoints, sizeof(int), 1, file, filename);
         zbin_check_range(filename, "num_waypoints", num_waypoints, 1, ZBIN_MAX_WAYPOINTS_PER_ROAD);
         road->type = zbin_remap_road_type(type);
+        road->road_solid_line = type == 6;
         if (road->type == -1) {
             zbin_check_range(filename, "road type", type, 4, 11);
         }
@@ -863,6 +870,476 @@ ZNavigation *load_znavigation(Drive *env) {
     return zn;
 }
 
+#define ZBIN_NAVI_SOLID_LINE_TYPE (DRIVEWAY + 1)
+// Logged goals are localized to every lane sub-line within this radius (zpufferdrive snap_goals=False), so the route
+// ends on whichever nearby lane is reachable instead of the closest one.
+#define ZBIN_NAVI_GOAL_SET_RADIUS 4.0
+#define ZBIN_NAVI_DEFAULT_SPEED_LIMIT (50.0f / 3.6f)
+
+// Inputs of build_znavigation gathered from the Drive entities (znavi_build.h plain arrays).
+typedef struct {
+    ZNaviMapInput map;
+    ZNaviAgentInput agents;
+    ZNaviBuildConfig cfg;
+    int *offset;
+    float *px, *py, *speed;
+    int *type;
+    ZNaviRole role[ZBIN_NAVI_SOLID_LINE_TYPE + 1];
+    unsigned char crossable[ZBIN_NAVI_SOLID_LINE_TYPE + 1];
+    int num_agents;
+    int *agent_entity; // [num_agents] entity index of each routed agent
+    float *agent_data;
+} ZnaviBuildInput;
+
+// zlib-compatible CRC-32 and byte size of a file. Returns 0 on success.
+static int zbin_file_crc32(const char *path, uint32_t *crc_out, uint64_t *size_out) {
+    uint32_t table[256];
+    for (uint32_t b = 0; b < 256; b++) {
+        uint32_t c = b;
+        for (int k = 0; k < 8; k++)
+            c = (c & 1u) ? (c >> 1) ^ 0xEDB88320u : c >> 1;
+        table[b] = c;
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL)
+        return -1;
+    unsigned char chunk[1 << 16];
+    uint32_t crc = 0xFFFFFFFFu;
+    uint64_t size = 0;
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), file)) > 0) {
+        for (size_t i = 0; i < n; i++)
+            crc = table[(crc ^ chunk[i]) & 0xFFu] ^ (crc >> 8);
+        size += n;
+    }
+    int error = ferror(file);
+    fclose(file);
+    if (error)
+        return -1;
+    *crc_out = crc ^ 0xFFFFFFFFu;
+    *size_out = size;
+    return 0;
+}
+
+// Legacy maps carry no lane speed limits; default them like zpufferdrive's load_map (50 km/h) so sub-line steps,
+// feasibility observations and navi_pid speeds match the zbin path.
+static void znavi_default_legacy_speed_limits(Drive *env) {
+    if (env->map_format == MAP_FORMAT_ZBIN)
+        return;
+    Entity *roads = &env->entities[env->num_objects];
+    for (int i = 0; i < env->num_roads; i++)
+        if (roads[i].type == ROAD_LANE && !(roads[i].road_speed_limit > 0.0f))
+            roads[i].road_speed_limit = ZBIN_NAVI_DEFAULT_SPEED_LIMIT;
+}
+
+// Gathers the builder inputs. The seed derives from the map content, so the tables do not depend on the map path.
+// Legacy lanes without a speed limit get the zpufferdrive default (also used by navi_pid and the observations).
+// `all_objects` routes every object with a valid sample (map-intrinsic, for sidecars) instead of the loaded agents.
+static void znavi_gather_build_input(Drive *env, uint32_t map_crc, int all_objects, ZnaviBuildInput *b) {
+    memset(b, 0, sizeof(*b));
+    Entity *roads = &env->entities[env->num_objects];
+    int num_roads = env->num_roads;
+    znavi_default_legacy_speed_limits(env);
+    b->offset = (int *)zbin_alloc(num_roads + 1, sizeof(int));
+    for (int i = 0; i < num_roads; i++)
+        b->offset[i + 1] = b->offset[i] + roads[i].array_size;
+    b->px = (float *)zbin_alloc(b->offset[num_roads], sizeof(float));
+    b->py = (float *)zbin_alloc(b->offset[num_roads], sizeof(float));
+    b->type = (int *)zbin_alloc(num_roads, sizeof(int));
+    b->speed = (float *)zbin_alloc(num_roads, sizeof(float));
+    for (int i = 0; i < num_roads; i++) {
+        memcpy(b->px + b->offset[i], roads[i].traj_x, roads[i].array_size * sizeof(float));
+        memcpy(b->py + b->offset[i], roads[i].traj_y, roads[i].array_size * sizeof(float));
+        b->type[i] = roads[i].road_solid_line ? ZBIN_NAVI_SOLID_LINE_TYPE : roads[i].type;
+        b->speed[i] = roads[i].road_speed_limit;
+    }
+    // PufferDrive road types, plus a builder-only type for zbin solid lines (non-crossable lane markers).
+    b->role[ROAD_LANE] = ZNB_ROLE_LANE;
+    b->role[ROAD_LINE] = ZNB_ROLE_MARKER;
+    b->role[ROAD_EDGE] = ZNB_ROLE_EDGE;
+    b->role[ZBIN_NAVI_SOLID_LINE_TYPE] = ZNB_ROLE_MARKER;
+    b->crossable[ROAD_LINE] = 1;
+    ZNaviMapInput map = {num_roads, b->offset,   b->px, b->py, b->type, b->speed, ZBIN_NAVI_SOLID_LINE_TYPE + 1,
+                         b->role,   b->crossable};
+    b->map = map;
+
+    // Agents that follow a route: active agents and navigation-PID static agents (or every valid object).
+    int num_agents = 0;
+    if (all_objects) {
+        b->agent_entity = (int *)zbin_alloc(env->num_objects + 1, sizeof(int));
+        for (int i = 0; i < env->num_objects; i++) {
+            const Entity *e = &env->entities[i];
+            for (int t = 0; t < e->array_size; t++)
+                if (e->traj_valid[t]) {
+                    b->agent_entity[num_agents++] = i;
+                    break;
+                }
+        }
+    } else {
+        b->agent_entity = (int *)zbin_alloc(env->active_agent_count + env->static_agent_count + 1, sizeof(int));
+        for (int i = 0; i < env->active_agent_count; i++)
+            b->agent_entity[num_agents++] = env->active_agent_indices[i];
+        for (int i = 0; i < env->static_agent_count; i++)
+            if (env->entities[env->static_agent_indices[i]].controller == CONTROLLER_NAVI_PID)
+                b->agent_entity[num_agents++] = env->static_agent_indices[i];
+    }
+    b->num_agents = num_agents;
+    b->agent_data = (float *)zbin_alloc((size_t)num_agents * 9 + 1, sizeof(float));
+    float *ax = b->agent_data, *ay = ax + num_agents, *ah = ay + num_agents, *fx = ah + num_agents;
+    float *fy = fx + num_agents, *fh = fy + num_agents, *alen = fh + num_agents, *gx = alen + num_agents;
+    float *gy = gx + num_agents;
+    for (int a = 0; a < num_agents; a++) {
+        const Entity *e = &env->entities[b->agent_entity[a]];
+        int first = -1, last = -1;
+        for (int t = 0; t < e->array_size; t++)
+            if (e->traj_valid[t]) {
+                if (first < 0)
+                    first = t;
+                last = t;
+            }
+        ax[a] = ay[a] = ah[a] = fx[a] = fy[a] = fh[a] = NAN;
+        if (first >= 0) {
+            ax[a] = e->traj_x[first];
+            ay[a] = e->traj_y[first];
+            ah[a] = e->traj_heading[first];
+            fx[a] = e->traj_x[last];
+            fy[a] = e->traj_y[last];
+            fh[a] = e->traj_heading[last];
+        }
+        alen[a] = e->length;
+        gx[a] = e->goal_position_x;
+        gy[a] = e->goal_position_y;
+    }
+    ZNaviAgentInput agents = {num_agents, ax, ay, ah, fx, fy, fh, alen, gx, gy};
+    b->agents = agents;
+
+    ZNaviBuildConfig cfg = znavi_default_config();
+    cfg.seed = 0x9E3779B97F4A7C15ULL ^ map_crc;
+    cfg.snap_goals = 0;
+    cfg.goal_set_radius = ZBIN_NAVI_GOAL_SET_RADIUS;
+    // Bound num_goals * num_lines like the zbin loader (one line per lane segment).
+    int num_lines_bound = 0;
+    for (int i = 0; i < num_roads; i++)
+        if (roads[i].type == ROAD_LANE && roads[i].array_size >= 2)
+            num_lines_bound += roads[i].array_size - 1;
+    cfg.max_goals = ZBIN_MAX_GOALS;
+    if (num_lines_bound > 0 && cfg.max_goals > ZBIN_MAX_NAVI_ENTITIES / num_lines_bound)
+        cfg.max_goals = ZBIN_MAX_NAVI_ENTITIES / num_lines_bound;
+    b->cfg = cfg;
+}
+
+static void znavi_free_build_input(ZnaviBuildInput *b) {
+    free(b->offset);
+    free(b->px);
+    free(b->py);
+    free(b->type);
+    free(b->speed);
+    free(b->agent_entity);
+    free(b->agent_data);
+}
+
+// Allocates a ZNavigation for the given lines (lane `line_road[l]`, segment `line_segment[l]`, `line_num_sub[l]`
+// samples) and fills the line geometry and the road -> navi entity tables; the per-sample tables stay zeroed.
+static ZNavigation *znavi_alloc_navigation(Drive *env, int num_lines, int num_goals, const int *line_road,
+                                           const int *line_segment, const int *line_num_sub) {
+    const Entity *roads = &env->entities[env->num_objects];
+    int num_roads = env->num_roads;
+    ZNavigation *zn = (ZNavigation *)zbin_alloc(1, sizeof(ZNavigation));
+    zn->num_roads = num_roads;
+    zn->num_lines = num_lines;
+    zn->num_goals = num_goals;
+    zn->total = num_goals * num_lines;
+    zn->line_road = (int *)zbin_alloc(num_lines + 1, sizeof(int));
+    zn->line_num_points = (int *)zbin_alloc(num_lines + 1, sizeof(int));
+    zn->line_sample_offset = (int *)zbin_alloc(num_lines + 1, sizeof(int));
+    zn->line_x_start = (float *)zbin_alloc(num_lines + 1, sizeof(float));
+    zn->line_y_start = (float *)zbin_alloc(num_lines + 1, sizeof(float));
+    zn->line_x_end = (float *)zbin_alloc(num_lines + 1, sizeof(float));
+    zn->line_y_end = (float *)zbin_alloc(num_lines + 1, sizeof(float));
+    int samples = 0;
+    for (int l = 0; l < num_lines; l++) {
+        int road = line_road[l], k = line_segment[l];
+        const Entity *lane = &roads[road];
+        zn->line_road[l] = road;
+        zn->line_num_points[l] = line_num_sub[l] + 1;
+        zn->line_sample_offset[l] = samples;
+        samples += line_num_sub[l];
+        zn->line_x_start[l] = lane->traj_x[k];
+        zn->line_y_start[l] = lane->traj_y[k];
+        zn->line_x_end[l] = lane->traj_x[k + 1];
+        zn->line_y_end[l] = lane->traj_y[k + 1];
+    }
+    zn->samples_per_goal = samples;
+    size_t sample_count = (size_t)num_goals * samples + 1;
+    zn->next_entity = (int *)zbin_alloc(sample_count, sizeof(int));
+    zn->next_point = (int *)zbin_alloc(sample_count, sizeof(int));
+    zn->feasibility_left = (float *)zbin_alloc(sample_count, sizeof(float));
+    zn->feasibility_center = (float *)zbin_alloc(sample_count, sizeof(float));
+    zn->feasibility_right = (float *)zbin_alloc(sample_count, sizeof(float));
+    zn->distance_to_goal = (float *)zbin_alloc(sample_count, sizeof(float));
+    zn->road_navi_entity_idx = (int **)zbin_alloc(num_roads + 1, sizeof(int *));
+    for (int i = 0; i < num_roads; i++) {
+        if (roads[i].type != ROAD_LANE || roads[i].array_size < 2)
+            continue;
+        size_t table_size = (size_t)num_goals * (roads[i].array_size - 1);
+        zn->road_navi_entity_idx[i] = (int *)zbin_alloc(table_size + 1, sizeof(int));
+        memset(zn->road_navi_entity_idx[i], -1, table_size * sizeof(int));
+    }
+    for (int l = 0; l < num_lines; l++) {
+        int road = line_road[l];
+        int num_segments = roads[road].array_size - 1;
+        for (int g = 0; g < num_goals; g++)
+            zn->road_navi_entity_idx[road][(size_t)line_segment[l] + (size_t)g * num_segments] = g * num_lines + l;
+    }
+    return zn;
+}
+
+static void znavi_set_agent_goals(Drive *env, const ZnaviBuildInput *b, const int *agent_goal) {
+    for (int i = 0; i < env->num_entities; i++)
+        env->entities[i].zdrive_goal_index = -1;
+    for (int a = 0; a < b->num_agents; a++)
+        env->entities[b->agent_entity[a]].zdrive_goal_index = agent_goal[a];
+}
+
+// Runs znavi_build on gathered inputs and converts its tables to a ZNavigation (without the lookup grid). When
+// `segments_out` is not NULL it receives the lane segment of each line (caller frees).
+static ZNavigation *znavi_build_from_input(Drive *env, ZnaviBuildInput *b, int **segments_out) {
+    ZNaviTables t;
+    znavi_build(&b->map, &b->agents, &b->cfg, &t);
+    int num_lines = t.num_lines, num_goals = t.num_goals, S = t.num_samples;
+    ZNavigation *zn =
+        znavi_alloc_navigation(env, num_lines, num_goals, t.line_polyline, t.line_segment, t.line_num_sub);
+    for (int g = 0; g < num_goals; g++)
+        for (int s = 0; s < S; s++) {
+            size_t i = (size_t)g * S + s;
+            int next = t.next_sample[i];
+            zn->next_entity[i] = next < 0 ? -1 : g * num_lines + t.sample_line[next];
+            zn->next_point[i] = next < 0 ? -1 : t.sample_index[next];
+            zn->feasibility_left[i] = fmin(ZNAVI_MAX_LANE_FEASIBILITY, t.feasibility_left[i]);
+            zn->feasibility_center[i] = fmin(ZNAVI_MAX_LANE_FEASIBILITY, t.feasibility_center[i]);
+            zn->feasibility_right[i] = fmin(ZNAVI_MAX_LANE_FEASIBILITY, t.feasibility_right[i]);
+            zn->distance_to_goal[i] = t.distance_to_goal[i];
+        }
+    znavi_set_agent_goals(env, b, t.agent_goal);
+    if (segments_out != NULL) {
+        *segments_out = (int *)zbin_alloc(num_lines + 1, sizeof(int));
+        memcpy(*segments_out, t.line_segment, (size_t)num_lines * sizeof(int));
+    }
+    znavi_tables_free(&t);
+    return zn;
+}
+
+// Builds the ZNavigation from the road entities (znavi_build.h) instead of reading Sections 3-4, and assigns the
+// agents' zdrive_goal_index. Expects centred coordinates (after zbin_set_means).
+ZNavigation *build_znavigation(Drive *env) {
+    uint32_t crc = 0;
+    uint64_t size = 0;
+    if (zbin_file_crc32(env->map_name, &crc, &size) != 0)
+        RAISE_FILE_ERROR(env->map_name);
+    ZnaviBuildInput b;
+    znavi_gather_build_input(env, crc, 0, &b);
+    ZNavigation *zn = znavi_build_from_input(env, &b, NULL);
+    znavi_free_build_input(&b);
+    znavi_build_grid(env, zn);
+    return zn;
+}
+
+// --- map_XXX.znavi sidecar: a cache of the map-intrinsic navigation of a legacy map ---------------------------------
+// The sidecar belongs to the map binary, not to a run: it routes every object with a valid sample (inputs taken
+// right after load_map_binary + set_means) and is bound to the map by its CRC-32 and size only. Runs then use the
+// goal of each object they control. Little-endian layout:
+//   char magic[4] "ZNAV", int32 version, uint32 map crc32, uint64 map size,
+//   int32 num_roads, num_objects, num_lines, num_goals, samples_per_goal,
+//   int32 line_road[num_lines], line_segment[num_lines], line_num_sub[num_lines], object_goal[num_objects],
+//   int32 next_entity[G*S], next_point[G*S], float32 feasibility_left/center/right[G*S], distance_to_goal[G*S]
+#define ZNAVI_SIDECAR_SUFFIX ".znavi"
+#define ZNAVI_SIDECAR_VERSION 1
+#define ZNAVI_SIDECAR_REGENERATE_HINT "python -m pufferlib.ocean.drive.drive navigation --map-dir <map_dir> --overwrite"
+
+static char *znavi_sidecar_path(const char *map_name) {
+    size_t n = strlen(map_name);
+    size_t stem = n >= 4 && strcmp(map_name + n - 4, ".bin") == 0 ? n - 4 : n;
+    size_t length = stem + strlen(ZNAVI_SIDECAR_SUFFIX) + 1;
+    char *path = (char *)zbin_alloc(length, 1);
+    snprintf(path, length, "%.*s%s", (int)stem, map_name, ZNAVI_SIDECAR_SUFFIX);
+    return path;
+}
+
+static int znavi_write_all(FILE *f, const void *data, size_t size, size_t count) {
+    return count == 0 || fwrite(data, size, count, f) == count;
+}
+
+// Writes atomically (temporary file + rename); returns 0 on success.
+static int znavi_write_sidecar(const Drive *env, const char *path, uint32_t crc, uint64_t size, const ZNavigation *zn,
+                               const int *line_segment) {
+    size_t tmp_length = strlen(path) + 32;
+    char *tmp = (char *)zbin_alloc(tmp_length, 1);
+    snprintf(tmp, tmp_length, "%s.tmp.%ld", path, (long)getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (f == NULL) {
+        free(tmp);
+        return -1;
+    }
+    int nl = zn->num_lines, ng = zn->num_goals, no = env->num_objects;
+    size_t gs = (size_t)ng * zn->samples_per_goal;
+    int *num_sub = (int *)zbin_alloc(nl + 1, sizeof(int));
+    int *goals = (int *)zbin_alloc(no + 1, sizeof(int));
+    for (int l = 0; l < nl; l++)
+        num_sub[l] = zn->line_num_points[l] - 1;
+    for (int i = 0; i < no; i++)
+        goals[i] = env->entities[i].zdrive_goal_index;
+    int32_t version = ZNAVI_SIDECAR_VERSION;
+    int32_t counts[5] = {zn->num_roads, no, nl, ng, zn->samples_per_goal};
+    int ok = fwrite("ZNAV", 1, 4, f) == 4 && znavi_write_all(f, &version, sizeof(version), 1) &&
+             znavi_write_all(f, &crc, sizeof(crc), 1) && znavi_write_all(f, &size, sizeof(size), 1) &&
+             znavi_write_all(f, counts, sizeof(int32_t), 5) && znavi_write_all(f, zn->line_road, sizeof(int), nl) &&
+             znavi_write_all(f, line_segment, sizeof(int), nl) && znavi_write_all(f, num_sub, sizeof(int), nl) &&
+             znavi_write_all(f, goals, sizeof(int), no) && znavi_write_all(f, zn->next_entity, sizeof(int), gs) &&
+             znavi_write_all(f, zn->next_point, sizeof(int), gs) &&
+             znavi_write_all(f, zn->feasibility_left, sizeof(float), gs) &&
+             znavi_write_all(f, zn->feasibility_center, sizeof(float), gs) &&
+             znavi_write_all(f, zn->feasibility_right, sizeof(float), gs) &&
+             znavi_write_all(f, zn->distance_to_goal, sizeof(float), gs);
+    ok = (fclose(f) == 0) && ok;
+    ok = ok && rename(tmp, path) == 0;
+    if (!ok)
+        remove(tmp);
+    free(goals);
+    free(num_sub);
+    free(tmp);
+    return ok ? 0 : -1;
+}
+
+static int znavi_read_ints(FILE *f, int *dst, size_t n) { return n == 0 || fread(dst, sizeof(int), n, f) == n; }
+static int znavi_read_floats(FILE *f, float *dst, size_t n) { return n == 0 || fread(dst, sizeof(float), n, f) == n; }
+
+// Reads and validates a sidecar against the loaded map. Returns NULL and sets *error on any mismatch.
+static ZNavigation *znavi_read_sidecar(Drive *env, FILE *f, uint32_t crc, uint64_t size, const char **error) {
+    char magic[4];
+    int32_t version;
+    uint32_t file_crc;
+    uint64_t file_size;
+    int32_t counts[5];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "ZNAV", 4) != 0 || fread(&version, sizeof(version), 1, f) != 1) {
+        *error = "not a .znavi file";
+        return NULL;
+    }
+    if (version != ZNAVI_SIDECAR_VERSION) {
+        *error = "unsupported version";
+        return NULL;
+    }
+    if (fread(&file_crc, sizeof(file_crc), 1, f) != 1 || fread(&file_size, sizeof(file_size), 1, f) != 1 ||
+        fread(counts, sizeof(int32_t), 5, f) != 5) {
+        *error = "truncated header";
+        return NULL;
+    }
+    if (file_crc != crc || file_size != size) {
+        *error = "map fingerprint mismatch (the map binary changed)";
+        return NULL;
+    }
+    int num_roads = counts[0], no = counts[1], nl = counts[2], ng = counts[3], S = counts[4];
+    if (num_roads != env->num_roads || no != env->num_objects || nl < 0 || nl > ZBIN_MAX_NAVI_LINES || ng < 0 ||
+        ng > ZBIN_MAX_GOALS || S < 0 || (nl > 0 && ng > ZBIN_MAX_NAVI_ENTITIES / nl)) {
+        *error = "invalid counts";
+        return NULL;
+    }
+    int *lines = (int *)zbin_alloc((size_t)3 * nl + 1, sizeof(int));
+    int *goals = (int *)zbin_alloc((size_t)no + 1, sizeof(int));
+    int *line_road = lines, *line_segment = lines + nl, *line_num_sub = lines + 2 * nl;
+    ZNavigation *zn = NULL;
+    *error = NULL;
+    if (!znavi_read_ints(f, lines, (size_t)3 * nl) || !znavi_read_ints(f, goals, (size_t)no))
+        *error = "truncated body";
+    long total_sub = 0;
+    for (int l = 0; *error == NULL && l < nl; l++) {
+        int road = line_road[l];
+        if (road < 0 || road >= env->num_roads || env->entities[env->num_objects + road].type != ROAD_LANE ||
+            line_segment[l] < 0 || line_segment[l] > env->entities[env->num_objects + road].array_size - 2 ||
+            line_num_sub[l] < 1 || line_num_sub[l] > ZBIN_MAX_SUB_LINES)
+            *error = "invalid line";
+        total_sub += line_num_sub[l];
+    }
+    if (*error == NULL && total_sub != S)
+        *error = "samples_per_goal does not match the lines";
+    for (int i = 0; *error == NULL && i < no; i++)
+        if (goals[i] < -1 || goals[i] >= ng)
+            *error = "invalid object goal";
+    if (*error == NULL) {
+        zn = znavi_alloc_navigation(env, nl, ng, line_road, line_segment, line_num_sub);
+        size_t gs = (size_t)ng * S;
+        if (!znavi_read_ints(f, zn->next_entity, gs) || !znavi_read_ints(f, zn->next_point, gs) ||
+            !znavi_read_floats(f, zn->feasibility_left, gs) || !znavi_read_floats(f, zn->feasibility_center, gs) ||
+            !znavi_read_floats(f, zn->feasibility_right, gs) || !znavi_read_floats(f, zn->distance_to_goal, gs))
+            *error = "truncated tables";
+        else if (fgetc(f) != EOF)
+            *error = "trailing bytes";
+        for (size_t i = 0; *error == NULL && i < gs; i++) {
+            int next = zn->next_entity[i];
+            if (next == -1 && zn->next_point[i] == -1)
+                continue;
+            if (next < 0 || next >= zn->total || zn->next_point[i] < 0 ||
+                zn->next_point[i] >= zn->line_num_points[next % nl] - 1)
+                *error = "invalid next hop";
+        }
+    }
+    if (*error == NULL) {
+        for (int i = 0; i < env->num_entities; i++)
+            env->entities[i].zdrive_goal_index = i < no ? goals[i] : -1;
+    } else if (zn != NULL) {
+        free_znavigation(zn);
+        zn = NULL;
+    }
+    free(lines);
+    free(goals);
+    return zn;
+}
+
+// Builds the map-intrinsic navigation (every valid object routed) and writes it to `path`. Expects the env right
+// after load_map_binary + set_means. Returns the navigation (without the lookup grid); *write_ok reports the write.
+static ZNavigation *znavi_build_and_write_sidecar(Drive *env, const char *path, uint32_t crc, uint64_t size,
+                                                  int *write_ok) {
+    ZnaviBuildInput b;
+    znavi_gather_build_input(env, crc, 1, &b);
+    int *segments = NULL;
+    ZNavigation *zn = znavi_build_from_input(env, &b, &segments);
+    znavi_free_build_input(&b);
+    *write_ok = znavi_write_sidecar(env, path, crc, size, zn, segments) == 0;
+    free(segments);
+    return zn;
+}
+
+// Legacy maps with zbin_navigation_source = 0: loads map_XXX.znavi, or builds the map-intrinsic navigation and
+// writes the sidecar when it is missing. A sidecar that does not match the map binary is an error. Must run right
+// after load_map_binary + set_means, before any preprocessing alters the logged trajectories.
+ZNavigation *load_or_build_znavigation_sidecar(Drive *env) {
+    uint32_t crc = 0;
+    uint64_t size = 0;
+    if (zbin_file_crc32(env->map_name, &crc, &size) != 0)
+        RAISE_FILE_ERROR(env->map_name);
+    znavi_default_legacy_speed_limits(env);
+    char *path = znavi_sidecar_path(env->map_name);
+    ZNavigation *zn = NULL;
+    FILE *f = fopen(path, "rb");
+    if (f != NULL) {
+        const char *error = NULL;
+        zn = znavi_read_sidecar(env, f, crc, size, &error);
+        fclose(f);
+        if (zn == NULL)
+            raise_error_with_message(
+                ERROR_INITIALIZATION_FAILED,
+                "stale or invalid navigation sidecar %s: %s (regenerate with " ZNAVI_SIDECAR_REGENERATE_HINT ")", path,
+                error);
+    } else {
+        int write_ok = 0;
+        zn = znavi_build_and_write_sidecar(env, path, crc, size, &write_ok);
+        if (!write_ok)
+            fprintf(stderr, "Warning: could not write navigation sidecar %s\n", path);
+    }
+    free(path);
+    znavi_build_grid(env, zn);
+    return zn;
+}
+
 static inline int znavi_num_points(const ZNavigation *zn, int navi_idx) {
     return zn->line_num_points[navi_idx % zn->num_lines];
 }
@@ -949,6 +1426,23 @@ static int znavi_lane_point(const Drive *env, const Entity *agent, int entity_id
     return ZB_CLAMP(point, 0, navi_line_size - 1);
 }
 
+// Distance already driven past the start of the route sample (point - 1, as used for distance_to_goal lookups) when
+// projecting (x, y) onto sub-segment `point`. Route distances are stored per sample start, so long samples (sparse
+// legacy polylines) would otherwise favour candidates that merely start further ahead.
+static float znavi_sample_progress(const ZNavigation *zn, int navi_idx, int point, float x, float y) {
+    float x_a, y_a, x_b, y_b;
+    znavi_point(zn, navi_idx, point, &x_a, &y_a);
+    znavi_point(zn, navi_idx, point + 1, &x_b, &y_b);
+    float s = znavi_projection_scalar(x, y, x_a, y_a, x_b, y_b, 1);
+    float progress = s * hypotf(x_b - x_a, y_b - y_a);
+    if (point > 0) {
+        float x_p, y_p;
+        znavi_point(zn, navi_idx, point - 1, &x_p, &y_p);
+        progress += hypotf(x_a - x_p, y_a - y_p);
+    }
+    return progress;
+}
+
 // Non-expert localization of zdrive_agent_obs.c compute_agent_metrics (closest/routed lane selection,
 // find_navi_edge_from_lane and the feasibility/distance lookup). Writes the observation state (route projection,
 // speed limit, feasibility); returns the selected lane entity (-1 when none within MAX_LANE_DISTANCE) and the
@@ -1001,7 +1495,8 @@ static int znavi_localize(Drive *env, Entity *agent, float *out_distance_to_goal
             nearest_reachable_distance = ZB_MIN(nearest_reachable_distance, dist);
             reachable[reachable_count].candidate_idx = i;
             reachable[reachable_count].distance = dist;
-            reachable[reachable_count].route_distance = route_distance;
+            reachable[reachable_count].route_distance =
+                route_distance - znavi_sample_progress(zn, candidate_navi_idx, candidate_point, agent->x, agent->y);
             reachable_count++;
         }
     }
@@ -1144,8 +1639,8 @@ static bool znavi_can_append_mission_goal(const ZNavigation *zn, const Entity *a
 
 // World-frame route samples at uniform arclength. The policy interface optionally ends with the original
 // mission goal when a reachable terminal is inside the lookahead, without growing the waypoint buffer.
-int znavi_lookahead_points(const Drive *env, const Entity *agent, int n_waypoints, float distance, float *xs,
-                           float *ys, bool include_mission_goal) {
+int znavi_lookahead_points(const Drive *env, const Entity *agent, int n_waypoints, float distance, float *xs, float *ys,
+                           bool include_mission_goal) {
     const ZNavigation *zn = env->znavigation;
     if (zn == NULL || n_waypoints <= 0)
         return 0;
@@ -1182,7 +1677,7 @@ void znavi_write_observations(const Drive *env, const Entity *agent, float *ego_
     float xs[ZNAVI_LOOKAHEAD_WAYPOINTS_MAX];
     float ys[ZNAVI_LOOKAHEAD_WAYPOINTS_MAX];
     int count = znavi_lookahead_points(env, agent, n_waypoints, env->navigation_lookahead_distance, xs, ys,
-                                      env->append_goal_to_navi_lookahead);
+                                       env->append_goal_to_navi_lookahead);
     for (int w = 0; w < n_waypoints; w++) {
         float forward = 0.0f, left = 0.0f;
         if (w < count) {
@@ -1208,7 +1703,7 @@ void znavi_reset_navigation_state(Drive *env, int agent_idx) {
 }
 
 // Refreshes the zdrive navigation state. The observation state follows zdrive every step; the reward state
-// (distance to goal, off-route) keeps its last value while no lane is within reach, like the legacy backend.
+// (distance to goal, off-route) keeps its last value while no lane is within reach.
 void znavi_update_navigation_state(Drive *env, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
     if (agent->x == INVALID_POSITION)

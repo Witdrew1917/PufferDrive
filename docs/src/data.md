@@ -63,28 +63,15 @@ Refer to [Simulator](simulator.md) for how the binaries are consumed during rese
 
 ## zpufferdrive binaries
 
-zpufferdrive (zdrive) v14 `map_XXX.bin` files, such as the Waymo binaries written by zpufferdrive's `scripts/python/process_maps.py`, can be used as a `map_dir` directly, with no conversion or sidecars. The format is detected from `map_000.bin`, and every map in the directory must use it. Agents, roads (with per-lane speed limits), goals (the last valid logged position, as in legacy maps) and zdrive's built-in navigation routes are loaded. Agents only see the routes with `navigation = 1`. See [Lane navigation](navigation.md#zpufferdrive-maps).
+zpufferdrive (zdrive) v14 `map_XXX.bin` files, such as the Waymo binaries written by zpufferdrive's `scripts/python/process_maps.py`, can be used as a `map_dir` directly, with no conversion. The format is detected from `map_000.bin`, and every map in the directory must use it. Agents, roads (with per-lane speed limits), goals (the last valid logged position, as in legacy maps) and zdrive's built-in navigation routes are loaded. Agents only see the routes with `navigation = 1`. See [Lane navigation](navigation.md#zpufferdrive-maps).
 
 ```bash
 puffer train puffer_drive --env.map-dir ~/Data/zpufferdrive/waymo_binaries/interactive_1k --env.navigation 1
 ```
 
-## Navigation sidecars (optional)
+## Navigation
 
-See [Lane navigation](navigation.md) for the full feature description.
-
-Lane-level navigation for legacy maps is stored next to each map as `map_XXX.navi`. Sidecars that exist are always loaded (for metrics and rendering), and they are required, and used by agents, when `navigation = 1` in the `[env]` section of `drive.ini` (or `--env.navigation 1`). Generate the sidecars from existing bins (the bins are not modified):
-
-```bash
-python -m pufferlib.ocean.drive.drive navigation --map-dir resources/drive/binaries/training --workers 16
-```
-
-Options: `--max-goals` (goal lanes per map, default 64; logged agent goal lanes are always included), `--seed`, `--overwrite`.
-
-- **Generation** (`pufferlib/ocean/drive/navigation.py`): lane successors are inferred from end→start proximity, lateral neighbours from parallel lanes about one lane width apart (a road edge between them forbids the lane change). Pairwise split metadata identifies shared approaches where goal-aware branch selection is physically possible. For every goal lane it stores longitudinal next hops and distances, lane-change-aware distances and left/center/right lane feasibility.
-- **Format** (little-endian): version 4 uses a 44-byte header with magic `"PDNAVI01"`, version, map CRC/size, object/road/lane/goal counts and a directed split-branch count. It stores lane/goal/object arrays, six per-goal/lane tables, and sparse branch offsets, sibling lane indices and shared-prefix limits. Hidden goal copies on overlapping same-direction lanes share a goal ID and are encoded by finite longitudinal distance with no next hop; no extra marker or goal slot is added. See [the full layout](navigation.md#file-format).
-- **Validation**: the C loader rejects missing, truncated, trailing-byte, out-of-range, old-version or stale sidecars (CRC/size mismatch with the map bin) and aborts env creation. Regenerate older sidecars with `--overwrite` and rebuild the native extension; no map conversion is required.
-- **Rendering**: with navigation enabled the renderer colours lanes by feasibility toward the selected agent's goal (red → green, grey = unreachable), highlights its `next_lane` route from the resolved split-aware navigation anchor in cyan, draws its observed route waypoints and marks the goal.
+Every map format uses zpufferdrive navigation. Legacy maps carry no routes, so they are built from the road entities and cached in a map-intrinsic `map_XXX.znavi` sidecar next to each map. `drive.py maps` writes it after each binary, `python -m pufferlib.ocean.drive.drive navigation --map-dir <dir>` writes the missing ones, and the environment writes any that are still missing on first use. A sidecar that does not match its map binary is an error. Agents only see the routes with `navigation = 1` in the `[env]` section of `drive.ini` (or `--env.navigation 1`). See [Lane navigation](navigation.md) for the full feature description.
 
 ## Interactive scenario editor
 

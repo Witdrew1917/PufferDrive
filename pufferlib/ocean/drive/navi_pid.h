@@ -55,45 +55,36 @@ static PIDRoute navi_pid_route(Drive *env, int agent_idx, bool refresh_navigatio
         return route;
 
     int count;
-    if (env->znavigation != NULL) {
-        if (agent->znavi_entity_idx < 0)
-            return route;
-        route.x[0] = agent->znavi_proj_x;
-        route.y[0] = agent->znavi_proj_y;
-        const ZNavigation *zn = env->znavigation;
-        ZNaviWalk walk = znavi_walk_init(agent->znavi_entity_idx, agent->znavi_point_idx, route.x[0], route.y[0]);
-        count = znavi_sample_route(zn, &walk, PID_ROUTE_POINTS, PID_ROUTE_DISTANCE, route.x + 1, route.y + 1);
-        if (env->append_goal_to_navi_lookahead && znavi_can_append_mission_goal(zn, agent, &walk, PID_ROUTE_DISTANCE)) {
-            float terminal_x, terminal_y;
-            znavi_point(zn, walk.navi_e, walk.navi_p, &terminal_x, &terminal_y);
-            float extension = hypotf(agent->init_goal_x - terminal_x, agent->init_goal_y - terminal_y);
-            float speed = fmaxf(0.0f, agent->vx * agent->heading_x + agent->vy * agent->heading_y);
-            float step_distance = (speed + 0.5f * ACCEL_MAX * env->dt) * env->dt;
-            if (extension > 1e-4f && walk.accum <= fmaxf(step_distance, 1e-4f)) {
-                // Keep tracking the final leg after leaving the lane graph.
-                agent->navi_pid_on_goal_segment = true;
-                agent->navi_pid_terminal_x = terminal_x;
-                agent->navi_pid_terminal_y = terminal_y;
-                if (walk.accum <= 1e-4f)
-                    return navi_pid_goal_segment(agent);
-            }
-            if (walk.accum - count * PID_ROUTE_SPACING > 1e-4f) {
-                route.x[++count] = terminal_x;
-                route.y[count] = terminal_y;
-            }
-            if (extension > 1e-4f) {
-                route.x[++count] = agent->init_goal_x;
-                route.y[count] = agent->init_goal_y;
-            }
-            route.remaining = walk.accum + extension;
+    if (agent->znavi_entity_idx < 0)
+        return route;
+    route.x[0] = agent->znavi_proj_x;
+    route.y[0] = agent->znavi_proj_y;
+    const ZNavigation *zn = env->znavigation;
+    ZNaviWalk walk = znavi_walk_init(agent->znavi_entity_idx, agent->znavi_point_idx, route.x[0], route.y[0]);
+    count = znavi_sample_route(zn, &walk, PID_ROUTE_POINTS, PID_ROUTE_DISTANCE, route.x + 1, route.y + 1);
+    if (env->append_goal_to_navi_lookahead && znavi_can_append_mission_goal(zn, agent, &walk, PID_ROUTE_DISTANCE)) {
+        float terminal_x, terminal_y;
+        znavi_point(zn, walk.navi_e, walk.navi_p, &terminal_x, &terminal_y);
+        float extension = hypotf(agent->init_goal_x - terminal_x, agent->init_goal_y - terminal_y);
+        float speed = fmaxf(0.0f, agent->vx * agent->heading_x + agent->vy * agent->heading_y);
+        float step_distance = (speed + 0.5f * ACCEL_MAX * env->dt) * env->dt;
+        if (extension > 1e-4f && walk.accum <= fmaxf(step_distance, 1e-4f)) {
+            // Keep tracking the final leg after leaving the lane graph.
+            agent->navi_pid_on_goal_segment = true;
+            agent->navi_pid_terminal_x = terminal_x;
+            agent->navi_pid_terminal_y = terminal_y;
+            if (walk.accum <= 1e-4f)
+                return navi_pid_goal_segment(agent);
         }
-    } else {
-        if (agent->navi_lane_idx < 0)
-            return route;
-        const Entity *lane = &env->entities[env->navigation->lane_entity_idx[agent->navi_lane_idx]];
-        int segment;
-        lane_project(lane, agent->x, agent->y, &segment, &route.x[0], &route.y[0]);
-        count = navigation_route_waypoints(env, agent, PID_ROUTE_POINTS, PID_ROUTE_SPACING, route.x + 1, route.y + 1);
+        if (walk.accum - count * PID_ROUTE_SPACING > 1e-4f) {
+            route.x[++count] = terminal_x;
+            route.y[count] = terminal_y;
+        }
+        if (extension > 1e-4f) {
+            route.x[++count] = agent->init_goal_x;
+            route.y[count] = agent->init_goal_y;
+        }
+        route.remaining = walk.accum + extension;
     }
     route.count = count + 1;
     return route;
@@ -266,7 +257,7 @@ static NaviPIDAction navi_pid_action(Drive *env, int agent_idx, bool refresh_nav
                          env->navi_pid_heading_gain * heading_error;
         float feedback_limit = PID_MAX_LATERAL_ACCELERATION / fmaxf(speed * speed, 4.0f);
         float curvature =
-            clip(route_curvature, -0.01f, 0.01f) + clip(feedback, -feedback_limit, feedback_limit);
+            clip(route_curvature, -0.1f, 0.1f) + clip(feedback, -feedback_limit, feedback_limit);
         float target = atanf(curvature * agent->wheelbase);
         float previous = env->dynamics_model == JERK ? agent->steering_angle : agent->navi_pid_steering;
         steering = previous + env->dt / (0.02f + env->dt) * (target - previous);
