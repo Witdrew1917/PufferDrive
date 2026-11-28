@@ -1415,31 +1415,47 @@ def process_all_maps(
 def _process_single_navigation(args):
     map_path, overwrite = args
     try:
-        return (map_path.name, write_navigation_sidecar(map_path, overwrite), None)
+        if detect_map_format(map_path) == MAP_FORMAT_ZBIN:
+            return (os.path.basename(map_path), "zbin", None)
+        written = binding.write_navigation_sidecar(map_path, overwrite)
+        return (os.path.basename(map_path), "written" if written else "existing", None)
     except Exception as e:
-        return (map_path.name, False, str(e))
+        return (os.path.basename(map_path), "failed", str(e))
 
 
 def process_all_navigation(map_dir, num_workers=None, overwrite=False):
-    """Writes the map_XXX.znavi navigation sidecar of every legacy map_*.bin in map_dir (zbin maps are skipped)."""
-    from pathlib import Path
+    """Writes the map_XXX.znavi navigation sidecar of every legacy map_*.bin in map_dir (zbin maps are skipped).
 
-    map_files = [p for p in sorted(Path(map_dir).glob("map_*.bin")) if detect_map_format(p) != MAP_FORMAT_ZBIN]
-    if not map_files:
-        print(f"No legacy map_*.bin files in {map_dir}")
-        return
-    with Pool(num_workers or cpu_count()) as pool:
-        results = list(
-            tqdm(
-                pool.imap(_process_single_navigation, [(p, overwrite) for p in map_files]),
-                total=len(map_files),
-                desc="Writing navigation sidecars",
-                unit="map",
-            )
+    The map format is detected inside the workers: a serial per-file check in the parent would stall for hours on
+    large (network-mounted) datasets before any work starts.
+    """
+    print(f"Listing map_*.bin files in {map_dir} ...", flush=True)
+    with os.scandir(map_dir) as entries:
+        map_files = sorted(
+            e.path for e in entries if e.name.startswith("map_") and e.name.endswith(".bin") and e.is_file()
         )
-    written = sum(1 for _, ok, _ in results if ok)
-    failed = [(name, error) for name, _, error in results if error is not None]
-    print(f"Wrote {written}, skipped {len(results) - written - len(failed)} existing, failed {len(failed)}")
+    if not map_files:
+        print(f"No map_*.bin files in {map_dir}")
+        return
+    print(f"Found {len(map_files)} maps", flush=True)
+    num_workers = num_workers or cpu_count()
+    chunksize = max(1, min(256, len(map_files) // (num_workers * 16)))
+    counts = {"written": 0, "existing": 0, "zbin": 0, "failed": 0}
+    failed = []
+    with Pool(num_workers) as pool:
+        for name, status, error in tqdm(
+            pool.imap_unordered(_process_single_navigation, [(p, overwrite) for p in map_files], chunksize=chunksize),
+            total=len(map_files),
+            desc="Writing navigation sidecars",
+            unit="map",
+        ):
+            counts[status] += 1
+            if error is not None:
+                failed.append((name, error))
+    print(
+        f"Wrote {counts['written']}, skipped {counts['existing']} existing and {counts['zbin']} zbin, "
+        f"failed {counts['failed']}"
+    )
     for name, error in failed:
         print(f"  {name}: {error}")
 
